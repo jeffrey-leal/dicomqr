@@ -1,0 +1,12 @@
+# Compiled binary
+*.exe
+
+# Go build cache
+/vendor/
+
+# Claude Code project settings
+.claude/
+
+# OS
+Thumbs.db
+desktop.ini
