@@ -16,9 +16,8 @@ type Settings struct {
 	FontName        string          `json:"fontName"`
 	LocalAETitle    string          `json:"localAETitle"`
 	LocalSCPPort    int             `json:"localSCPPort"`
-	DownloadDir     string          `json:"downloadDir"`
-	SubfolderFormat string          `json:"subfolderFormat"`
-	Profiles        []ServerProfile `json:"profiles"`
+	DownloadDir string          `json:"downloadDir"`
+	Profiles    []ServerProfile `json:"profiles"`
 }
 
 func appSettingsDir() (string, error) {

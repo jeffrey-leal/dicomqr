@@ -23,17 +23,25 @@ type queryRow struct {
 	hoverTimer  *time.Timer
 	showPending bool
 	tooltipPop  *widget.PopUp
+	onTapped    func(id string)
 	onMenu      func(id string, pos fyne.Position)
 }
 
-func newQueryRow(cv fyne.Canvas, onMenu func(id string, pos fyne.Position)) *queryRow {
+func newQueryRow(cv fyne.Canvas, onTapped func(id string), onMenu func(id string, pos fyne.Position)) *queryRow {
 	qr := &queryRow{
-		ct:     canvas.NewText("", theme.Color(theme.ColorNameForeground)),
-		cv:     cv,
-		onMenu: onMenu,
+		ct:       canvas.NewText("", theme.Color(theme.ColorNameForeground)),
+		cv:       cv,
+		onTapped: onTapped,
+		onMenu:   onMenu,
 	}
 	qr.ExtendBaseWidget(qr)
 	return qr
+}
+
+func (qr *queryRow) Tapped(*fyne.PointEvent) {
+	if qr.onTapped != nil && qr.nodeID != "" {
+		qr.onTapped(qr.nodeID)
+	}
 }
 
 func (qr *queryRow) CreateRenderer() fyne.WidgetRenderer {

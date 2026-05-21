@@ -4,7 +4,6 @@
   "localAETitle": "DICOMQR",
   "localSCPPort": 11112,
   "downloadDir": "",
-  "subfolderFormat": "StudyDate/PatientID/SeriesNumber",
   "profiles": [
     {
       "name": "Local Orthanc",

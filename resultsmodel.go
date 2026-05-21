@@ -163,11 +163,17 @@ func (m *resultsModel) childUIDs(id string) []string {
 }
 
 func (m *resultsModel) isBranch(id string) bool {
+	if id == "" {
+		// Virtual root must be a branch so Tree.walk recurses into childUIDs("").
+		return true
+	}
 	n, ok := m.nodes[id]
 	if !ok {
 		return false
 	}
-	return len(n.children) > 0 || n.kind == kindStudy || n.kind == kindPatient
+	// Patient nodes are always expandable (they always contain study children).
+	// Study and series nodes are leaves unless series/image children are present.
+	return n.kind == kindPatient || len(n.children) > 0
 }
 
 func (m *resultsModel) labelFor(id string) string {

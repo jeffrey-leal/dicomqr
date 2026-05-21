@@ -1,0 +1,8 @@
+services:
+  go-netdicom:
+    image: golang:1.24-alpine
+    volumes:
+      - ../:/home/golang/app
+      - ..:/workspaces:cached
+    command: /bin/sh -c "while sleep 1000; do :; done"
+    

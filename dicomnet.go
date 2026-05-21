@@ -2,11 +2,21 @@ package main
 
 import (
 	"context"
-	"errors"
+	"fmt"
+	"net"
+	"strconv"
+	"strings"
+
+	netdicom "github.com/algm/go-netdicom"
+	"github.com/algm/go-netdicom/sopclass"
+	dicom "github.com/grailbio/go-dicom"
+	"github.com/grailbio/go-dicom/dicomtag"
 )
 
-// FindResult holds one C-FIND response item.
+// FindResult holds one C-FIND response item. Err is set on error items;
+// all other fields are zero when Err != nil.
 type FindResult struct {
+	Err               error
 	Level             string
 	PatientName       string
 	PatientID         string
@@ -33,10 +43,8 @@ type MoveProgress struct {
 }
 
 // DicomClient is an SCU that wraps the go-netdicom library.
-// TODO: replace stub bodies with algm/go-netdicom calls once go mod tidy
-// resolves the dependency.
 type DicomClient struct {
-	profile     ServerProfile
+	profile      ServerProfile
 	localAETitle string
 }
 
@@ -45,29 +53,247 @@ func NewDicomClient(profile ServerProfile, localAETitle string) *DicomClient {
 	return &DicomClient{profile: profile, localAETitle: localAETitle}
 }
 
-// Echo sends a C-ECHO to verify connectivity. Returns nil on success.
+// Echo sends a C-ECHO (Verification SOP Class 1.2.840.10008.1.1) to verify
+// DICOM connectivity with the configured server. The association is opened,
+// the echo is sent, and the association is released — all within one call.
+// Returns nil on a successful Status 0000H response.
 func (c *DicomClient) Echo(ctx context.Context) error {
-	// TODO: implement using algm/go-netdicom ServiceUser
-	return errors.New("C-ECHO: not yet implemented")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	su, err := netdicom.NewServiceUser(netdicom.ServiceUserParams{
+		CalledAETitle:  c.profile.RemoteAETitle,
+		CallingAETitle: c.localAETitle,
+		SOPClasses:     sopclass.VerificationClasses,
+	})
+	if err != nil {
+		return fmt.Errorf("c-echo: create service user: %w", err)
+	}
+
+	type result struct{ err error }
+	done := make(chan result, 1)
+
+	go func() {
+		defer su.Release()
+		su.Connect(fmt.Sprintf("%s:%d", c.profile.Host, c.profile.Port))
+		done <- result{su.CEcho()}
+	}()
+
+	select {
+	case r := <-done:
+		return r.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
-// Find sends a C-FIND at the given query level and streams results on the
-// returned channel. The channel is closed when the query completes or ctx
-// is cancelled. A non-nil error is returned if the association fails.
+// Find sends a C-FIND (Study Root or Patient Root QR, Verification SOP Class
+// 1.2.840.10008.5.1.4.1.2.2.1) at the given query level and streams results on
+// the returned channel. The channel is closed when the query completes or ctx
+// is cancelled. A non-nil error is returned only when the ServiceUser cannot be
+// created; association and query errors close the channel silently (0 results).
 func (c *DicomClient) Find(ctx context.Context, level string, params map[string]string) (<-chan FindResult, error) {
-	// TODO: implement using algm/go-netdicom C-FIND
-	ch := make(chan FindResult)
-	close(ch)
-	return ch, errors.New("C-FIND: not yet implemented")
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	su, err := netdicom.NewServiceUser(netdicom.ServiceUserParams{
+		CalledAETitle:  c.profile.RemoteAETitle,
+		CallingAETitle: c.localAETitle,
+		SOPClasses:     sopclass.QRFindClasses,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("c-find: create service user: %w", err)
+	}
+
+	out := make(chan FindResult, 128)
+
+	go func() {
+		defer close(out)
+		defer su.Release()
+		su.Connect(fmt.Sprintf("%s:%d", c.profile.Host, c.profile.Port))
+
+		for r := range su.CFind(levelToQRLevel(level), buildFindFilter(level, params)) {
+			if r.Err != nil {
+				select {
+				case out <- FindResult{Err: r.Err}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			select {
+			case out <- elementsToFindResult(r.Elements):
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return out, nil
 }
 
-// Move sends a C-MOVE-RQ for the given UIDs, directing the PACS to push
-// files to destAE. Progress callbacks are fired for each C-MOVE-RSP pending
-// response. Returns nil when the operation completes successfully.
-func (c *DicomClient) Move(ctx context.Context, level, studyUID, seriesUID string, destAE string, onProgress func(MoveProgress)) error {
-	// TODO: implement using algm/go-netdicom C-MOVE
-	return errors.New("C-MOVE: not yet implemented")
+// Move sends a C-MOVE-RQ (PS3.4 C.4.2) for the given UIDs, directing the PACS
+// to push files to destAE. onProgress is called for each C-MOVE-RSP pending
+// response. Returns nil when the final response carries StatusSuccess (0000H).
+// patientID is included in the filter when non-empty; required by PACS that
+// mandate it at STUDY level (Patient Root model per PS3.4 C.4.2.1).
+func (c *DicomClient) Move(ctx context.Context, level, patientID, studyUID, seriesUID string, destAE string, onProgress func(MoveProgress)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	su, err := netdicom.NewServiceUser(netdicom.ServiceUserParams{
+		CalledAETitle:  c.profile.RemoteAETitle,
+		CallingAETitle: c.localAETitle,
+		SOPClasses:     sopclass.QRMoveClasses,
+	})
+	if err != nil {
+		return fmt.Errorf("c-move: create service user: %w", err)
+	}
+
+	type result struct{ err error }
+	done := make(chan result, 1)
+
+	go func() {
+		defer su.Release()
+		su.Connect(fmt.Sprintf("%s:%d", c.profile.Host, c.profile.Port))
+
+		progressFn := func(p netdicom.CMoveProgress) {
+			if onProgress != nil {
+				onProgress(MoveProgress{
+					Remaining: p.Remaining,
+					Completed: p.Completed,
+					Failed:    p.Failed,
+					Warning:   p.Warning,
+				})
+			}
+		}
+		done <- result{su.CMove(levelToQRLevel(level), destAE, buildMoveFilter(level, patientID, studyUID, seriesUID), progressFn)}
+	}()
+
+	select {
+	case r := <-done:
+		return r.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// levelToQRLevel maps the query-level string used by the UI to the go-netdicom
+// QRLevel constant. Defaults to Study Root if the level is unrecognised.
+func levelToQRLevel(level string) netdicom.QRLevel {
+	switch strings.ToUpper(level) {
+	case "SERIES":
+		return netdicom.QRLevelSeries
+	case "PATIENT":
+		return netdicom.QRLevelPatient
+	default:
+		return netdicom.QRLevelStudy
+	}
+}
+
+// buildFindFilter builds a C-FIND identifier dataset from the UI query params.
+// Empty-value elements act as return keys; non-empty values are match criteria.
+// StudyDate uses DICOM range syntax (YYYYMMDD-YYYYMMDD, PS3.4 C.2.2.2.5).
+func buildFindFilter(level string, params map[string]string) []*dicom.Element {
+	dateRange := buildDateRange(params["StudyDateFrom"], params["StudyDateTo"])
+	return []*dicom.Element{
+		dicom.MustNewElement(dicomtag.SpecificCharacterSet, "ISO_IR 192"),
+		dicom.MustNewElement(dicomtag.PatientName, params["PatientName"]),
+		dicom.MustNewElement(dicomtag.PatientID, params["PatientID"]),
+		dicom.MustNewElement(dicomtag.AccessionNumber, params["AccessionNumber"]),
+		dicom.MustNewElement(dicomtag.StudyDate, dateRange),
+		dicom.MustNewElement(dicomtag.StudyInstanceUID, ""),
+		dicom.MustNewElement(dicomtag.StudyDescription, ""),
+		dicom.MustNewElement(dicomtag.ModalitiesInStudy, params["ModalitiesInStudy"]),
+	}
+}
+
+// buildMoveFilter builds the C-MOVE identifier dataset for the given UIDs.
+// PatientID is included when non-empty — required by PACS using Patient Root
+// at STUDY level (PS3.4 C.4.2.1). At SERIES level SeriesInstanceUID is also
+// included so the PACS can scope the sub-operations correctly (PS3.4 C.4.2).
+func buildMoveFilter(level, patientID, studyUID, seriesUID string) []*dicom.Element {
+	var filter []*dicom.Element
+	if patientID != "" {
+		filter = append(filter, dicom.MustNewElement(dicomtag.PatientID, patientID))
+	}
+	filter = append(filter, dicom.MustNewElement(dicomtag.StudyInstanceUID, studyUID))
+	if level == "SERIES" && seriesUID != "" {
+		filter = append(filter, dicom.MustNewElement(dicomtag.SeriesInstanceUID, seriesUID))
+	}
+	return filter
+}
+
+// buildDateRange encodes a DICOM date range string from UI from/to values.
+// Returns "" (match-all) when both are empty.
+func buildDateRange(from, to string) string {
+	switch {
+	case from == "" && to == "":
+		return ""
+	case from == "":
+		return "-" + to
+	case to == "":
+		return from + "-"
+	default:
+		return from + "-" + to
+	}
+}
+
+// elementsToFindResult extracts a FindResult from the elements in one C-FIND
+// response dataset. Unknown tags are silently ignored.
+func elementsToFindResult(elems []*dicom.Element) FindResult {
+	var r FindResult
+	for _, elem := range elems {
+		s, err := elem.GetString()
+		if err != nil {
+			continue
+		}
+		switch elem.Tag {
+		case dicomtag.PatientName:
+			r.PatientName = s
+		case dicomtag.PatientID:
+			r.PatientID = s
+		case dicomtag.StudyInstanceUID:
+			r.StudyInstanceUID = s
+		case dicomtag.StudyDate:
+			r.StudyDate = s
+		case dicomtag.StudyDescription:
+			r.StudyDescription = s
+		case dicomtag.AccessionNumber:
+			r.AccessionNumber = s
+		case dicomtag.ModalitiesInStudy:
+			r.ModalitiesInStudy = s
+		case dicomtag.SeriesInstanceUID:
+			r.SeriesInstanceUID = s
+		case dicomtag.SeriesNumber:
+			r.SeriesNumber = s
+		case dicomtag.SeriesDescription:
+			r.SeriesDescription = s
+		case dicomtag.Modality:
+			r.Modality = s
+		case dicomtag.SOPInstanceUID:
+			r.SOPInstanceUID = s
+		case dicomtag.InstanceNumber:
+			if n, err2 := strconv.Atoi(s); err2 == nil {
+				r.InstanceNumber = n
+			}
+		}
+	}
+	return r
 }
 
 // Close is a no-op; associations are opened and closed per-operation.
 func (c *DicomClient) Close() {}
+
+// localIP returns the preferred outbound IPv4 address of this machine by
+// opening a UDP socket toward a public address (no packets are sent).
+func localIP() string {
+	conn, err := net.Dial("udp4", "8.8.8.8:53")
+	if err != nil {
+		return "unknown"
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+}

@@ -178,7 +178,8 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 				pendingProfiles = append(pendingProfiles[:i], pendingProfiles[i+1:]...)
 				buildProfileList()
 			})
-			rows[i] = container.NewBorder(nil, nil, nameLabel, container.NewHBox(editBtn, deleteBtn))
+			// nameLabel as center so it expands to fill available width; buttons pin right.
+			rows[i] = container.NewBorder(nil, nil, nil, container.NewHBox(editBtn, deleteBtn), nameLabel)
 		}
 		profileList.Objects = rows
 		profileList.Refresh()
@@ -192,8 +193,8 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 		})
 	})
 
-	profileScroll := container.NewScroll(profileList)
-	profileScroll.SetMinSize(fyne.NewSize(0, 120))
+	profileScroll := container.NewVScroll(profileList)
+	profileScroll.SetMinSize(fyne.NewSize(0, 160))
 
 	connHeader := widget.NewLabel("Connections")
 	connHeader.TextStyle = fyne.TextStyle{Bold: true}
@@ -248,13 +249,12 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 		}
 
 		updated := Settings{
-			DarkTheme:       current.isDark,
-			FontName:        current.fontName,
-			LocalAETitle:    localAEEntry.Text,
-			LocalSCPPort:    port,
-			DownloadDir:     cfg.DownloadDir,
-			SubfolderFormat: cfg.SubfolderFormat,
-			Profiles:        pendingProfiles,
+			DarkTheme:    current.isDark,
+			FontName:     current.fontName,
+			LocalAETitle: localAEEntry.Text,
+			LocalSCPPort: port,
+			DownloadDir:  cfg.DownloadDir,
+			Profiles:     pendingProfiles,
 		}
 		saveSettings(updated)
 		a.Settings().SetTheme(current)
@@ -262,14 +262,14 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 		d.Hide()
 	})
 
-	fill := canvas.NewRectangle(color.Transparent)
-	fill.SetMinSize(fyne.NewSize(0, 24))
 	buttonRow := container.NewBorder(
 		widget.NewSeparator(), nil, nil, nil,
-		container.NewStack(fill, container.NewCenter(container.NewHBox(cancelBtn, applyBtn))),
+		container.NewPadded(container.NewBorder(nil, nil, nil, container.NewHBox(cancelBtn, applyBtn))),
 	)
 
-	content := container.NewVBox(uiSection, connSection, retSection, buttonRow)
+	minWidth := canvas.NewRectangle(color.Transparent)
+	minWidth.SetMinSize(fyne.NewSize(640, 0))
+	content := container.NewStack(minWidth, container.NewVBox(uiSection, connSection, retSection, buttonRow))
 	d = dialog.NewCustomWithoutButtons("Preferences", content, w)
 	d.Show()
 }
