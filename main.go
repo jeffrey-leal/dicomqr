@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -83,6 +84,8 @@ func main() {
 		activeProfile ServerProfile
 		scp           *StorageSCP
 		cancelQuery   context.CancelFunc
+		connCtx       context.Context
+		cancelConn    context.CancelFunc
 	)
 
 	// ── Status bar ──────────────────────────────────────────────────────────
@@ -154,6 +157,37 @@ func main() {
 		},
 	)
 
+	tree.OnBranchOpened = func(id string) {
+		if !strings.HasPrefix(id, "S:") || model.isSeriesLoaded(id) {
+			return
+		}
+		model.markSeriesLoaded(id) // mark before goroutine to prevent duplicate queries
+		_, studyUID, _, _ := model.uidsForNode(id)
+		go func() {
+			if connCtx == nil {
+				return
+			}
+			ch, err := client.Find(connCtx, "SERIES", map[string]string{"StudyInstanceUID": studyUID})
+			if err != nil {
+				return
+			}
+			var series []FindResult
+			for r := range ch {
+				if r.Err == nil {
+					series = append(series, r)
+				}
+			}
+			for range ch {}
+			fyne.Do(func() {
+				for _, r := range series {
+					model.addSeries(r.StudyInstanceUID, r.SeriesInstanceUID,
+						r.Modality, r.SeriesNumber, r.SeriesDescription, r.NumInstances)
+				}
+				tree.Refresh()
+			})
+		}()
+	}
+
 	w.Canvas().AddShortcut(&fyne.ShortcutCopy{}, func(_ fyne.Shortcut) {
 		for id := range selectedNodes {
 			w.Clipboard().SetContent(model.labelFor(id))
@@ -168,82 +202,136 @@ func main() {
 	patientIDEntry.SetPlaceHolder("Patient ID")
 	accessionEntry := widget.NewEntry()
 	accessionEntry.SetPlaceHolder("Accession number")
-	studyDateFromEntry := widget.NewEntry()
-	studyDateFromEntry.SetPlaceHolder("YYYYMMDD")
-	studyDateToEntry := widget.NewEntry()
-	studyDateToEntry.SetPlaceHolder("YYYYMMDD")
-	modalitySelect := widget.NewSelect([]string{"(Any)", "CT", "MR", "PT", "NM", "US", "CR", "DX", "XA", "RF"}, nil)
-	modalitySelect.SetSelected("(Any)")
+	studyDateFromEntry := widget.NewDateEntry()
+	studyDateToEntry := widget.NewDateEntry()
+	modalityCheck := widget.NewCheckGroup(
+		[]string{"CT", "MR", "PT", "NM", "US", "CR", "DX", "XA", "RF"}, nil)
+	modalityCheck.Horizontal = true
 
 	doSearch := func() {
 		if state != stateConnected || client == nil {
 			dialog.ShowInformation("Not connected", "Connect to a DICOM server first.", w)
 			return
 		}
-		model.clear()
-		tree.Refresh()
-		progressBar.Show()
-		setStatus("Querying…")
 
-		params := map[string]string{
-			"PatientName":    patientNameEntry.Text,
-			"PatientID":      patientIDEntry.Text,
-			"AccessionNumber": accessionEntry.Text,
-			"StudyDateFrom":  studyDateFromEntry.Text,
-			"StudyDateTo":    studyDateToEntry.Text,
-		}
-		if modalitySelect.Selected != "(Any)" {
-			params["ModalitiesInStudy"] = modalitySelect.Selected
-		}
+		runSearch := func() {
+			model.clear()
+			tree.Refresh()
+			progressBar.Show()
+			setStatus("Querying…")
 
-		ctx, cancel := context.WithCancel(context.Background())
-		cancelQuery = cancel
-
-		go func() {
-			defer cancel()
-			ch, err := client.Find(ctx, activeProfile.InfoModel, params)
-			if err != nil {
-				setStatus("Query error: " + err.Error())
-				fyne.Do(func() { progressBar.Hide() })
-				return
+			dateFrom := ""
+			if studyDateFromEntry.Date != nil {
+				dateFrom = studyDateFromEntry.Date.Format("20060102")
 			}
-			var results []FindResult
-			var queryErr error
-			for r := range ch {
-				if r.Err != nil {
-					queryErr = r.Err
-					break
+			dateTo := ""
+			if studyDateToEntry.Date != nil {
+				dateTo = studyDateToEntry.Date.Format("20060102")
+			}
+			baseParams := map[string]string{
+				"PatientName":     patientNameEntry.Text,
+				"PatientID":       patientIDEntry.Text,
+				"AccessionNumber": accessionEntry.Text,
+				"StudyDateFrom":   dateFrom,
+				"StudyDateTo":     dateTo,
+			}
+
+			// Build one param set per selected modality so each query is a single
+			// modality filter — PACS multi-value matching is unreliable across vendors.
+			// Results are merged client-side and deduplicated by StudyInstanceUID.
+			var paramSets []map[string]string
+			if len(modalityCheck.Selected) == 0 {
+				paramSets = []map[string]string{baseParams}
+			} else {
+				for _, mod := range modalityCheck.Selected {
+					p := make(map[string]string, len(baseParams)+1)
+					for k, v := range baseParams {
+						p[k] = v
+					}
+					p["ModalitiesInStudy"] = mod
+					paramSets = append(paramSets, p)
 				}
-				results = append(results, r)
 			}
-			for range ch {} // drain so Find's goroutine can exit
-			if queryErr != nil {
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancelQuery = cancel
+
+			go func() {
+				defer cancel()
+				seen := make(map[string]bool)
+				var allResults []FindResult
+				var queryErr error
+				for _, params := range paramSets {
+					if ctx.Err() != nil {
+						break
+					}
+					ch, err := client.Find(ctx, activeProfile.InfoModel, params)
+					if err != nil {
+						queryErr = err
+						break
+					}
+					for r := range ch {
+						if r.Err != nil {
+							queryErr = r.Err
+							break
+						}
+						if !seen[r.StudyInstanceUID] {
+							seen[r.StudyInstanceUID] = true
+							allResults = append(allResults, r)
+						}
+					}
+					for range ch {} // drain so Find's goroutine can exit
+					if queryErr != nil {
+						break
+					}
+				}
+				if queryErr != nil {
+					fyne.Do(func() {
+						progressBar.Hide()
+						statusLabel.SetText("Query error: " + queryErr.Error())
+					})
+					return
+				}
 				fyne.Do(func() {
+					for _, r := range allResults {
+						model.addStudy(r.PatientName, r.PatientID, r.StudyInstanceUID,
+							r.StudyDate, r.StudyDescription, r.AccessionNumber, r.ModalitiesInStudy)
+					}
+					tree.Refresh()
 					progressBar.Hide()
-					statusLabel.SetText("Query error: " + queryErr.Error())
+					statusLabel.SetText(fmt.Sprintf("Query complete — %d studies", len(allResults)))
 				})
-				return
-			}
-				fyne.Do(func() {
-				for _, r := range results {
-					model.addStudy(r.PatientName, r.PatientID, r.StudyInstanceUID,
-						r.StudyDate, r.StudyDescription, r.AccessionNumber, r.ModalitiesInStudy)
-				}
-				tree.Refresh()
-				tree.OpenAllBranches()
-				progressBar.Hide()
-				statusLabel.SetText(fmt.Sprintf("Query complete — %d studies", len(results)))
-			})
-		}()
+			}()
+		}
+
+		noParams := patientNameEntry.Text == "" &&
+			patientIDEntry.Text == "" &&
+			accessionEntry.Text == "" &&
+			studyDateFromEntry.Date == nil &&
+			studyDateToEntry.Date == nil &&
+			len(modalityCheck.Selected) == 0
+		if noParams {
+			dialog.ShowConfirm("Warning",
+				"No search parameters have been specified.\n\nRunning an unconstrained query may retrieve a large number of results and place unnecessary load on the PACS server.\n\nDo you want to proceed?",
+				func(ok bool) {
+					if ok {
+						runSearch()
+					}
+				}, w)
+			return
+		}
+		runSearch()
 	}
 
 	doClearQuery := func() {
 		patientNameEntry.SetText("")
 		patientIDEntry.SetText("")
 		accessionEntry.SetText("")
-		studyDateFromEntry.SetText("")
-		studyDateToEntry.SetText("")
-		modalitySelect.SetSelected("(Any)")
+		studyDateFromEntry.Validator = nil
+		studyDateFromEntry.SetDate(nil)
+		studyDateToEntry.Validator = nil
+		studyDateToEntry.SetDate(nil)
+		modalityCheck.SetSelected(nil)
 		model.clear()
 		selectedNodes = make(map[string]bool)
 		tree.Refresh()
@@ -363,6 +451,7 @@ func main() {
 				return
 			}
 			scp = s
+			connCtx, cancelConn = context.WithCancel(context.Background())
 
 			setConnState(stateConnected, fmt.Sprintf("Connected: %s@%s:%d  |  SCP %s (AE: %s)",
 					profile.RemoteAETitle, profile.Host, profile.Port, s.ListenAddr(), cfg.LocalAETitle))
@@ -372,6 +461,9 @@ func main() {
 	disconnectBtn.OnTapped = func() {
 		if cancelQuery != nil {
 			cancelQuery()
+		}
+		if cancelConn != nil {
+			cancelConn()
 		}
 		if scp != nil {
 			scp.Stop()
@@ -397,8 +489,8 @@ func main() {
 
 	connPanel := container.NewVBox(
 		container.NewBorder(nil, nil,
-			container.NewHBox(widget.NewLabel("Server:"), profileSelect, searchTopBtn),
-			container.NewHBox(filtersBtn, connectBtn, disconnectBtn, echoBtn),
+			container.NewHBox(widget.NewLabel("Server:"), profileSelect, filtersBtn, searchTopBtn),
+			container.NewHBox(connectBtn, disconnectBtn, echoBtn),
 		),
 		widget.NewSeparator(),
 	)
@@ -416,7 +508,7 @@ func main() {
 					widget.NewFormItem("Accession No", accessionEntry),
 					widget.NewFormItem("Study Date From", studyDateFromEntry),
 					widget.NewFormItem("Study Date To", studyDateToEntry),
-					widget.NewFormItem("Modality", modalitySelect),
+					widget.NewFormItem("Modality", modalityCheck),
 				),
 				container.NewHBox(layout.NewSpacer(), searchBtn, clearBtn),
 			)
@@ -462,45 +554,72 @@ func main() {
 			return
 		}
 
-		// Collect unique (patientID, studyUID) pairs from selected nodes.
-		// Selecting a patient node expands to all its study children.
-		type studyTarget struct{ patientID, studyUID string }
-		seen := make(map[string]bool)
-		var targets []studyTarget
+		// Collect retrieve targets from selected nodes.
+		// Patient → all study children at STUDY level.
+		// Study   → STUDY level.
+		// Series  → SERIES level, unless its parent study is also selected.
+		type retrieveTarget struct {
+			level     string // "STUDY" or "SERIES"
+			patientID string
+			studyUID  string
+			seriesUID string
+		}
+		studySeen := make(map[string]bool)
+		var targets []retrieveTarget
+		var pendingSeries []retrieveTarget
 		for id := range selectedNodes {
-			patID, studyUID, _, _ := model.uidsForNode(id)
-			if studyUID != "" {
-				if !seen[studyUID] {
-					seen[studyUID] = true
-					targets = append(targets, studyTarget{patID, studyUID})
-				}
-			} else {
+			patID, studyUID, seriesUID, _ := model.uidsForNode(id)
+			switch {
+			case studyUID == "":
 				// Patient node — expand to study children.
 				for _, childID := range model.childUIDs(id) {
-					childPatID, childStudyUID, _, _ := model.uidsForNode(childID)
-					if childStudyUID != "" && !seen[childStudyUID] {
-						seen[childStudyUID] = true
-						targets = append(targets, studyTarget{childPatID, childStudyUID})
+					cp, cs, _, _ := model.uidsForNode(childID)
+					if cs != "" && !studySeen[cs] {
+						studySeen[cs] = true
+						targets = append(targets, retrieveTarget{"STUDY", cp, cs, ""})
 					}
 				}
+			case seriesUID == "":
+				// Study node.
+				if !studySeen[studyUID] {
+					studySeen[studyUID] = true
+					targets = append(targets, retrieveTarget{"STUDY", patID, studyUID, ""})
+				}
+			default:
+				// Series node — defer until we know which studies are selected.
+				pendingSeries = append(pendingSeries, retrieveTarget{"SERIES", patID, studyUID, seriesUID})
+			}
+		}
+		// Add series targets only when their parent study was not selected directly.
+		for _, t := range pendingSeries {
+			if !studySeen[t.studyUID] {
+				targets = append(targets, t)
 			}
 		}
 		if len(targets) == 0 {
-			dialog.ShowInformation("Nothing selected", "Click one or more studies in the results list first.", w)
+			dialog.ShowInformation("Nothing selected", "Click one or more studies or series in the results list first.", w)
 			return
 		}
 
 		count := len(targets)
-		log.Printf("retrieve: %d studies, destAE=%s port=%d", count, cfg.LocalAETitle, cfg.LocalSCPPort)
+		log.Printf("retrieve: %d targets, destAE=%s port=%d", count, cfg.LocalAETitle, cfg.LocalSCPPort)
 		for i, t := range targets {
-			log.Printf("  study[%d]: patientID=%s studyUID=%s", i, t.patientID, t.studyUID)
+			log.Printf("  target[%d]: level=%s patientID=%s studyUID=%s seriesUID=%s", i, t.level, t.patientID, t.studyUID, t.seriesUID)
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
 		cancelRetrieve = cancel
 		progressBar.SetValue(0)
 		progressBar.Show()
-		statusLabel.SetText(fmt.Sprintf("Starting retrieve of %d studies…", count))
+		startNoun := "studies"
+		if count == 1 {
+			if targets[0].level == "SERIES" {
+				startNoun = "series"
+			} else {
+				startNoun = "study"
+			}
+		}
+		statusLabel.SetText(fmt.Sprintf("Starting retrieve of %d %s…", count, startNoun))
 
 		go func() {
 			defer cancel()
@@ -520,10 +639,14 @@ func main() {
 					break
 				}
 				idx := i + 1
+				label := "study"
+				if tgt.level == "SERIES" {
+					label = "series"
+				}
 				fyne.Do(func() {
-					statusLabel.SetText(fmt.Sprintf("Retrieving study %d/%d…", idx, count))
+					statusLabel.SetText(fmt.Sprintf("Retrieving %s %d/%d…", label, idx, count))
 				})
-				err := client.Move(ctx, "STUDY", tgt.patientID, tgt.studyUID, "", cfg.LocalAETitle, func(p MoveProgress) {
+				err := client.Move(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, cfg.LocalAETitle, func(p MoveProgress) {
 					sub := p.Remaining + p.Completed + p.Failed + p.Warning
 					if sub > 0 {
 						frac := (float64(i) + float64(p.Completed)/float64(sub)) / float64(count)
@@ -640,9 +763,21 @@ func main() {
 	helpMenu := fyne.NewMenu("Help",
 		fyne.NewMenuItem("About", func() {
 			lbl := widget.NewLabel(fmt.Sprintf(
-				"dicomqr\nVersion %s\nBuild date: %s\n\nDICOM Q/R client for querying and\nretrieving studies from a PACS server.",
+				"dicomqr  %s  (built %s)\n"+
+					"DICOM Q/R client for querying and retrieving studies from a PACS server.\n\n"+
+					"Developer\n"+
+					"  Jeffrey Leal  <jeffrey.leal@gmail.com>\n"+
+					"  github.com/jeffrey-leal\n\n"+
+					"Developed with AI assistance from Claude Sonnet 4.6 (Anthropic)\n\n"+
+					"Open-source libraries\n"+
+					"  fyne.io/fyne/v2                  — GUI framework\n"+
+					"  github.com/algm/go-netdicom      — DICOM networking\n"+
+					"  github.com/grailbio/go-dicom     — DICOM file parsing\n"+
+					"  github.com/suyashkumar/dicom     — DICOM file parsing\n"+
+					"  github.com/sqweek/dialog         — native file/folder picker",
 				version, bd))
-			dialog.ShowCustom("About dicomqr", "OK", lbl, w)
+			lbl.TextStyle = fyne.TextStyle{Monospace: true}
+			dialog.ShowCustom("About dicomqr", "OK", container.NewPadded(lbl), w)
 		}),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Client info…", func() {

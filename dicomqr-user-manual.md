@@ -106,11 +106,11 @@ Click **Filters ▾** in the server row to open the search criteria panel. The p
 | Patient Name | Matches the DICOM Patient Name attribute. Supports DICOM wildcard characters: `*` matches any sequence of characters, `?` matches a single character. Format: `FAMILY^GIVEN` or a partial name with wildcards (e.g. `DOE*`). Leave blank to match all patients. |
 | Patient ID | Matches the DICOM Patient ID (MRN). Supports wildcards. Leave blank to match all IDs. |
 | Accession No | Matches the DICOM Accession Number. Leave blank to match all accession numbers. |
-| Study Date From | The start of the study date range in `YYYYMMDD` format. Leave blank for no lower bound. |
-| Study Date To | The end of the study date range in `YYYYMMDD` format. Leave blank for no upper bound. |
-| Modality | Restricts results to a specific imaging modality. Select **(Any)** to include all modalities. Available options: CT, MR, PT, NM, US, CR, DX, XA, RF. |
+| Study Date From | The start of the study date range. Click the calendar icon to open a month-view date picker and select a date, or type directly into the field. Leave blank for no lower bound. |
+| Study Date To | The end of the study date range. Click the calendar icon to open a month-view date picker and select a date, or type directly into the field. Leave blank for no upper bound. |
+| Modality | Restricts results to one or more imaging modalities. Tick any combination of the checkboxes: CT, MR, PT, NM, US, CR, DX, XA, RF. When multiple modalities are ticked, a separate query is sent for each and the results are merged. Leave all checkboxes unticked to include all modalities. |
 
-At least one field should be populated before searching. Sending a completely unconstrained query (all fields blank, modality set to Any) may return a very large result set or be rejected by the PACS.
+At least one field should be populated before searching. Sending a completely unconstrained query (all fields blank, no modalities ticked) may return a very large result set or be rejected by the PACS.
 
 ### 5.3 Running a Search
 
@@ -136,7 +136,7 @@ Results are displayed in an expandable tree with three levels:
 
 **Series** — one or more series under each study. The label shows the series number, modality, series description, and image count.
 
-Click the expand arrow on any branch to reveal its children. All branches are expanded automatically after a successful search.
+The tree starts fully collapsed after each search. Click the expand arrow next to a patient node to reveal its studies. Click the expand arrow next to a study node to load its series — dicomqr sends a separate C-FIND query to the PACS at this point to retrieve series-level information. The series list is fetched once per study per session; collapsing and re-expanding a study does not repeat the query.
 
 ### 6.2 Filtering Results
 
@@ -148,7 +148,14 @@ The filter acts on the already-loaded results and does not send a new query to t
 
 Click any row in the results tree to select it. Selected rows are shown in bold in the primary accent color. Click the same row again to deselect it. Multiple rows at any level (patient, study, or series) may be selected simultaneously.
 
-When a patient or study node is selected for retrieval, dicomqr retrieves all studies under that patient, or all series under that study, respectively.
+Series nodes are only visible after a study has been expanded. Expand a study first, then select individual series for retrieval.
+
+Selection behaviour during retrieval:
+
+- **Patient node selected** — all studies under that patient are retrieved.
+- **Study node selected** — the entire study is retrieved as a single C-MOVE request.
+- **Series node(s) selected** — each selected series is retrieved individually.
+- **Mixed selection** — if a study and one or more of its series are both selected, the study-level C-MOVE takes precedence and the series are not sent as duplicate requests.
 
 Press `Ctrl+C` to copy the full label text of any selected row to the clipboard.
 
@@ -181,13 +188,13 @@ The following conditions must be met before a retrieval can proceed:
 
 ### 7.2 Starting a Retrieve
 
-Select one or more rows in the results tree, then click **Retrieve Selected** (or select **Query > Retrieve Selected**). dicomqr sends a C-MOVE request to the PACS for each selected study. The PACS responds by pushing the DICOM files to the local SCP listener, which writes them to the download folder.
+Select one or more rows in the results tree, then click **Retrieve Selected** (or select **Query > Retrieve Selected**). dicomqr sends a C-MOVE request to the PACS for each selected item. Selecting a study retrieves all of its series in a single C-MOVE; selecting individual series sends one C-MOVE per series. The PACS responds by pushing the DICOM files to the local SCP listener, which writes them to the download folder.
 
-A progress bar appears below the retrieve buttons and advances as each study is transferred. The status bar shows which study is currently being retrieved.
+A progress bar appears below the retrieve buttons and advances as each study or series is transferred. The status bar shows which item is currently being retrieved.
 
 ### 7.3 Progress
 
-The progress bar tracks completion across all selected studies. As each file arrives, the status bar briefly shows the path of the received file.
+The progress bar tracks completion across all selected studies and series. As each file arrives, the status bar briefly shows the path of the received file.
 
 ### 7.4 Completion
 
@@ -324,8 +331,11 @@ The status bar at the bottom of the window provides real-time feedback on the ap
 | Query complete | `Query complete — <N> studies` |
 | Query error | `Query error: <reason>` |
 | Disconnected | `Disconnected` |
-| Retrieve starting | `Starting retrieve of <N> studies…` |
-| Retrieve in progress | `Retrieving study <N>/<total>…` |
+| Retrieve starting (studies) | `Starting retrieve of <N> studies…` |
+| Retrieve starting (single study) | `Starting retrieve of 1 study…` |
+| Retrieve starting (series) | `Starting retrieve of <N> series…` |
+| Retrieve in progress (study) | `Retrieving study <N>/<total>…` |
+| Retrieve in progress (series) | `Retrieving series <N>/<total>…` |
 | File received | `Received: <file path>` |
 | Retrieve complete | `Retrieved <N> files successfully` |
 | Retrieve cancelled | `Retrieve cancelled` |
@@ -373,3 +383,29 @@ The following points are commonly required when configuring a PACS to work with 
 **Information model** — Different PACS products implement either Study Root or Patient Root query models, or both. If queries return no results or an error, try changing the Info model field in the server profile from **study** to **patient**, or vice versa.
 
 **IPv4 connectivity** — dicomqr listens on an IPv4 socket only. The PACS must connect to the workstation's IPv4 address. Ensure the address shown in **Help > Client info…** is the correct IPv4 address on the same network as the PACS.
+
+---
+
+## Appendix C: Credits and Acknowledgements
+
+### Developer
+
+dicomqr was written by **Jeffrey Leal** (<jeffrey.leal@gmail.com>, [github.com/jeffrey-leal](https://github.com/jeffrey-leal)).
+
+### AI Assistance
+
+This application was developed with assistance from **Claude Sonnet 4.6**, an AI assistant created by [Anthropic](https://www.anthropic.com).
+
+### Open-Source Libraries
+
+dicomqr is built on the following open-source projects:
+
+| Library | Repository | Purpose |
+|---|---|---|
+| Fyne | [fyne.io/fyne/v2](https://github.com/fyne-io/fyne) | Cross-platform GUI framework |
+| go-netdicom | [github.com/algm/go-netdicom](https://github.com/algm/go-netdicom) | DICOM networking (C-ECHO, C-FIND, C-MOVE SCU; C-STORE SCP) |
+| go-dicom (grailbio) | [github.com/grailbio/go-dicom](https://github.com/grailbio/go-dicom) | DICOM tag definitions and element parsing |
+| go-dicom (suyashkumar) | [github.com/suyashkumar/dicom](https://github.com/suyashkumar/dicom) | DICOM file reading for received files |
+| dialog | [github.com/sqweek/dialog](https://github.com/sqweek/dialog) | Native Windows file and folder picker dialogs |
+
+All libraries are used under their respective open-source licences.

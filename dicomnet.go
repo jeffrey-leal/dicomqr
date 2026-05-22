@@ -195,8 +195,20 @@ func levelToQRLevel(level string) netdicom.QRLevel {
 
 // buildFindFilter builds a C-FIND identifier dataset from the UI query params.
 // Empty-value elements act as return keys; non-empty values are match criteria.
-// StudyDate uses DICOM range syntax (YYYYMMDD-YYYYMMDD, PS3.4 C.2.2.2.5).
+// At SERIES level only StudyInstanceUID is used as a match key; all other fields
+// are return keys. StudyDate uses DICOM range syntax (PS3.4 C.2.2.2.5).
 func buildFindFilter(level string, params map[string]string) []*dicom.Element {
+	if strings.ToUpper(level) == "SERIES" {
+		return []*dicom.Element{
+			dicom.MustNewElement(dicomtag.SpecificCharacterSet, "ISO_IR 192"),
+			dicom.MustNewElement(dicomtag.StudyInstanceUID, params["StudyInstanceUID"]),
+			dicom.MustNewElement(dicomtag.SeriesInstanceUID, ""),
+			dicom.MustNewElement(dicomtag.SeriesNumber, ""),
+			dicom.MustNewElement(dicomtag.Modality, ""),
+			dicom.MustNewElement(dicomtag.SeriesDescription, ""),
+			dicom.MustNewElement(dicomtag.NumberOfSeriesRelatedInstances, ""),
+		}
+	}
 	dateRange := buildDateRange(params["StudyDateFrom"], params["StudyDateTo"])
 	return []*dicom.Element{
 		dicom.MustNewElement(dicomtag.SpecificCharacterSet, "ISO_IR 192"),
@@ -278,6 +290,10 @@ func elementsToFindResult(elems []*dicom.Element) FindResult {
 		case dicomtag.InstanceNumber:
 			if n, err2 := strconv.Atoi(s); err2 == nil {
 				r.InstanceNumber = n
+			}
+		case dicomtag.NumberOfSeriesRelatedInstances:
+			if n, err2 := strconv.Atoi(s); err2 == nil {
+				r.NumInstances = n
 			}
 		}
 	}

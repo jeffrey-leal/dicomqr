@@ -22,10 +22,12 @@ type resultNode struct {
 	children []string
 
 	// DICOM identifiers used when building C-MOVE query datasets
-	patientID        string
-	studyInstanceUID string
+	patientID         string
+	studyInstanceUID  string
 	seriesInstanceUID string
-	sopInstanceUID   string
+	sopInstanceUID    string
+
+	seriesLoaded bool // true once a series C-FIND has been fired for this study node
 }
 
 // resultsModel is the data model backing the Fyne widget.Tree for query results.
@@ -100,9 +102,23 @@ func (m *resultsModel) addSeries(studyUID, seriesUID, modality, seriesNumber, se
 		}
 		m.nodes[rID] = &resultNode{
 			id: rID, kind: kindSeries, label: label, tooltip: tooltip,
-			studyInstanceUID: studyUID, seriesInstanceUID: seriesUID,
+			patientID:         study.patientID, // propagate so retrieve can build C-MOVE filters
+			studyInstanceUID:  studyUID,
+			seriesInstanceUID: seriesUID,
 		}
 		study.children = append(study.children, rID)
+		m.applyFilter()
+	}
+}
+
+func (m *resultsModel) isSeriesLoaded(id string) bool {
+	n, ok := m.nodes[id]
+	return ok && n.seriesLoaded
+}
+
+func (m *resultsModel) markSeriesLoaded(id string) {
+	if n, ok := m.nodes[id]; ok {
+		n.seriesLoaded = true
 	}
 }
 
@@ -171,9 +187,9 @@ func (m *resultsModel) isBranch(id string) bool {
 	if !ok {
 		return false
 	}
-	// Patient nodes are always expandable (they always contain study children).
-	// Study and series nodes are leaves unless series/image children are present.
-	return n.kind == kindPatient || len(n.children) > 0
+	// Patient and study nodes are always branches; study nodes show an expand
+	// arrow before series are loaded so OnBranchOpened can trigger lazy loading.
+	return n.kind == kindPatient || n.kind == kindStudy
 }
 
 func (m *resultsModel) labelFor(id string) string {
