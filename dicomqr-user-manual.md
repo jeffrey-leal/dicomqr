@@ -1,6 +1,6 @@
 # dicomqr User Manual
 
-Version 0.1.0
+Version 0.1.1
 
 ---
 
@@ -323,7 +323,7 @@ The status bar at the bottom of the window provides real-time feedback on the ap
 
 | Situation | Status bar text |
 |---|---|
-| Application started, not connected | `v0.1.0` |
+| Application started, not connected | `v0.1.1` |
 | Connecting to server | `Connecting…` |
 | Connected | `Connected: <AE>@<host>:<port>  \|  SCP <address> (AE: <title>)` |
 | Connection failed | `Connection failed: <reason>` |
@@ -390,22 +390,39 @@ The following points are commonly required when configuring a PACS to work with 
 
 ### Developer
 
-dicomqr was written by **Jeffrey Leal** (<jeffrey.leal@gmail.com>, [github.com/jeffrey-leal](https://github.com/jeffrey-leal)).
+**Jeffrey Leal**
+Email: jeffrey.leal@gmail.com
+GitHub: https://github.com/jeffrey-leal
 
 ### AI Assistance
 
-This application was developed with assistance from **Claude Sonnet 4.6**, an AI assistant created by [Anthropic](https://www.anthropic.com).
+This application was designed and developed with the assistance of **Claude Sonnet 4.6** by [Anthropic](https://www.anthropic.com). Architecture planning, code generation, DICOM standard research, and documentation were produced in collaboration with Claude Code.
+
+### UI Template
+
+This application's structure, conventions, and UI patterns are derived from **dicomhdr** — a Fyne-based DICOM file inspector by the same developer.
+https://github.com/jeffrey-leal/dicomhdr
+
+### DICOM Standard Reference
+
+Protocol implementation follows the DICOM Standard published by NEMA:
+
+**DICOM PS3 (2024b)** — https://dicom.nema.org/medical/dicom/current
+
+Sections referenced:
+- PS3.4 — Service Class Specifications (Query/Retrieve, C.4)
+- PS3.7 — Message Exchange (DIMSE-C services: C-ECHO, C-FIND, C-MOVE, C-STORE)
+- PS3.8 — Network Communication / DICOM Upper Layer Protocol
 
 ### Open-Source Libraries
 
-dicomqr is built on the following open-source projects:
+| Library | Author / Maintainer | Licence | Purpose |
+|---|---|---|---|
+| [fyne.io/fyne/v2](https://fyne.io) v2.7.3 | Fyne.io contributors | BSD 3-Clause | GUI framework |
+| [algm/go-netdicom](https://github.com/algm/go-netdicom) v0.1.0 | Alan Griffin (fork of grailbio) | BSD 3-Clause | DICOM network protocol (C-ECHO, C-FIND, C-MOVE, C-STORE SCP) |
+| [grailbio/go-netdicom](https://github.com/grailbio/go-netdicom) | Yasushi Saito / GRAIL Inc. | BSD 3-Clause | Original DICOM networking library (base of go-netdicom fork) |
+| [grailbio/go-dicom](https://github.com/grailbio/go-dicom) | GRAIL Inc. | Apache 2.0 | DICOM dataset encoding / file header writing |
+| [suyashkumar/dicom](https://github.com/suyashkumar/dicom) v1.1.0 | Suyash Kumar | MIT | DICOM file parsing for received files |
+| [sqweek/dialog](https://github.com/sqweek/dialog) | sqweek | ISC | Native Windows file/folder picker dialogs |
 
-| Library | Repository | Purpose |
-|---|---|---|
-| Fyne | [fyne.io/fyne/v2](https://github.com/fyne-io/fyne) | Cross-platform GUI framework |
-| go-netdicom | [github.com/algm/go-netdicom](https://github.com/algm/go-netdicom) | DICOM networking (C-ECHO, C-FIND, C-MOVE SCU; C-STORE SCP) |
-| go-dicom (grailbio) | [github.com/grailbio/go-dicom](https://github.com/grailbio/go-dicom) | DICOM tag definitions and element parsing |
-| go-dicom (suyashkumar) | [github.com/suyashkumar/dicom](https://github.com/suyashkumar/dicom) | DICOM file reading for received files |
-| dialog | [github.com/sqweek/dialog](https://github.com/sqweek/dialog) | Native Windows file and folder picker dialogs |
-
-All libraries are used under their respective open-source licences.
+All libraries are used under their respective open-source licences. A vendored copy of `algm/go-netdicom` is included under `thirdparty/go-netdicom` with its original BSD 3-Clause licence intact.
