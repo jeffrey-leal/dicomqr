@@ -23,7 +23,7 @@ import (
 	sqweekdialog "github.com/sqweek/dialog"
 )
 
-const version = "0.1.0"
+const version = "0.1.1"
 
 // buildDate is injected at link time: -ldflags "-X main.buildDate=YYYY-MM-DD"
 var buildDate string
@@ -763,21 +763,33 @@ func main() {
 	helpMenu := fyne.NewMenu("Help",
 		fyne.NewMenuItem("About", func() {
 			lbl := widget.NewLabel(fmt.Sprintf(
-				"dicomqr  %s  (built %s)\n"+
-					"DICOM Q/R client for querying and retrieving studies from a PACS server.\n\n"+
+				"dicomqr  v%s  (built %s)\n"+
+					"DICOM Query/Retrieve client — query and retrieve studies from a PACS server.\n"+
+					"Implements DICOM PS3.4/PS3.7: C-ECHO, C-FIND, C-MOVE, C-STORE SCP.\n\n"+
 					"Developer\n"+
 					"  Jeffrey Leal  <jeffrey.leal@gmail.com>\n"+
-					"  github.com/jeffrey-leal\n\n"+
-					"Developed with AI assistance from Claude Sonnet 4.6 (Anthropic)\n\n"+
-					"Open-source libraries\n"+
-					"  fyne.io/fyne/v2                  — GUI framework\n"+
-					"  github.com/algm/go-netdicom      — DICOM networking\n"+
-					"  github.com/grailbio/go-dicom     — DICOM file parsing\n"+
-					"  github.com/suyashkumar/dicom     — DICOM file parsing\n"+
-					"  github.com/sqweek/dialog         — native file/folder picker",
+					"  https://github.com/jeffrey-leal\n\n"+
+					"AI Assistance\n"+
+					"  Claude Sonnet 4.6 by Anthropic  (https://anthropic.com)\n"+
+					"  Architecture, code generation, and DICOM standard research.\n\n"+
+					"UI Template\n"+
+					"  dicomhdr by Jeffrey Leal\n"+
+					"  https://github.com/jeffrey-leal/dicomhdr\n\n"+
+					"DICOM Standard Reference\n"+
+					"  DICOM PS3 (2024b) — https://dicom.nema.org/medical/dicom/current\n\n"+
+					"Open-Source Libraries\n"+
+					"  fyne.io/fyne/v2 v2.7.3              Fyne.io — GUI framework (BSD 3-Clause)\n"+
+					"  github.com/algm/go-netdicom v0.1.0  Alan Griffin — DICOM networking (BSD 3-Clause)\n"+
+					"  github.com/grailbio/go-netdicom     Yasushi Saito / GRAIL — base networking lib\n"+
+					"  github.com/grailbio/go-dicom        GRAIL Inc. — DICOM encoding (Apache 2.0)\n"+
+					"  github.com/suyashkumar/dicom        Suyash Kumar — DICOM parsing (MIT)\n"+
+					"  github.com/sqweek/dialog            sqweek — native file dialogs (ISC)\n\n"+
+					"Full credits: CREDITS.md in the project repository.",
 				version, bd))
 			lbl.TextStyle = fyne.TextStyle{Monospace: true}
-			dialog.ShowCustom("About dicomqr", "OK", container.NewPadded(lbl), w)
+			d := dialog.NewCustom("About dicomqr", "OK", container.NewPadded(lbl), w)
+			d.Resize(fyne.NewSize(620, 0))
+			d.Show()
 		}),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Client info…", func() {

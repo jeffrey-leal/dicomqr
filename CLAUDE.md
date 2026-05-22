@@ -46,6 +46,14 @@ CGO_ENABLED=1 CC=/c/msys64/mingw64/bin/gcc.exe \
 - `github.com/suyashkumar/dicom v1.1.0` — DICOM file parsing (for received files)
 - `github.com/sqweek/dialog` — native Windows file/folder picker
 
+## Documentation
+
+| File | Purpose |
+|---|---|
+| `CREDITS.md` | Full attribution — developer, AI assistance, DICOM standard reference, open-source libraries |
+| `CHANGELOG.md` | Version history |
+| `dicomqr-user-manual.md` | End-user guide |
+
 ## Notes
 
 - App ID: `com.jeffreyleal.dicomqr`
