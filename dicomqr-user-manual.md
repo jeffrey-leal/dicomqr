@@ -1,6 +1,6 @@
 # dicomqr User Manual
 
-Version 0.1.1
+Version 0.1.2
 
 ---
 
@@ -323,7 +323,7 @@ The status bar at the bottom of the window provides real-time feedback on the ap
 
 | Situation | Status bar text |
 |---|---|
-| Application started, not connected | `v0.1.1` |
+| Application started, not connected | `v0.1.2` |
 | Connecting to server | `Connecting…` |
 | Connected | `Connected: <AE>@<host>:<port>  \|  SCP <address> (AE: <title>)` |
 | Connection failed | `Connection failed: <reason>` |

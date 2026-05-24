@@ -6,8 +6,10 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -23,7 +25,7 @@ import (
 	sqweekdialog "github.com/sqweek/dialog"
 )
 
-const version = "0.1.1"
+const version = "0.1.2"
 
 // buildDate is injected at link time: -ldflags "-X main.buildDate=YYYY-MM-DD"
 var buildDate string
@@ -124,15 +126,19 @@ func main() {
 		tree.Refresh()
 	}
 
+	// startRetrieve is assigned below after the retrieve variables are in scope.
+	var startRetrieve func(nodeIDs []string)
+
 	onMenu := func(id string, pos fyne.Position) {
 		_, studyUID, seriesUID, _ := model.uidsForNode(id)
 		uid := seriesUID
 		if uid == "" {
 			uid = studyUID
 		}
+		retrieveItem := fyne.NewMenuItem("Retrieve", func() { startRetrieve([]string{id}) })
 		copyUID := fyne.NewMenuItem("Copy UID", func() { w.Clipboard().SetContent(uid) })
 		copyLabel := fyne.NewMenuItem("Copy label", func() { w.Clipboard().SetContent(model.labelFor(id)) })
-		popup := widget.NewPopUpMenu(fyne.NewMenu("", copyUID, copyLabel), w.Canvas())
+		popup := widget.NewPopUpMenu(fyne.NewMenu("", retrieveItem, fyne.NewMenuItemSeparator(), copyUID, copyLabel), w.Canvas())
 		popup.ShowAtPosition(pos)
 	}
 
@@ -258,37 +264,60 @@ func main() {
 
 			go func() {
 				defer cancel()
+
+				type queryResult struct {
+					results []FindResult
+					err     error
+				}
+				resultsCh := make(chan queryResult, len(paramSets))
+
+				var wg sync.WaitGroup
+				for _, params := range paramSets {
+					wg.Add(1)
+					go func(p map[string]string) {
+						defer wg.Done()
+						ch, err := client.Find(ctx, activeProfile.InfoModel, p)
+						if err != nil {
+							resultsCh <- queryResult{err: err}
+							return
+						}
+						var results []FindResult
+						var findErr error
+						for r := range ch {
+							if r.Err != nil {
+								findErr = r.Err
+								break
+							}
+							results = append(results, r)
+						}
+						for range ch {} // drain so Find's goroutine can exit
+						resultsCh <- queryResult{results: results, err: findErr}
+					}(params)
+				}
+				go func() { wg.Wait(); close(resultsCh) }()
+
 				seen := make(map[string]bool)
 				var allResults []FindResult
-				var queryErr error
-				for _, params := range paramSets {
-					if ctx.Err() != nil {
-						break
-					}
-					ch, err := client.Find(ctx, activeProfile.InfoModel, params)
-					if err != nil {
-						queryErr = err
-						break
-					}
-					for r := range ch {
-						if r.Err != nil {
-							queryErr = r.Err
-							break
+				var firstErr error
+				for qr := range resultsCh {
+					if qr.err != nil {
+						if firstErr == nil {
+							firstErr = qr.err
 						}
+						continue
+					}
+					for _, r := range qr.results {
 						if !seen[r.StudyInstanceUID] {
 							seen[r.StudyInstanceUID] = true
 							allResults = append(allResults, r)
 						}
 					}
-					for range ch {} // drain so Find's goroutine can exit
-					if queryErr != nil {
-						break
-					}
 				}
-				if queryErr != nil {
+
+				if firstErr != nil && len(allResults) == 0 {
 					fyne.Do(func() {
 						progressBar.Hide()
-						statusLabel.SetText("Query error: " + queryErr.Error())
+						statusLabel.SetText("Query error: " + firstErr.Error())
 					})
 					return
 				}
@@ -541,9 +570,25 @@ func main() {
 		}()
 	})
 
+	openFolderBtn := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {
+		dir := cfg.DownloadDir
+		if dir == "" {
+			dialog.ShowInformation("No folder set", "Select a download folder first.", w)
+			return
+		}
+		go exec.Command("explorer", dir).Start()
+	})
+
 	var cancelRetrieve context.CancelFunc
 
-	retrieveBtn := widget.NewButton("Retrieve Selected", func() {
+	type retrieveTarget struct {
+		level     string // "STUDY" or "SERIES"
+		patientID string
+		studyUID  string
+		seriesUID string
+	}
+
+	startRetrieve = func(nodeIDs []string) {
 		if state != stateConnected || client == nil {
 			dialog.ShowInformation("Not connected", "Connect to a DICOM server first.", w)
 			return
@@ -554,20 +599,14 @@ func main() {
 			return
 		}
 
-		// Collect retrieve targets from selected nodes.
+		// Collect retrieve targets from the supplied node IDs.
 		// Patient → all study children at STUDY level.
 		// Study   → STUDY level.
-		// Series  → SERIES level, unless its parent study is also selected.
-		type retrieveTarget struct {
-			level     string // "STUDY" or "SERIES"
-			patientID string
-			studyUID  string
-			seriesUID string
-		}
+		// Series  → SERIES level, unless its parent study is also in the list.
 		studySeen := make(map[string]bool)
 		var targets []retrieveTarget
 		var pendingSeries []retrieveTarget
-		for id := range selectedNodes {
+		for _, id := range nodeIDs {
 			patID, studyUID, seriesUID, _ := model.uidsForNode(id)
 			switch {
 			case studyUID == "":
@@ -586,11 +625,11 @@ func main() {
 					targets = append(targets, retrieveTarget{"STUDY", patID, studyUID, ""})
 				}
 			default:
-				// Series node — defer until we know which studies are selected.
+				// Series node — defer until we know which studies are in the list.
 				pendingSeries = append(pendingSeries, retrieveTarget{"SERIES", patID, studyUID, seriesUID})
 			}
 		}
-		// Add series targets only when their parent study was not selected directly.
+		// Add series targets only when their parent study was not included directly.
 		for _, t := range pendingSeries {
 			if !studySeen[t.studyUID] {
 				targets = append(targets, t)
@@ -681,6 +720,14 @@ func main() {
 				}
 			})
 		}()
+	}
+
+	retrieveBtn := widget.NewButton("Retrieve Selected", func() {
+		ids := make([]string, 0, len(selectedNodes))
+		for id := range selectedNodes {
+			ids = append(ids, id)
+		}
+		startRetrieve(ids)
 	})
 
 	cancelRetrieveBtn := widget.NewButton("Cancel", func() {
@@ -693,7 +740,7 @@ func main() {
 		widget.NewSeparator(),
 		container.NewBorder(nil, nil,
 			widget.NewLabel("Download to:"),
-			browseBtn,
+			container.NewHBox(openFolderBtn, browseBtn),
 			downloadDirEntry,
 		),
 		container.NewHBox(retrieveBtn, cancelRetrieveBtn),

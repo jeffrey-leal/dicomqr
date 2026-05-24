@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.1.2] — 2026-05-24
+
+### Added
+- **Series-level query and retrieve** — expanding a study node fires a
+  C-FIND at SERIES level and populates series children on demand; individual
+  series can be selected and retrieved via C-MOVE at SERIES level; mixed
+  study + series selections are deduplicated automatically
+- **Date picker controls** — Study Date From / To fields replaced with
+  `widget.DateEntry` (calendar icon opens a month-view popup picker)
+- **Multi-select modality filter** — single Select dropdown replaced with
+  horizontal checkboxes; multiple modalities can be ticked simultaneously
+- **Parallel modality queries** — when multiple modalities are selected each
+  C-FIND is dispatched concurrently (`sync.WaitGroup`); results are merged
+  and deduplicated client-side; multi-modality search time is now equal to
+  a single-modality search rather than N × single search time
+- **Open download folder button** — icon button in the retrieve panel opens
+  the configured download folder in Windows Explorer
+- **Right-click Retrieve** — results tree context menu now includes a
+  Retrieve item that retrieves the right-clicked node directly, independent
+  of the current selection
+- **Credits** — About dialog and user manual Appendix C list the developer,
+  AI assistance (Claude Sonnet 4.6 / Anthropic), and all open-source libraries
+
+### Changed
+- Results tree starts fully **collapsed** after each search; expanding a
+  study node triggers the series C-FIND (previously all branches were
+  auto-expanded, which prevented series from loading correctly)
+- Cleared date fields no longer show a validation error
+
+---
+
 ## [0.1.1] — 2026-05-22
 
 ### Added
