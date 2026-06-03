@@ -1038,8 +1038,10 @@ func main() {
 		}),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Client info…", func() {
-			info := fmt.Sprintf("Local AE Title:  %s\nLocal SCP port:  %d\nLocal IP:        %s\n\nRegister these on your PACS to enable C-MOVE.",
-				cfg.LocalAETitle, cfg.LocalSCPPort, localIP())
+			info := fmt.Sprintf("%14s: %s\n%14s: %d\n%14s: %s\n\nRegister these on your PACS to enable C-MOVE.",
+				"Local AE Title", cfg.LocalAETitle,
+				"Local SCP port", cfg.LocalSCPPort,
+				"Local IP", localIP())
 			lbl := widget.NewLabel(info)
 			lbl.TextStyle = fyne.TextStyle{Monospace: true}
 			d := dialog.NewCustom("Client Info", "Close", container.NewPadded(lbl), w)
