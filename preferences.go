@@ -32,7 +32,10 @@ func (t *appTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) co
 }
 
 func (t *appTheme) Font(style fyne.TextStyle) fyne.Resource {
-	if t.font != nil {
+	// Always delegate monospace requests to the base theme so that
+	// TextStyle{Monospace: true} renders with a proper fixed-width font
+	// regardless of which proportional font the user has selected.
+	if t.font != nil && !style.Monospace {
 		return t.font
 	}
 	return t.base.Font(style)
