@@ -31,6 +31,16 @@ type resultNode struct {
 	sopInstanceUID    string
 
 	seriesLoaded bool // true once a series C-FIND has been fired for this study node
+
+	// Raw DICOM field values retained for CSV/JSON export (Phase 4-A).
+	patientName  string // patient nodes
+	studyDate    string // study nodes
+	studyDesc    string // study nodes
+	accession    string // study nodes
+	modalities   string // study nodes
+	seriesNumber string // series nodes
+	modality     string // series nodes
+	numInstances int    // series nodes
 }
 
 // resultsModel is the data model backing the Fyne widget.Tree for query results.
@@ -70,8 +80,9 @@ func (m *resultsModel) addStudy(patientName, patientID, studyUID, studyDate, stu
 		}
 		m.nodes[patID] = &resultNode{
 			id: patID, kind: kindPatient, label: label,
-			patientID: patientID,
-			sortKey:   strings.ToLower(patientName),
+			patientID:   patientID,
+			patientName: patientName,
+			sortKey:     strings.ToLower(patientName),
 		}
 		m.sortedInsert(&m.roots, patID)
 	}
@@ -92,7 +103,11 @@ func (m *resultsModel) addStudy(patientName, patientID, studyUID, studyDate, stu
 		m.nodes[sID] = &resultNode{
 			id: sID, kind: kindStudy, label: label, tooltip: tooltip,
 			patientID: patientID, studyInstanceUID: studyUID,
-			sortKey: studyDate,
+			sortKey:    studyDate,
+			studyDate:  studyDate,
+			studyDesc:  studyDesc,
+			accession:  accession,
+			modalities: modalities,
 		}
 		parent := m.nodes[patID]
 		m.sortedInsert(&parent.children, sID)
@@ -123,6 +138,9 @@ func (m *resultsModel) addSeries(studyUID, seriesUID, modality, seriesNumber, se
 			studyInstanceUID:  studyUID,
 			seriesInstanceUID: seriesUID,
 			sortKey:           fmt.Sprintf("%010d", n),
+			seriesNumber:      seriesNumber,
+			modality:          modality,
+			numInstances:      numInstances,
 		}
 		m.sortedInsert(&study.children, rID)
 	}
@@ -230,4 +248,64 @@ func (m *resultsModel) uidsForNode(id string) (patientID, studyUID, seriesUID, s
 		return
 	}
 	return n.patientID, n.studyInstanceUID, n.seriesInstanceUID, n.sopInstanceUID
+}
+
+// ExportRow is one flat record produced for CSV/JSON export.
+type ExportRow struct {
+	PatientName  string `json:"patientName"`
+	PatientID    string `json:"patientID"`
+	StudyDate    string `json:"studyDate"`
+	StudyDesc    string `json:"studyDescription"`
+	Accession    string `json:"accessionNumber"`
+	Modalities   string `json:"modalities"`
+	StudyUID     string `json:"studyInstanceUID"`
+	SeriesUID    string `json:"seriesInstanceUID"`
+	SeriesNumber string `json:"seriesNumber"`
+	Modality     string `json:"modality"`
+	NumInstances int    `json:"numInstances"`
+}
+
+// exportRows returns a flat list of all visible study/series nodes for export.
+// Studies with no series loaded produce one row each; studies with series loaded
+// produce one row per series.
+func (m *resultsModel) exportRows() []ExportRow {
+	var rows []ExportRow
+	for _, patID := range m.roots {
+		pat, ok := m.nodes[patID]
+		if !ok {
+			continue
+		}
+		for _, studyID := range pat.children {
+			study, ok := m.nodes[studyID]
+			if !ok {
+				continue
+			}
+			base := ExportRow{
+				PatientName: pat.patientName,
+				PatientID:   pat.patientID,
+				StudyDate:   study.studyDate,
+				StudyDesc:   study.studyDesc,
+				Accession:   study.accession,
+				Modalities:  study.modalities,
+				StudyUID:    study.studyInstanceUID,
+			}
+			if len(study.children) == 0 {
+				rows = append(rows, base)
+				continue
+			}
+			for _, seriesID := range study.children {
+				sr, ok := m.nodes[seriesID]
+				if !ok {
+					continue
+				}
+				row := base
+				row.SeriesUID = sr.seriesInstanceUID
+				row.SeriesNumber = sr.seriesNumber
+				row.Modality = sr.modality
+				row.NumInstances = sr.numInstances
+				rows = append(rows, row)
+			}
+		}
+	}
+	return rows
 }

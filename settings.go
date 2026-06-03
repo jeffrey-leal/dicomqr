@@ -56,19 +56,23 @@ func ensureDefaultSettings() {
 
 // loadSettings reads ~/.dicomqr/settings.json, overlaying saved values on top
 // of compiled-in defaults so new fields always have a sensible value.
+// If DownloadDir is still empty after loading, it defaults to ~/DICOM Downloads.
 func loadSettings() Settings {
 	var s Settings
 	json.Unmarshal(defaultSettingsJSON, &s)
 
 	path, err := appSettingsPath()
-	if err != nil {
-		return s
+	if err == nil {
+		if data, err := os.ReadFile(path); err == nil {
+			json.Unmarshal(data, &s)
+		}
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return s
+
+	if s.DownloadDir == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			s.DownloadDir = filepath.Join(home, "DICOM Downloads")
+		}
 	}
-	json.Unmarshal(data, &s)
 	return s
 }
 

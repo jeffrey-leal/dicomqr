@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	netdicom "github.com/algm/go-netdicom"
+	"github.com/algm/go-netdicom/dimse"
 	"github.com/algm/go-netdicom/sopclass"
 	dicom "github.com/grailbio/go-dicom"
 	"github.com/grailbio/go-dicom/dicomtag"
@@ -180,6 +181,49 @@ func (c *DicomClient) Move(ctx context.Context, level, patientID, studyUID, seri
 	}
 }
 
+// Get sends a C-GET-RQ (PS3.4 C.4.3) for the given UIDs, causing the PACS to
+// return DICOM instances over the same association. onStore is called once per
+// received instance; returning a non-nil error sends CStoreOutOfResources and
+// aborts the retrieve. C-GET does not require a separate inbound C-STORE SCP.
+// Returns nil when the final response carries StatusSuccess (0000H).
+func (c *DicomClient) Get(ctx context.Context, level, patientID, studyUID, seriesUID string,
+	onStore func(transferSyntaxUID, sopClassUID, sopInstanceUID string, data []byte) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	su, err := netdicom.NewServiceUser(netdicom.ServiceUserParams{
+		CalledAETitle:  c.profile.RemoteAETitle,
+		CallingAETitle: c.localAETitle,
+		SOPClasses:     sopclass.QRGetClasses,
+	})
+	if err != nil {
+		return fmt.Errorf("c-get: create service user: %w", err)
+	}
+
+	type result struct{ err error }
+	done := make(chan result, 1)
+
+	go func() {
+		defer su.Release()
+		su.Connect(fmt.Sprintf("%s:%d", c.profile.Host, c.profile.Port))
+		done <- result{su.CGet(levelToQRLevel(level), buildMoveFilter(level, patientID, studyUID, seriesUID),
+			func(txUID, scUID, siUID string, data []byte) dimse.Status {
+				if storeErr := onStore(txUID, scUID, siUID, data); storeErr != nil {
+					return dimse.Status{Status: dimse.CStoreOutOfResources, ErrorComment: storeErr.Error()}
+				}
+				return dimse.Success
+			})}
+	}()
+
+	select {
+	case r := <-done:
+		return r.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // levelToQRLevel maps the query-level string used by the UI to the go-netdicom
 // QRLevel constant. Defaults to Study Root if the level is unrecognised.
 func levelToQRLevel(level string) netdicom.QRLevel {
@@ -303,13 +347,38 @@ func elementsToFindResult(elems []*dicom.Element) FindResult {
 // Close is a no-op; associations are opened and closed per-operation.
 func (c *DicomClient) Close() {}
 
-// localIP returns the preferred outbound IPv4 address of this machine by
-// opening a UDP socket toward a public address (no packets are sent).
+// localIP returns the preferred outbound IPv4 address of this machine.
+// It tries a UDP connect first (no packets sent); on failure it enumerates
+// network interfaces as a fallback for air-gapped environments (Phase 3-H).
 func localIP() string {
-	conn, err := net.Dial("udp4", "8.8.8.8:53")
+	if conn, err := net.Dial("udp4", "8.8.8.8:53"); err == nil {
+		defer conn.Close()
+		return conn.LocalAddr().(*net.UDPAddr).IP.String()
+	}
+	ifaces, err := net.Interfaces()
 	if err != nil {
 		return "unknown"
 	}
-	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP.String()
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip4 := ip.To4(); ip4 != nil && !ip4.IsLoopback() && !ip4.IsLinkLocalUnicast() {
+				return ip4.String()
+			}
+		}
+	}
+	return "unknown"
 }

@@ -263,10 +263,31 @@ func organizeFilePath(downloadDir, patientName, patientID, studyDesc, studyDate,
 	if filename == ".dcm" {
 		filename = fmt.Sprintf("%d.dcm", time.Now().UnixNano())
 	}
-	return filepath.Join(downloadDir, patFolder, studyFolder, seriesFolder, filename)
+
+	// Truncate each component to 64 runes (Phase 3-F).
+	patFolder = truncateRunes(patFolder, 64)
+	studyFolder = truncateRunes(studyFolder, 64)
+	seriesFolder = truncateRunes(seriesFolder, 64)
+
+	full := filepath.Join(downloadDir, patFolder, studyFolder, seriesFolder, filename)
+	// Fall back to flat layout when the full path would exceed 255 characters.
+	if len(full) > 255 {
+		full = filepath.Join(downloadDir, filename)
+	}
+	return full
 }
 
-// sanitize strips characters that are unsafe in path components.
+// windowsReserved is the set of device names forbidden as path components on Windows.
+var windowsReserved = map[string]bool{
+	"CON": true, "PRN": true, "AUX": true, "NUL": true,
+	"COM1": true, "COM2": true, "COM3": true, "COM4": true, "COM5": true,
+	"COM6": true, "COM7": true, "COM8": true, "COM9": true,
+	"LPT1": true, "LPT2": true, "LPT3": true, "LPT4": true, "LPT5": true,
+	"LPT6": true, "LPT7": true, "LPT8": true, "LPT9": true,
+}
+
+// sanitize strips characters that are unsafe in path components and prefixes
+// Windows reserved device names with "_" (Phase 3-G).
 func sanitize(s string) string {
 	var b strings.Builder
 	for _, r := range s {
@@ -276,7 +297,20 @@ func sanitize(s string) string {
 			b.WriteRune(r)
 		}
 	}
-	return b.String()
+	result := b.String()
+	if windowsReserved[strings.ToUpper(result)] {
+		return "_" + result
+	}
+	return result
+}
+
+// truncateRunes limits a string to maxRunes Unicode code points.
+func truncateRunes(s string, maxRunes int) string {
+	r := []rune(s)
+	if len(r) <= maxRunes {
+		return s
+	}
+	return string(r[:maxRunes])
 }
 
 // scpStringTag returns the string value of a DICOM tag from a dataset, or ""

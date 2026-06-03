@@ -26,7 +26,7 @@ import (
 	sqweekdialog "github.com/sqweek/dialog"
 )
 
-const version = "0.1.3"
+const version = "0.2.0"
 
 // buildDate is injected at link time: -ldflags "-X main.buildDate=YYYY-MM-DD"
 var buildDate string
@@ -89,6 +89,7 @@ func main() {
 		activeProfile ServerProfile
 		scp           *StorageSCP
 		cancelQuery   context.CancelFunc
+		cancelConnect context.CancelFunc
 		connCtx       context.Context
 		cancelConn    context.CancelFunc
 	)
@@ -108,6 +109,8 @@ func main() {
 	// ── Status bar ──────────────────────────────────────────────────────────
 	statusLabel := widget.NewLabel("v" + version)
 	clockLabel := widget.NewLabel("")
+	queryProgress := widget.NewProgressBarInfinite()
+	queryProgress.Hide()
 	progressBar := widget.NewProgressBar()
 	progressBar.Hide()
 
@@ -122,6 +125,7 @@ func main() {
 
 	statusBar := container.NewVBox(
 		container.NewHBox(statusLabel, layout.NewSpacer(), clockLabel),
+		queryProgress,
 		progressBar,
 	)
 
@@ -242,7 +246,7 @@ func main() {
 		runSearch := func() {
 			model.clear()
 			tree.Refresh()
-			progressBar.Show()
+			queryProgress.Show()
 			setStatus("Querying…")
 
 			dateFrom := ""
@@ -345,20 +349,24 @@ func main() {
 
 				if firstErr != nil && len(allResults) == 0 {
 					fyne.Do(func() {
-						progressBar.Hide()
+						queryProgress.Hide()
 						statusLabel.SetText("Query error: " + firstErr.Error())
 					})
 					return
 				}
 				fyne.Do(func() {
-					for _, r := range allResults {
+					total := len(allResults)
+					for i, r := range allResults {
 						model.addStudy(r.PatientName, r.PatientID, r.StudyInstanceUID,
 							r.StudyDate, r.StudyDescription, r.AccessionNumber, r.ModalitiesInStudy)
+						if (i+1)%10 == 0 {
+							statusLabel.SetText(fmt.Sprintf("Loading results… %d/%d", i+1, total))
+						}
 					}
 					model.applyFilter()
 					tree.Refresh()
-					progressBar.Hide()
-					statusLabel.SetText(fmt.Sprintf("Query complete — %d studies", len(allResults)))
+					queryProgress.Hide()
+					statusLabel.SetText(fmt.Sprintf("Query complete — %d studies", total))
 				})
 			}()
 		}
@@ -458,19 +466,22 @@ func main() {
 			switch s {
 			case stateDisconnected:
 				connectBtn.Enable()
+				disconnectBtn.SetText("Disconnect")
 				disconnectBtn.Disable()
 				echoBtn.Disable()
 				searchBtn.Disable()
 				searchTopBtn.Disable()
 			case stateConnected:
 				connectBtn.Disable()
+				disconnectBtn.SetText("Disconnect")
 				disconnectBtn.Enable()
 				echoBtn.Enable()
 				searchBtn.Enable()
 				searchTopBtn.Enable()
 			case stateBusy:
 				connectBtn.Disable()
-				disconnectBtn.Disable()
+				disconnectBtn.SetText("Cancel")
+				disconnectBtn.Enable()
 				echoBtn.Disable()
 			}
 			statusLabel.SetText(msg)
@@ -495,10 +506,26 @@ func main() {
 		profile := cfg.Profiles[idx]
 		setConnState(stateBusy, "Connecting…")
 
+		timeout := time.Duration(profile.ConnectTimeout) * time.Second
+		if timeout <= 0 {
+			timeout = 10 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		cancelConnect = cancel
+
 		go func() {
+			defer cancel()
 			c := NewDicomClient(profile, cfg.LocalAETitle)
-			if err := c.Echo(context.Background()); err != nil {
-				setConnState(stateDisconnected, "Connection failed: "+err.Error())
+			if err := c.Echo(ctx); err != nil {
+				if ctx.Err() != nil {
+					setConnState(stateDisconnected, "Connection cancelled")
+				} else {
+					setConnState(stateDisconnected, "Connection failed: "+err.Error())
+				}
+				return
+			}
+			if ctx.Err() != nil {
+				setConnState(stateDisconnected, "Connection cancelled")
 				return
 			}
 			client = c
@@ -518,6 +545,10 @@ func main() {
 	}
 
 	disconnectBtn.OnTapped = func() {
+		if cancelConnect != nil {
+			cancelConnect()
+			cancelConnect = nil
+		}
 		if cancelQuery != nil {
 			cancelQuery()
 		}
@@ -571,7 +602,7 @@ func main() {
 				),
 				container.NewHBox(layout.NewSpacer(), searchBtn, clearBtn),
 			)
-			searchPopup = widget.NewPopUp(container.NewPadded(popupContent), w.Canvas())
+			searchPopup = widget.NewModalPopUp(container.NewPadded(popupContent), w.Canvas())
 		}
 		pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(connPanel)
 		searchPopup.ShowAtPosition(fyne.NewPos(pos.X, pos.Y+connPanel.Size().Height))
@@ -618,7 +649,11 @@ func main() {
 		seriesUID string
 	}
 
-	startRetrieve = func(nodeIDs []string) {
+	// startRetrieveTargets runs the retrieve loop for an already-resolved target
+	// list. Extracted so the retry dialog can re-invoke it with only the failed
+	// targets without duplicating the full retrieve loop (Phase 4-E).
+	var startRetrieveTargets func(targets []retrieveTarget)
+	startRetrieveTargets = func(targets []retrieveTarget) {
 		if getState() != stateConnected || client == nil {
 			dialog.ShowInformation("Not connected", "Connect to a DICOM server first.", w)
 			return
@@ -633,47 +668,6 @@ func main() {
 					fmt.Sprintf("The local C-STORE SCP is not listening.\n\nDisconnect and reconnect to restart it.\nExpected port: %d  AE title: %s", cfg.LocalSCPPort, cfg.LocalAETitle), w)
 				return
 			}
-		}
-
-		// Collect retrieve targets from the supplied node IDs.
-		// Patient → all study children at STUDY level.
-		// Study   → STUDY level.
-		// Series  → SERIES level, unless its parent study is also in the list.
-		studySeen := make(map[string]bool)
-		var targets []retrieveTarget
-		var pendingSeries []retrieveTarget
-		for _, id := range nodeIDs {
-			patID, studyUID, seriesUID, _ := model.uidsForNode(id)
-			switch {
-			case studyUID == "":
-				// Patient node — expand to study children.
-				for _, childID := range model.childUIDs(id) {
-					cp, cs, _, _ := model.uidsForNode(childID)
-					if cs != "" && !studySeen[cs] {
-						studySeen[cs] = true
-						targets = append(targets, retrieveTarget{"STUDY", cp, cs, ""})
-					}
-				}
-			case seriesUID == "":
-				// Study node.
-				if !studySeen[studyUID] {
-					studySeen[studyUID] = true
-					targets = append(targets, retrieveTarget{"STUDY", patID, studyUID, ""})
-				}
-			default:
-				// Series node — defer until we know which studies are in the list.
-				pendingSeries = append(pendingSeries, retrieveTarget{"SERIES", patID, studyUID, seriesUID})
-			}
-		}
-		// Add series targets only when their parent study was not included directly.
-		for _, t := range pendingSeries {
-			if !studySeen[t.studyUID] {
-				targets = append(targets, t)
-			}
-		}
-		if len(targets) == 0 {
-			dialog.ShowInformation("Nothing selected", "Click one or more studies or series in the results list first.", w)
-			return
 		}
 
 		count := len(targets)
@@ -734,6 +728,7 @@ func main() {
 
 			var cancelled bool
 			var errCount int
+			var failed []retrieveTarget
 			for i, tgt := range targets {
 				if ctx.Err() != nil {
 					cancelled = true
@@ -779,16 +774,13 @@ func main() {
 						cancelled = true
 						break
 					}
-					// Log the error and continue with the remaining targets rather
-					// than aborting the whole retrieve.
 					log.Printf("retrieve: %s %d/%d error (continuing): %v", label, idx, count, err)
 					errCount++
+					failed = append(failed, tgt)
 				}
 			}
 
 			restoreSCP()
-			// Capture fileCount before fyne.Do; defer cancel() fires on return,
-			// after which ctx.Err() would appear non-nil even on a clean completion.
 			n := atomic.LoadInt64(&fileCount)
 			fyne.Do(func() {
 				progressBar.Hide()
@@ -797,11 +789,68 @@ func main() {
 					statusLabel.SetText("Retrieve cancelled")
 				case errCount > 0:
 					statusLabel.SetText(fmt.Sprintf("Retrieved %d files (%d/%d targets had errors — see log)", n, errCount, count))
+					// Offer to retry only the failed targets (Phase 4-E).
+					dialog.ShowConfirm("Retrieve errors",
+						fmt.Sprintf("%d of %d targets failed.\nRetry failed targets only?", len(failed), count),
+						func(ok bool) {
+							if ok {
+								startRetrieveTargets(failed)
+							}
+						}, w)
 				default:
 					statusLabel.SetText(fmt.Sprintf("Retrieved %d files successfully", n))
 				}
 			})
 		}()
+	}
+
+	startRetrieve = func(nodeIDs []string) {
+		if getState() != stateConnected || client == nil {
+			dialog.ShowInformation("Not connected", "Connect to a DICOM server first.", w)
+			return
+		}
+
+		// Collect retrieve targets from the supplied node IDs.
+		// Patient → all study children at STUDY level.
+		// Study   → STUDY level.
+		// Series  → SERIES level, unless its parent study is also in the list.
+		studySeen := make(map[string]bool)
+		var targets []retrieveTarget
+		var pendingSeries []retrieveTarget
+		for _, id := range nodeIDs {
+			patID, studyUID, seriesUID, _ := model.uidsForNode(id)
+			switch {
+			case studyUID == "":
+				// Patient node — expand to study children.
+				for _, childID := range model.childUIDs(id) {
+					cp, cs, _, _ := model.uidsForNode(childID)
+					if cs != "" && !studySeen[cs] {
+						studySeen[cs] = true
+						targets = append(targets, retrieveTarget{"STUDY", cp, cs, ""})
+					}
+				}
+			case seriesUID == "":
+				// Study node.
+				if !studySeen[studyUID] {
+					studySeen[studyUID] = true
+					targets = append(targets, retrieveTarget{"STUDY", patID, studyUID, ""})
+				}
+			default:
+				// Series node — defer until we know which studies are in the list.
+				pendingSeries = append(pendingSeries, retrieveTarget{"SERIES", patID, studyUID, seriesUID})
+			}
+		}
+		// Add series targets only when their parent study was not included directly.
+		for _, t := range pendingSeries {
+			if !studySeen[t.studyUID] {
+				targets = append(targets, t)
+			}
+		}
+		if len(targets) == 0 {
+			dialog.ShowInformation("Nothing selected", "Click one or more studies or series in the results list first.", w)
+			return
+		}
+		startRetrieveTargets(targets)
 	}
 
 	retrieveBtn := widget.NewButton("Retrieve Selected", func() {
@@ -831,12 +880,20 @@ func main() {
 	// ── Search bar (filter above tree) ───────────────────────────────────────
 	filterEntry := widget.NewEntry()
 	filterEntry.SetPlaceHolder("Filter results…")
+	var filterDebounce *time.Timer
 	filterEntry.OnChanged = func(s string) {
-		model.setFilter(s)
-		if s != "" {
-			tree.OpenAllBranches()
+		if filterDebounce != nil {
+			filterDebounce.Stop()
 		}
-		tree.Refresh()
+		filterDebounce = time.AfterFunc(150*time.Millisecond, func() {
+			fyne.Do(func() {
+				model.setFilter(s)
+				if s != "" {
+					tree.OpenAllBranches()
+				}
+				tree.Refresh()
+			})
+		})
 	}
 	filterBar := container.NewBorder(nil, nil, nil,
 		widget.NewButton("Clear", func() {
@@ -855,6 +912,10 @@ func main() {
 	w.Canvas().AddShortcut(
 		&desktop.CustomShortcut{KeyName: fyne.KeyF, Modifier: fyne.KeyModifierShortcutDefault},
 		func(_ fyne.Shortcut) { w.Canvas().Focus(patientNameEntry) },
+	)
+	w.Canvas().AddShortcut(
+		&desktop.CustomShortcut{KeyName: fyne.KeyR, Modifier: fyne.KeyModifierShortcutDefault},
+		func(_ fyne.Shortcut) { retrieveBtn.OnTapped() },
 	)
 
 	// ── Menus ─────────────────────────────────────────────────────────────────
@@ -876,6 +937,48 @@ func main() {
 	queryMenu := fyne.NewMenu("Query",
 		fyne.NewMenuItem("Search", doSearch),
 		fyne.NewMenuItem("Clear results", doClearQuery),
+		fyne.NewMenuItemSeparator(),
+		fyne.NewMenuItem("Export…", func() {
+			if len(model.roots) == 0 {
+				dialog.ShowInformation("No results", "Run a query first, then export.", w)
+				return
+			}
+			formatSelect := widget.NewSelect([]string{"CSV", "JSON"}, nil)
+			formatSelect.SetSelected("CSV")
+			d := dialog.NewCustomConfirm("Export results", "Export", "Cancel",
+				container.NewVBox(widget.NewLabel("Export format:"), formatSelect),
+				func(ok bool) {
+					if !ok {
+						return
+					}
+					go func() {
+						ext := strings.ToLower(formatSelect.Selected)
+						path, err := sqweekdialog.File().Filter("Export file", ext).Save()
+						if err != nil {
+							return
+						}
+						if !strings.HasSuffix(strings.ToLower(path), "."+ext) {
+							path += "." + ext
+						}
+						rows := model.exportRows()
+						var writeErr error
+						if formatSelect.Selected == "CSV" {
+							writeErr = exportToCSV(path, rows)
+						} else {
+							writeErr = exportToJSON(path, rows)
+						}
+						fyne.Do(func() {
+							if writeErr != nil {
+								dialog.ShowError(writeErr, w)
+							} else {
+								dialog.ShowInformation("Export complete",
+									fmt.Sprintf("Exported %d rows to:\n%s", len(rows), path), w)
+							}
+						})
+					}()
+				}, w)
+			d.Show()
+		}),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Retrieve Selected", func() { retrieveBtn.OnTapped() }),
 		fyne.NewMenuItem("Cancel retrieve", func() {
@@ -906,9 +1009,6 @@ func main() {
 					"AI Assistance\n"+
 					"  Claude Sonnet 4.6 by Anthropic  (https://anthropic.com)\n"+
 					"  Architecture, code generation, and DICOM standard research.\n\n"+
-					"UI Template\n"+
-					"  dicomhdr by Jeffrey Leal\n"+
-					"  https://github.com/jeffrey-leal/dicomhdr\n\n"+
 					"DICOM Standard Reference\n"+
 					"  DICOM PS3 (2024b) — https://dicom.nema.org/medical/dicom/current",
 				version, bd))

@@ -184,8 +184,28 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 				pendingProfiles = append(pendingProfiles[:i], pendingProfiles[i+1:]...)
 				buildProfileList()
 			})
+			// Up/Down reordering buttons (Phase 4-C).
+			upBtn := widget.NewButtonWithIcon("", theme.MoveUpIcon(), func() {
+				if i > 0 {
+					pendingProfiles[i-1], pendingProfiles[i] = pendingProfiles[i], pendingProfiles[i-1]
+					buildProfileList()
+				}
+			})
+			downBtn := widget.NewButtonWithIcon("", theme.MoveDownIcon(), func() {
+				if i < len(pendingProfiles)-1 {
+					pendingProfiles[i], pendingProfiles[i+1] = pendingProfiles[i+1], pendingProfiles[i]
+					buildProfileList()
+				}
+			})
+			if i == 0 {
+				upBtn.Disable()
+			}
+			if i == len(pendingProfiles)-1 {
+				downBtn.Disable()
+			}
 			// nameLabel as center so it expands to fill available width; buttons pin right.
-			rows[i] = container.NewBorder(nil, nil, nil, container.NewHBox(editBtn, deleteBtn), nameLabel)
+			rows[i] = container.NewBorder(nil, nil, nil,
+				container.NewHBox(upBtn, downBtn, editBtn, deleteBtn), nameLabel)
 		}
 		profileList.Objects = rows
 		profileList.Refresh()
@@ -284,14 +304,42 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerProfile)) {
 	nameEntry := widget.NewEntry()
 	nameEntry.SetText(p.Name)
+
 	aeEntry := widget.NewEntry()
 	aeEntry.SetText(p.RemoteAETitle)
+	aeEntry.Validator = func(s string) error {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return fmt.Errorf("AE title is required")
+		}
+		if len(s) > 16 {
+			return fmt.Errorf("AE title must be ≤ 16 characters")
+		}
+		return nil
+	}
+
 	hostEntry := widget.NewEntry()
 	hostEntry.SetText(p.Host)
+
 	portEntry := widget.NewEntry()
 	portEntry.SetText(fmt.Sprintf("%d", p.Port))
+	portEntry.Validator = func(s string) error {
+		v, err := strconv.Atoi(strings.TrimSpace(s))
+		if err != nil || v < 1 || v > 65535 {
+			return fmt.Errorf("port must be 1–65535")
+		}
+		return nil
+	}
+
+	timeoutEntry := widget.NewEntry()
+	if p.ConnectTimeout > 0 {
+		timeoutEntry.SetText(fmt.Sprintf("%d", p.ConnectTimeout))
+	}
+	timeoutEntry.SetPlaceHolder("10 (default)")
+
 	modelSelect := widget.NewSelect([]string{"study", "patient"}, nil)
 	modelSelect.SetSelected(p.InfoModel)
+
 	retrieveMethodSelect := widget.NewSelect([]string{"C-MOVE (default)", "C-GET", "Auto"}, nil)
 	switch p.RetrieveMethod {
 	case "GET":
@@ -307,6 +355,7 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 		widget.NewFormItem("Remote AE Title", aeEntry),
 		widget.NewFormItem("Host", hostEntry),
 		widget.NewFormItem("Port", portEntry),
+		widget.NewFormItem("Connect timeout (s)", timeoutEntry),
 		widget.NewFormItem("Info model", modelSelect),
 		widget.NewFormItem("Retrieve method", retrieveMethodSelect),
 	)
@@ -315,9 +364,22 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 		if !save {
 			return
 		}
+		// Inline validation (Phase 3-I): show error and abort if invalid.
+		if err := aeEntry.Validate(); err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
+		if err := portEntry.Validate(); err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
 		port := p.Port
-		if v, err := strconv.Atoi(portEntry.Text); err == nil && v > 0 && v < 65536 {
+		if v, err := strconv.Atoi(strings.TrimSpace(portEntry.Text)); err == nil && v > 0 && v < 65536 {
 			port = v
+		}
+		timeout := 0
+		if v, err := strconv.Atoi(strings.TrimSpace(timeoutEntry.Text)); err == nil && v > 0 {
+			timeout = v
 		}
 		retrieveMethod := "MOVE"
 		switch retrieveMethodSelect.Selected {
@@ -331,6 +393,7 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 			RemoteAETitle:  strings.ToUpper(strings.TrimSpace(aeEntry.Text)),
 			Host:           strings.TrimSpace(hostEntry.Text),
 			Port:           port,
+			ConnectTimeout: timeout,
 			InfoModel:      modelSelect.Selected,
 			RetrieveMethod: retrieveMethod,
 		})
