@@ -15,6 +15,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
@@ -25,7 +26,7 @@ import (
 	sqweekdialog "github.com/sqweek/dialog"
 )
 
-const version = "0.1.2"
+const version = "0.1.3"
 
 // buildDate is injected at link time: -ldflags "-X main.buildDate=YYYY-MM-DD"
 var buildDate string
@@ -63,6 +64,7 @@ func main() {
 	dicomlog.SetLevel(2)
 	setupLogFile()
 	a := app.NewWithID("com.jeffreyleal.dicomqr")
+	a.SetIcon(appIcon)
 	w := a.NewWindow("dicomqr")
 	w.Resize(fyne.NewSize(900, 650))
 
@@ -82,6 +84,7 @@ func main() {
 
 	var (
 		state         connState
+		stateMu       sync.Mutex
 		client        *DicomClient
 		activeProfile ServerProfile
 		scp           *StorageSCP
@@ -89,6 +92,18 @@ func main() {
 		connCtx       context.Context
 		cancelConn    context.CancelFunc
 	)
+
+	// Thread-safe state accessors (Phase 1-A)
+	getState := func() connState {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		return state
+	}
+	setState := func(s connState) {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		state = s
+	}
 
 	// ── Status bar ──────────────────────────────────────────────────────────
 	statusLabel := widget.NewLabel("v" + version)
@@ -123,7 +138,7 @@ func main() {
 		} else {
 			selectedNodes[id] = true
 		}
-		tree.Refresh()
+		tree.RefreshItem(id)
 	}
 
 	// startRetrieve is assigned below after the retrieve variables are in scope.
@@ -183,13 +198,15 @@ func main() {
 					series = append(series, r)
 				}
 			}
-			for range ch {}
+			for range ch {
+			}
 			fyne.Do(func() {
 				for _, r := range series {
 					model.addSeries(r.StudyInstanceUID, r.SeriesInstanceUID,
 						r.Modality, r.SeriesNumber, r.SeriesDescription, r.NumInstances)
 				}
-				tree.Refresh()
+				model.applyFilter()
+				tree.RefreshItem(id)
 			})
 		}()
 	}
@@ -209,13 +226,15 @@ func main() {
 	accessionEntry := widget.NewEntry()
 	accessionEntry.SetPlaceHolder("Accession number")
 	studyDateFromEntry := widget.NewDateEntry()
+	studyDateFromEntry.Validator = nil
 	studyDateToEntry := widget.NewDateEntry()
+	studyDateToEntry.Validator = nil
 	modalityCheck := widget.NewCheckGroup(
 		[]string{"CT", "MR", "PT", "NM", "US", "CR", "DX", "XA", "RF"}, nil)
 	modalityCheck.Horizontal = true
 
 	doSearch := func() {
-		if state != stateConnected || client == nil {
+		if getState() != stateConnected || client == nil {
 			dialog.ShowInformation("Not connected", "Connect to a DICOM server first.", w)
 			return
 		}
@@ -234,10 +253,16 @@ func main() {
 			if studyDateToEntry.Date != nil {
 				dateTo = studyDateToEntry.Date.Format("20060102")
 			}
+			wildcard := func(s string) string {
+				if s == "" || strings.HasSuffix(s, "*") {
+					return s
+				}
+				return s + "*"
+			}
 			baseParams := map[string]string{
-				"PatientName":     patientNameEntry.Text,
-				"PatientID":       patientIDEntry.Text,
-				"AccessionNumber": accessionEntry.Text,
+				"PatientName":     wildcard(patientNameEntry.Text),
+				"PatientID":       wildcard(patientIDEntry.Text),
+				"AccessionNumber": wildcard(accessionEntry.Text),
 				"StudyDateFrom":   dateFrom,
 				"StudyDateTo":     dateTo,
 			}
@@ -259,6 +284,9 @@ func main() {
 				}
 			}
 
+			if cancelQuery != nil {
+				cancelQuery()
+			}
 			ctx, cancel := context.WithCancel(context.Background())
 			cancelQuery = cancel
 
@@ -290,7 +318,8 @@ func main() {
 							}
 							results = append(results, r)
 						}
-						for range ch {} // drain so Find's goroutine can exit
+						for range ch {
+						} // drain so Find's goroutine can exit
 						resultsCh <- queryResult{results: results, err: findErr}
 					}(params)
 				}
@@ -326,6 +355,7 @@ func main() {
 						model.addStudy(r.PatientName, r.PatientID, r.StudyInstanceUID,
 							r.StudyDate, r.StudyDescription, r.AccessionNumber, r.ModalitiesInStudy)
 					}
+					model.applyFilter()
 					tree.Refresh()
 					progressBar.Hide()
 					statusLabel.SetText(fmt.Sprintf("Query complete — %d studies", len(allResults)))
@@ -353,6 +383,9 @@ func main() {
 	}
 
 	doClearQuery := func() {
+		if cancelQuery != nil {
+			cancelQuery()
+		}
 		patientNameEntry.SetText("")
 		patientIDEntry.SetText("")
 		accessionEntry.SetText("")
@@ -420,7 +453,7 @@ func main() {
 	echoBtn.Disable()
 
 	setConnState := func(s connState, msg string) {
-		state = s
+		setState(s)
 		fyne.Do(func() {
 			switch s {
 			case stateDisconnected:
@@ -472,9 +505,6 @@ func main() {
 			activeProfile = profile
 
 			s := NewStorageSCP(cfg.LocalAETitle, cfg.LocalSCPPort, cfg.DownloadDir)
-			s.OnFileReceived = func(path string) {
-				fyne.Do(func() { statusLabel.SetText("Received: " + path) })
-			}
 			if err := s.Start(); err != nil {
 				setConnState(stateDisconnected, "SCP error: "+err.Error())
 				return
@@ -483,7 +513,7 @@ func main() {
 			connCtx, cancelConn = context.WithCancel(context.Background())
 
 			setConnState(stateConnected, fmt.Sprintf("Connected: %s@%s:%d  |  SCP %s (AE: %s)",
-					profile.RemoteAETitle, profile.Host, profile.Port, s.ListenAddr(), cfg.LocalAETitle))
+				profile.RemoteAETitle, profile.Host, profile.Port, s.ListenAddr(), cfg.LocalAETitle))
 		}()
 	}
 
@@ -531,13 +561,13 @@ func main() {
 		}
 		if searchPopup == nil {
 			popupContent := container.NewVBox(
-				widget.NewForm(
-					widget.NewFormItem("Patient Name", patientNameEntry),
-					widget.NewFormItem("Patient ID", patientIDEntry),
-					widget.NewFormItem("Accession No", accessionEntry),
-					widget.NewFormItem("Study Date From", studyDateFromEntry),
-					widget.NewFormItem("Study Date To", studyDateToEntry),
-					widget.NewFormItem("Modality", modalityCheck),
+				container.New(layout.NewFormLayout(),
+					widget.NewLabel("Patient Name"), patientNameEntry,
+					widget.NewLabel("Patient ID"), patientIDEntry,
+					widget.NewLabel("Accession No"), accessionEntry,
+					widget.NewLabel("Study Date From"), studyDateFromEntry,
+					widget.NewLabel("Study Date To"), studyDateToEntry,
+					widget.NewLabel("Modality"), modalityCheck,
 				),
 				container.NewHBox(layout.NewSpacer(), searchBtn, clearBtn),
 			)
@@ -554,7 +584,7 @@ func main() {
 	downloadDirEntry.OnChanged = func(dir string) {
 		cfg.DownloadDir = dir
 		if scp != nil {
-			scp.downloadDir = dir
+			scp.SetDownloadDir(dir)
 		}
 		saveSettings(cfg)
 	}
@@ -589,14 +619,20 @@ func main() {
 	}
 
 	startRetrieve = func(nodeIDs []string) {
-		if state != stateConnected || client == nil {
+		if getState() != stateConnected || client == nil {
 			dialog.ShowInformation("Not connected", "Connect to a DICOM server first.", w)
 			return
 		}
-		if scp == nil || !scp.IsRunning() {
-			dialog.ShowInformation("SCP not running",
-				fmt.Sprintf("The local C-STORE SCP is not listening.\n\nDisconnect and reconnect to restart it.\nExpected port: %d  AE title: %s", cfg.LocalSCPPort, cfg.LocalAETitle), w)
-			return
+		method := activeProfile.RetrieveMethod
+		if method == "" {
+			method = "MOVE"
+		}
+		if method == "MOVE" || method == "AUTO" {
+			if scp == nil || !scp.IsRunning() {
+				dialog.ShowInformation("SCP not running",
+					fmt.Sprintf("The local C-STORE SCP is not listening.\n\nDisconnect and reconnect to restart it.\nExpected port: %d  AE title: %s", cfg.LocalSCPPort, cfg.LocalAETitle), w)
+				return
+			}
 		}
 
 		// Collect retrieve targets from the supplied node IDs.
@@ -663,15 +699,41 @@ func main() {
 		go func() {
 			defer cancel()
 
-			// Count files received during this retrieve operation.
 			var fileCount int64
-			origOnFileReceived := scp.OnFileReceived
-			scp.OnFileReceived = func(path string) {
+
+			// For C-MOVE: intercept scp.OnFileReceived to count and report files.
+			var origOnFileReceived func(string)
+			if scp != nil && (method == "MOVE" || method == "AUTO") {
+				origOnFileReceived = scp.OnFileReceived()
+				scp.SetOnFileReceived(func(path string) {
+					atomic.AddInt64(&fileCount, 1)
+					if ctx.Err() == nil {
+						fyne.Do(func() { statusLabel.SetText("Received: " + path) })
+					}
+				})
+			}
+			restoreSCP := func() {
+				if scp != nil {
+					scp.SetOnFileReceived(origOnFileReceived)
+				}
+			}
+
+			// For C-GET: callback writes each received instance to the download folder.
+			getCallback := func(txUID, scUID, siUID string, data []byte) error {
+				path, saveErr := saveGetFile(cfg.DownloadDir, txUID, scUID, siUID, data)
+				if saveErr != nil {
+					log.Printf("c-get: save file: %v", saveErr)
+					return saveErr
+				}
 				atomic.AddInt64(&fileCount, 1)
-				fyne.Do(func() { statusLabel.SetText("Received: " + path) })
+				if ctx.Err() == nil {
+					fyne.Do(func() { statusLabel.SetText("Received: " + path) })
+				}
+				return nil
 			}
 
 			var cancelled bool
+			var errCount int
 			for i, tgt := range targets {
 				if ctx.Err() != nil {
 					cancelled = true
@@ -685,37 +747,57 @@ func main() {
 				fyne.Do(func() {
 					statusLabel.SetText(fmt.Sprintf("Retrieving %s %d/%d…", label, idx, count))
 				})
-				err := client.Move(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, cfg.LocalAETitle, func(p MoveProgress) {
-					sub := p.Remaining + p.Completed + p.Failed + p.Warning
-					if sub > 0 {
-						frac := (float64(i) + float64(p.Completed)/float64(sub)) / float64(count)
-						fyne.Do(func() { progressBar.SetValue(frac) })
+
+				var err error
+				switch method {
+				case "GET":
+					err = client.Get(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, getCallback)
+				case "AUTO":
+					err = client.Get(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, getCallback)
+					if err != nil && ctx.Err() == nil {
+						log.Printf("retrieve: c-get failed (%v), falling back to c-move", err)
+						err = client.Move(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, cfg.LocalAETitle, func(p MoveProgress) {
+							sub := p.Remaining + p.Completed + p.Failed + p.Warning
+							if sub > 0 {
+								frac := (float64(i) + float64(p.Completed)/float64(sub)) / float64(count)
+								fyne.Do(func() { progressBar.SetValue(frac) })
+							}
+						})
 					}
-				})
+				default: // "MOVE"
+					err = client.Move(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, cfg.LocalAETitle, func(p MoveProgress) {
+						sub := p.Remaining + p.Completed + p.Failed + p.Warning
+						if sub > 0 {
+							frac := (float64(i) + float64(p.Completed)/float64(sub)) / float64(count)
+							fyne.Do(func() { progressBar.SetValue(frac) })
+						}
+					})
+				}
+
 				if err != nil {
 					if ctx.Err() != nil {
 						cancelled = true
 						break
 					}
-					msg := err.Error()
-					scp.OnFileReceived = origOnFileReceived
-					fyne.Do(func() {
-						progressBar.Hide()
-						statusLabel.SetText("Retrieve error: " + msg)
-					})
-					return
+					// Log the error and continue with the remaining targets rather
+					// than aborting the whole retrieve.
+					log.Printf("retrieve: %s %d/%d error (continuing): %v", label, idx, count, err)
+					errCount++
 				}
 			}
 
-			scp.OnFileReceived = origOnFileReceived
+			restoreSCP()
 			// Capture fileCount before fyne.Do; defer cancel() fires on return,
 			// after which ctx.Err() would appear non-nil even on a clean completion.
 			n := atomic.LoadInt64(&fileCount)
 			fyne.Do(func() {
 				progressBar.Hide()
-				if cancelled {
+				switch {
+				case cancelled:
 					statusLabel.SetText("Retrieve cancelled")
-				} else {
+				case errCount > 0:
+					statusLabel.SetText(fmt.Sprintf("Retrieved %d files (%d/%d targets had errors — see log)", n, errCount, count))
+				default:
 					statusLabel.SetText(fmt.Sprintf("Retrieved %d files successfully", n))
 				}
 			})
@@ -809,7 +891,12 @@ func main() {
 	}
 	helpMenu := fyne.NewMenu("Help",
 		fyne.NewMenuItem("About", func() {
-			lbl := widget.NewLabel(fmt.Sprintf(
+			iconImg := canvas.NewImageFromResource(appIcon)
+			iconImg.FillMode = canvas.ImageFillContain
+			iconImg.SetMinSize(fyne.NewSize(240, 240))
+
+			// Top-left: key info + credits, wrapped to fit beside the icon.
+			topLbl := widget.NewLabel(fmt.Sprintf(
 				"dicomqr  v%s  (built %s)\n"+
 					"DICOM Query/Retrieve client — query and retrieve studies from a PACS server.\n"+
 					"Implements DICOM PS3.4/PS3.7: C-ECHO, C-FIND, C-MOVE, C-STORE SCP.\n\n"+
@@ -823,19 +910,30 @@ func main() {
 					"  dicomhdr by Jeffrey Leal\n"+
 					"  https://github.com/jeffrey-leal/dicomhdr\n\n"+
 					"DICOM Standard Reference\n"+
-					"  DICOM PS3 (2024b) — https://dicom.nema.org/medical/dicom/current\n\n"+
-					"Open-Source Libraries\n"+
-					"  fyne.io/fyne/v2 v2.7.3              Fyne.io — GUI framework (BSD 3-Clause)\n"+
-					"  github.com/algm/go-netdicom v0.1.0  Alan Griffin — DICOM networking (BSD 3-Clause)\n"+
-					"  github.com/grailbio/go-netdicom     Yasushi Saito / GRAIL — base networking lib\n"+
-					"  github.com/grailbio/go-dicom        GRAIL Inc. — DICOM encoding (Apache 2.0)\n"+
-					"  github.com/suyashkumar/dicom        Suyash Kumar — DICOM parsing (MIT)\n"+
-					"  github.com/sqweek/dialog            sqweek — native file dialogs (ISC)\n\n"+
-					"Full credits: CREDITS.md in the project repository.",
+					"  DICOM PS3 (2024b) — https://dicom.nema.org/medical/dicom/current",
 				version, bd))
-			lbl.TextStyle = fyne.TextStyle{Monospace: true}
-			d := dialog.NewCustom("About dicomqr", "OK", container.NewPadded(lbl), w)
-			d.Resize(fyne.NewSize(620, 0))
+			topLbl.TextStyle = fyne.TextStyle{Monospace: true}
+			topLbl.Wrapping = fyne.TextWrapWord
+
+			// Bottom: open-source library table, full dialog width.
+			bottomLbl := widget.NewLabel(
+				"Open-Source Libraries\n" +
+					"  fyne.io/fyne/v2 v2.7.3              Fyne.io — GUI framework (BSD 3-Clause)\n" +
+					"  github.com/algm/go-netdicom v0.1.0  Alan Griffin — DICOM networking (BSD 3-Clause)\n" +
+					"  github.com/grailbio/go-netdicom     Yasushi Saito / GRAIL — base networking lib\n" +
+					"  github.com/grailbio/go-dicom        GRAIL Inc. — DICOM encoding (Apache 2.0)\n" +
+					"  github.com/suyashkumar/dicom        Suyash Kumar — DICOM parsing (MIT)\n" +
+					"  github.com/sqweek/dialog            sqweek — native file dialogs (ISC)\n\n" +
+					"Full credits: CREDITS.md in the project repository.")
+			bottomLbl.TextStyle = fyne.TextStyle{Monospace: true}
+
+			// Icon anchored to top of right column; VBox does not stretch items
+			// downward, so the image sits at the top even when the left text is taller.
+			iconCol := container.NewVBox(iconImg)
+			topSection := container.NewBorder(nil, nil, nil, iconCol, topLbl)
+			content := container.NewPadded(container.NewVBox(topSection, bottomLbl))
+			d := dialog.NewCustom("About dicomqr", "OK", content, w)
+			d.Resize(fyne.NewSize(720, 0))
 			d.Show()
 		}),
 		fyne.NewMenuItemSeparator(),

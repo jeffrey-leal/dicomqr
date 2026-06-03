@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -20,6 +22,7 @@ type resultNode struct {
 	label    string
 	tooltip  string
 	children []string
+	sortKey  string // patient: lower-case name; study: YYYYMMDD date; series: zero-padded number
 
 	// DICOM identifiers used when building C-MOVE query datasets
 	patientID         string
@@ -42,6 +45,15 @@ func newResultsModel() *resultsModel {
 	return &resultsModel{nodes: make(map[string]*resultNode)}
 }
 
+// sortedInsert uses binary search to find the correct position for id in list
+// and inserts it there. list is assumed to be already sorted by sortKey.
+func (m *resultsModel) sortedInsert(list *[]string, id string) {
+	pos := sort.Search(len(*list), func(i int) bool {
+		return m.nodes[(*list)[i]].sortKey >= m.nodes[id].sortKey
+	})
+	*list = append((*list)[:pos], append([]string{id}, (*list)[pos:]...)...)
+}
+
 func (m *resultsModel) clear() {
 	m.nodes = make(map[string]*resultNode)
 	m.roots = nil
@@ -56,8 +68,12 @@ func (m *resultsModel) addStudy(patientName, patientID, studyUID, studyDate, stu
 		if patientID != "" {
 			label += fmt.Sprintf("  (ID: %s)", patientID)
 		}
-		m.nodes[patID] = &resultNode{id: patID, kind: kindPatient, label: label, patientID: patientID}
-		m.roots = append(m.roots, patID)
+		m.nodes[patID] = &resultNode{
+			id: patID, kind: kindPatient, label: label,
+			patientID: patientID,
+			sortKey:   strings.ToLower(patientName),
+		}
+		m.sortedInsert(&m.roots, patID)
 	}
 
 	sID := "S:" + studyUID
@@ -76,11 +92,11 @@ func (m *resultsModel) addStudy(patientName, patientID, studyUID, studyDate, stu
 		m.nodes[sID] = &resultNode{
 			id: sID, kind: kindStudy, label: label, tooltip: tooltip,
 			patientID: patientID, studyInstanceUID: studyUID,
+			sortKey: studyDate,
 		}
 		parent := m.nodes[patID]
-		parent.children = append(parent.children, sID)
+		m.sortedInsert(&parent.children, sID)
 	}
-	m.applyFilter()
 }
 
 // addSeries inserts a series node under an existing study node.
@@ -100,14 +116,15 @@ func (m *resultsModel) addSeries(studyUID, seriesUID, modality, seriesNumber, se
 		if !ok {
 			return
 		}
+		n, _ := strconv.Atoi(strings.TrimSpace(seriesNumber))
 		m.nodes[rID] = &resultNode{
 			id: rID, kind: kindSeries, label: label, tooltip: tooltip,
 			patientID:         study.patientID, // propagate so retrieve can build C-MOVE filters
 			studyInstanceUID:  studyUID,
 			seriesInstanceUID: seriesUID,
+			sortKey:           fmt.Sprintf("%010d", n),
 		}
-		study.children = append(study.children, rID)
-		m.applyFilter()
+		m.sortedInsert(&study.children, rID)
 	}
 }
 

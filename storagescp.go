@@ -24,15 +24,57 @@ import (
 type StorageSCP struct {
 	localAETitle string
 	port         int
-	downloadDir  string
-	listenAddr   string // actual bound address, set in Start()
 
-	// OnFileReceived is called on the goroutine that received the file.
-	// Use fyne.Do() inside the callback to update UI elements.
-	OnFileReceived func(path string)
+	// downloadDir is guarded by dirMu (Phase 1-B)
+	dirMu       sync.RWMutex
+	downloadDir string
+
+	listenAddr string // actual bound address, set in Start()
+
+	// onFileReceived is guarded by cbMu (Phase 1-C)
+	cbMu           sync.Mutex
+	onFileReceived func(path string)
 
 	running bool
 	cancel  context.CancelFunc
+}
+
+// DownloadDir returns the download directory (thread-safe, Phase 1-B).
+func (s *StorageSCP) DownloadDir() string {
+	s.dirMu.RLock()
+	defer s.dirMu.RUnlock()
+	return s.downloadDir
+}
+
+// SetDownloadDir updates the download directory (thread-safe, Phase 1-B).
+func (s *StorageSCP) SetDownloadDir(d string) {
+	s.dirMu.Lock()
+	defer s.dirMu.Unlock()
+	s.downloadDir = d
+}
+
+// SetOnFileReceived sets the callback (thread-safe, Phase 1-C).
+func (s *StorageSCP) SetOnFileReceived(fn func(path string)) {
+	s.cbMu.Lock()
+	defer s.cbMu.Unlock()
+	s.onFileReceived = fn
+}
+
+// OnFileReceived returns the current callback (thread-safe, Phase 1-C).
+func (s *StorageSCP) OnFileReceived() func(string) {
+	s.cbMu.Lock()
+	defer s.cbMu.Unlock()
+	return s.onFileReceived
+}
+
+// callOnFileReceived invokes the callback if set (thread-safe, Phase 1-C).
+func (s *StorageSCP) callOnFileReceived(path string) {
+	s.cbMu.Lock()
+	fn := s.onFileReceived
+	s.cbMu.Unlock()
+	if fn != nil {
+		fn(path)
+	}
 }
 
 // NewStorageSCP creates a C-STORE SCP that writes files to downloadDir.
@@ -50,10 +92,10 @@ func (s *StorageSCP) Start() error {
 	if s.running {
 		return nil
 	}
-	if s.downloadDir == "" {
+	if s.DownloadDir() == "" {
 		return errors.New("download directory is not configured")
 	}
-	if err := os.MkdirAll(s.downloadDir, 0o755); err != nil {
+	if err := os.MkdirAll(s.DownloadDir(), 0o755); err != nil {
 		return fmt.Errorf("cannot create download directory: %w", err)
 	}
 
@@ -127,7 +169,7 @@ func (s *StorageSCP) handleCStore(
 ) dimse.Status {
 	// Create the temp file inside downloadDir so the later rename stays on the
 	// same filesystem and avoids cross-device rename failures.
-	tmpFile, err := os.CreateTemp(s.downloadDir, ".recv_*.tmp")
+	tmpFile, err := os.CreateTemp(s.DownloadDir(), ".recv_*.tmp")
 	if err != nil {
 		return dimse.Status{Status: dimse.CStoreOutOfResources, ErrorComment: err.Error()}
 	}
@@ -167,7 +209,7 @@ func (s *StorageSCP) handleCStore(
 		seriesNumber = scpStringTag(ds, dicomtag.SeriesNumber)
 	}
 
-	dest := s.organizeFilePath(patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber, sopInstanceUID)
+	dest := organizeFilePath(s.DownloadDir(), patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber, sopInstanceUID)
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		os.Remove(tmpPath)
 		return dimse.Status{Status: dimse.CStoreOutOfResources, ErrorComment: err.Error()}
@@ -183,17 +225,15 @@ func (s *StorageSCP) handleCStore(
 		os.Remove(tmpPath)
 	}
 
-	if s.OnFileReceived != nil {
-		s.OnFileReceived(dest)
-	}
+	s.callOnFileReceived(dest)
 	return dimse.Success
 }
 
 // organizeFilePath builds the destination path for a received DICOM file using
 // the fixed structure:
 //
-//	<DownloadDir>/<Patient Name> (MRN)/<Study Description> (StudyDate)/<Series Description> (SeriesNumber)/<sopInstanceUID>.dcm
-func (s *StorageSCP) organizeFilePath(patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber, sopInstanceUID string) string {
+//	<downloadDir>/<Patient Name> (MRN)/<Study Description> (StudyDate)/<Series Description> (SeriesNumber)/<sopInstanceUID>.dcm
+func organizeFilePath(downloadDir, patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber, sopInstanceUID string) string {
 	if patientName == "" {
 		patientName = "Unknown Patient"
 	}
@@ -222,7 +262,7 @@ func (s *StorageSCP) organizeFilePath(patientName, patientID, studyDesc, studyDa
 	if filename == ".dcm" {
 		filename = fmt.Sprintf("%d.dcm", time.Now().UnixNano())
 	}
-	return filepath.Join(s.downloadDir, patFolder, studyFolder, seriesFolder, filename)
+	return filepath.Join(downloadDir, patFolder, studyFolder, seriesFolder, filename)
 }
 
 // sanitize strips characters that are unsafe in path components.
@@ -264,4 +304,67 @@ func scpCopyFile(src, dst string) error {
 	defer out.Close()
 	_, err = io.Copy(out, in)
 	return err
+}
+
+// saveGetFile writes a C-GET instance payload to the download directory using
+// the same organized subfolder hierarchy as the C-STORE SCP. The data argument
+// is the raw DICOM dataset bytes as received from the C-GET callback (no Group
+// 2 prefix); this function prepends the proper DICOM File Meta Information
+// header before writing. Returns the path of the saved file.
+func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID string, data []byte) (string, error) {
+	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
+		return "", fmt.Errorf("cannot create download directory: %w", err)
+	}
+
+	tmpFile, err := os.CreateTemp(downloadDir, ".recv_*.tmp")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmpFile.Name()
+
+	enc := dicomio.NewEncoderWithTransferSyntax(tmpFile, transferSyntaxUID)
+	dicom.WriteFileHeader(enc, []*dicom.Element{
+		dicom.MustNewElement(dicomtag.TransferSyntaxUID, transferSyntaxUID),
+		dicom.MustNewElement(dicomtag.MediaStorageSOPClassUID, sopClassUID),
+		dicom.MustNewElement(dicomtag.MediaStorageSOPInstanceUID, sopInstanceUID),
+	})
+	if encErr := enc.Error(); encErr != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return "", encErr
+	}
+
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return "", err
+	}
+	tmpFile.Close()
+
+	var patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber string
+	if ds, parseErr := dicom.ReadDataSetFromFile(tmpPath, dicom.ReadOptions{DropPixelData: true}); parseErr == nil {
+		patientName = scpStringTag(ds, dicomtag.PatientName)
+		patientID = scpStringTag(ds, dicomtag.PatientID)
+		studyDesc = scpStringTag(ds, dicomtag.StudyDescription)
+		studyDate = scpStringTag(ds, dicomtag.StudyDate)
+		seriesDesc = scpStringTag(ds, dicomtag.SeriesDescription)
+		seriesNumber = scpStringTag(ds, dicomtag.SeriesNumber)
+	}
+
+	dest := organizeFilePath(downloadDir, patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber, sopInstanceUID)
+
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		os.Remove(tmpPath)
+		return "", err
+	}
+
+	if err := os.Rename(tmpPath, dest); err != nil {
+		if copyErr := scpCopyFile(tmpPath, dest); copyErr != nil {
+			os.Remove(tmpPath)
+			return "", copyErr
+		}
+		os.Remove(tmpPath)
+	}
+
+	return dest, nil
 }

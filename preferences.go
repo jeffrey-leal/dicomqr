@@ -138,13 +138,19 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 	themeSelect := widget.NewRadioGroup([]string{"Light", "Dark"}, nil)
 	themeSelect.SetSelected(themeLabel)
 
-	fontOptions := append([]string{"(default)"}, listSystemFonts()...)
-	fontSelect := widget.NewSelect(fontOptions, nil)
+	fontSelect := widget.NewSelect([]string{"(default)", "(loading…)"}, nil)
 	if current.fontName != "" {
 		fontSelect.SetSelected(current.fontName)
 	} else {
 		fontSelect.SetSelected("(default)")
 	}
+	go func() {
+		fonts := listSystemFonts()
+		fyne.Do(func() {
+			fontSelect.Options = append([]string{"(default)"}, fonts...)
+			fontSelect.Refresh()
+		})
+	}()
 
 	// UI section
 	uiHeader := widget.NewLabel("UI")
@@ -286,6 +292,15 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 	portEntry.SetText(fmt.Sprintf("%d", p.Port))
 	modelSelect := widget.NewSelect([]string{"study", "patient"}, nil)
 	modelSelect.SetSelected(p.InfoModel)
+	retrieveMethodSelect := widget.NewSelect([]string{"C-MOVE (default)", "C-GET", "Auto"}, nil)
+	switch p.RetrieveMethod {
+	case "GET":
+		retrieveMethodSelect.SetSelected("C-GET")
+	case "AUTO":
+		retrieveMethodSelect.SetSelected("Auto")
+	default:
+		retrieveMethodSelect.SetSelected("C-MOVE (default)")
+	}
 
 	form := widget.NewForm(
 		widget.NewFormItem("Profile name", nameEntry),
@@ -293,6 +308,7 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 		widget.NewFormItem("Host", hostEntry),
 		widget.NewFormItem("Port", portEntry),
 		widget.NewFormItem("Info model", modelSelect),
+		widget.NewFormItem("Retrieve method", retrieveMethodSelect),
 	)
 
 	dialog.ShowCustomConfirm("Edit Server", "Save", "Cancel", form, func(save bool) {
@@ -303,12 +319,20 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 		if v, err := strconv.Atoi(portEntry.Text); err == nil && v > 0 && v < 65536 {
 			port = v
 		}
+		retrieveMethod := "MOVE"
+		switch retrieveMethodSelect.Selected {
+		case "C-GET":
+			retrieveMethod = "GET"
+		case "Auto":
+			retrieveMethod = "AUTO"
+		}
 		onSave(ServerProfile{
-			Name:          nameEntry.Text,
-			RemoteAETitle: strings.ToUpper(strings.TrimSpace(aeEntry.Text)),
-			Host:          strings.TrimSpace(hostEntry.Text),
-			Port:          port,
-			InfoModel:     modelSelect.Selected,
+			Name:           nameEntry.Text,
+			RemoteAETitle:  strings.ToUpper(strings.TrimSpace(aeEntry.Text)),
+			Host:           strings.TrimSpace(hostEntry.Text),
+			Port:           port,
+			InfoModel:      modelSelect.Selected,
+			RetrieveMethod: retrieveMethod,
 		})
 	}, w)
 }

@@ -12,12 +12,12 @@ var defaultSettingsJSON []byte
 
 // Settings holds all persisted application preferences.
 type Settings struct {
-	DarkTheme       bool            `json:"darkTheme"`
-	FontName        string          `json:"fontName"`
-	LocalAETitle    string          `json:"localAETitle"`
-	LocalSCPPort    int             `json:"localSCPPort"`
-	DownloadDir string          `json:"downloadDir"`
-	Profiles    []ServerProfile `json:"profiles"`
+	DarkTheme    bool            `json:"darkTheme"`
+	FontName     string          `json:"fontName"`
+	LocalAETitle string          `json:"localAETitle"`
+	LocalSCPPort int             `json:"localSCPPort"`
+	DownloadDir  string          `json:"downloadDir"`
+	Profiles     []ServerProfile `json:"profiles"`
 }
 
 func appSettingsDir() (string, error) {
@@ -72,13 +72,15 @@ func loadSettings() Settings {
 	return s
 }
 
-// saveSettings writes s to ~/.dicomqr/settings.json as indented JSON.
+// saveSettings writes s to ~/.dicomqr/settings.json as indented JSON atomically
+// (write-to-temp + rename) to prevent corruption on crash mid-write.
 func saveSettings(s Settings) {
 	path, err := appSettingsPath()
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return
 	}
 	if s.Profiles == nil {
@@ -88,5 +90,24 @@ func saveSettings(s Settings) {
 	if err != nil {
 		return
 	}
-	os.WriteFile(path, data, 0o644)
+
+	// Write to temp file first; os.Rename is atomic on NTFS.
+	tmp, err := os.CreateTemp(dir, ".settings_*.json.tmp")
+	if err != nil {
+		return
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return
+	}
+	// os.Rename is atomic on NTFS; overwrites destination atomically.
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+	}
 }
