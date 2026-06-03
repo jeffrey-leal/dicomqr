@@ -591,6 +591,7 @@ func main() {
 			return
 		}
 		if searchPopup == nil {
+			closeBtn := widget.NewButton("Close", func() { searchPopup.Hide() })
 			popupContent := container.NewVBox(
 				container.New(layout.NewFormLayout(),
 					widget.NewLabel("Patient Name"), patientNameEntry,
@@ -600,7 +601,7 @@ func main() {
 					widget.NewLabel("Study Date To"), studyDateToEntry,
 					widget.NewLabel("Modality"), modalityCheck,
 				),
-				container.NewHBox(layout.NewSpacer(), searchBtn, clearBtn),
+				container.NewHBox(layout.NewSpacer(), searchBtn, clearBtn, closeBtn),
 			)
 			searchPopup = widget.NewModalPopUp(container.NewPadded(popupContent), w.Canvas())
 		}
