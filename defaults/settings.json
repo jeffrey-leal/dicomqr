@@ -4,6 +4,9 @@
   "localAETitle": "DICOMQR",
   "localSCPPort": 11112,
   "downloadDir": "",
+  "selectionColor": "",
+  "selectionBold": true,
+  "selectionItalic": false,
   "profiles": [
     {
       "name": "Local Orthanc",

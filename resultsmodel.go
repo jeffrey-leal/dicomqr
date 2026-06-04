@@ -30,7 +30,8 @@ type resultNode struct {
 	seriesInstanceUID string
 	sopInstanceUID    string
 
-	seriesLoaded bool // true once a series C-FIND has been fired for this study node
+	seriesLoaded bool   // true once a series C-FIND has been fired for this study node
+	parentID     string // empty for patient nodes; patID for study nodes; sID for series nodes
 
 	// Raw DICOM field values retained for CSV/JSON export (Phase 4-A).
 	patientName  string // patient nodes
@@ -104,6 +105,7 @@ func (m *resultsModel) addStudy(patientName, patientID, studyUID, studyDate, stu
 			id: sID, kind: kindStudy, label: label, tooltip: tooltip,
 			patientID: patientID, studyInstanceUID: studyUID,
 			sortKey:    studyDate,
+			parentID:   patID,
 			studyDate:  studyDate,
 			studyDesc:  studyDesc,
 			accession:  accession,
@@ -138,12 +140,20 @@ func (m *resultsModel) addSeries(studyUID, seriesUID, modality, seriesNumber, se
 			studyInstanceUID:  studyUID,
 			seriesInstanceUID: seriesUID,
 			sortKey:           fmt.Sprintf("%010d", n),
+			parentID:          sID,
 			seriesNumber:      seriesNumber,
 			modality:          modality,
 			numInstances:      numInstances,
 		}
 		m.sortedInsert(&study.children, rID)
 	}
+}
+
+func (m *resultsModel) parentOf(id string) string {
+	if n, ok := m.nodes[id]; ok {
+		return n.parentID
+	}
+	return ""
 }
 
 func (m *resultsModel) isSeriesLoaded(id string) bool {

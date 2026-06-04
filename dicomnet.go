@@ -89,11 +89,13 @@ func (c *DicomClient) Echo(ctx context.Context) error {
 	}
 }
 
-// Find sends a C-FIND (Study Root or Patient Root QR, Verification SOP Class
-// 1.2.840.10008.5.1.4.1.2.2.1) at the given query level and streams results on
-// the returned channel. The channel is closed when the query completes or ctx
-// is cancelled. A non-nil error is returned only when the ServiceUser cannot be
-// created; association and query errors close the channel silently (0 results).
+// Find sends a C-FIND (Study Root or Patient Root QR) at the given query level
+// and streams results on the returned channel. The channel is closed when the
+// query completes or ctx is cancelled. A non-nil error is returned only when the
+// ServiceUser cannot be created. Association failures (e.g. the connection
+// dropped mid-session) and query rejections are reported in-band as a
+// FindResult with Err set, so callers can distinguish a genuinely empty result
+// from a failed query.
 func (c *DicomClient) Find(ctx context.Context, level string, params map[string]string) (<-chan FindResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err

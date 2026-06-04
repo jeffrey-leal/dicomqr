@@ -1,54 +1,56 @@
 # Changelog
 
-## [0.2.0] — 2026-06-03
+## [1.0.0] — 2026-06-03
+
+Initial public release.
 
 ### Added
-- **Export results** — Query menu → **Export…** saves the current results tree to CSV or JSON; studies with no series loaded produce one row each, studies with series loaded produce one row per series
-- **Connect timeout** — each server profile has a **Connect timeout (s)** field (default 10 s); prevents indefinite hangs on unreachable servers; the timeout can be overridden per profile in **File > Preferences… > Connections > Edit**
-- **Cancel connect** — the **Disconnect** button changes to **Cancel** while a connection is in progress and cancels the in-flight C-ECHO; clicking it sets the app back to disconnected immediately
-- **Retry failed retrieve targets** — when one or more targets error during a retrieve a confirmation dialog offers to retry only the failed targets without re-downloading the successful ones
-- **Profile reordering** — Up/Down buttons in the Connections preference list reorder server profiles
-- **Ctrl+R shortcut** — keyboard shortcut to trigger Retrieve Selected (mirrors the menu item)
-- **Indeterminate progress bar during query** — a separate infinite-progress bar animates during C-FIND; the deterministic retrieve progress bar is hidden while querying
-- **Live loading count** — the status bar updates every 10 studies while the results batch is being inserted (`Loading results… N/total`)
-- **Download directory default** — if no download directory is configured the app defaults to `~/DICOM Downloads` instead of leaving the field blank
-- **Filter debounce** — the results filter waits 150 ms after the last keystroke before re-running, preventing redundant redraws on fast typing
-- **Air-gapped IP detection** — `localIP()` falls back to enumerating network interfaces when the UDP trick to `8.8.8.8` fails (no internet connection)
-- **Inline server profile validation** — AE Title and Port fields in the server editor show inline error hints and block save if the values are invalid (AE title: required, ≤ 16 chars; Port: 1–65535)
-
-### Changed
-- **Filter popup** — the Filters dropdown is now a modal popup that auto-dismisses on outside click (was a non-modal `widget.PopUp`)
-- **About dialog** — removed the "UI Template / dicomhdr" attribution section
-
-### Fixed
-- **Path-length guard** — each folder component in the download directory hierarchy is truncated to 64 characters; the full path falls back to a flat `<downloadDir>/<sopInstanceUID>.dcm` layout when it would exceed 255 characters
-- **Windows reserved device names** — path components matching `CON`, `NUL`, `PRN`, `AUX`, `COM1`–`COM9`, `LPT1`–`LPT9` are prefixed with `_` to prevent Windows from rejecting the path
-
-### Internal (Phases 1–2, shipped as 0.1.4/0.1.5)
-- Data race fixes: `state`, `StorageSCP.downloadDir`, `scp.OnFileReceived` all guarded by mutexes
-- Atomic settings write (temp-file + `os.Rename`) to prevent settings corruption on crash
-- `sort.Search`-based sorted insert replaces `sort.Slice`-on-every-insert (O(N log N) vs O(N² log N))
-- `applyFilter` deferred out of per-insert path — called once per batch
-- `tree.RefreshItem(id)` replaces full `tree.Refresh()` after series lazy-load
-
----
-
-## [0.1.3] — 2026-05-26
-
-### Added
-- **Per-profile retrieve method** — each server profile now has a **Retrieve method** setting (C-MOVE / C-GET / Auto), configurable in **File > Preferences… > Connections > Edit**
+- **Per-profile retrieve method** — each server profile has a **Retrieve method** setting (C-MOVE / C-GET / Auto), configurable in **File > Preferences… > Connections > Edit**
 - **C-GET retrieval** — C-GET transfers files back over the same association; no inbound C-STORE SCP port or PACS-side registration of a destination AE is required
 - **Auto mode** — attempts C-GET first; falls back to C-MOVE automatically if the PACS rejects or does not support C-GET
-- **App icon** — application icon embedded in the Windows executable (shown in Explorer and the taskbar); icon also displayed in the **Help > About** dialog
-- **App icon in user manual** — icon shown on the title page of the user manual
-- **Automatic wildcard search** — Patient Name, Patient ID, and Accession Number fields automatically append `*` on search if the value does not already end with one; empty fields remain unconstrained
-- **Results tree sorting** — patients sorted alphabetically by name; studies within a patient sorted chronologically by date; series within a study sorted numerically by series number
+- **Export results** — Query menu → **Export…** saves the current results tree to CSV or JSON; studies with no series loaded produce one row each, studies with series loaded produce one row per series
+- **Series-level query and retrieve** — expanding a study fires a SERIES-level C-FIND and lets individual series be selected and retrieved
+- **Multi-select modality filter** — modalities are ticked via checkboxes and each is dispatched as a concurrent single-modality C-FIND, merged and deduplicated client-side
+- **Automatic wildcard search** — Patient Name, Patient ID, and Accession Number fields automatically append `*` on search when the value does not already end with one
+- **Results tree sorting** — patients alphabetical by name; studies chronological by date; series numeric by series number
+- **Select All / Clear Selection** — buttons in the retrieve panel; **Esc** also clears the current selection
+- **Expand All / Collapse All** — buttons above the results tree
+- **Customisable selection appearance** — **Preferences → UI** sets the colour and font style (bold / italic) applied to selected tree rows; an unset colour follows the theme's primary colour
+- **Connect timeout** — per-profile **Connect timeout (s)** field (default 10 s) prevents indefinite hangs on unreachable servers
+- **Cancel connect** — the **Disconnect** button becomes **Cancel** while connecting and aborts the in-flight C-ECHO
+- **Retry failed retrieve targets** — after a partial retrieve a dialog offers to retry only the failed targets
+- **Profile reordering** — Up/Down buttons in the Connections preference list reorder server profiles
+- **Ctrl+R shortcut** — triggers Retrieve Selected (mirrors the menu item)
+- **Progress reporting** — an indeterminate progress bar animates during C-FIND; the retrieve bar advances per target so C-GET (which carries no sub-operation count) also shows progress
+- **Live loading count** — large result sets are inserted in batches across UI frames with a `Loading results… N/total` counter, keeping the window responsive
+- **Window size persistence** — the window size is saved on exit and restored on the next launch
+- **Download directory default** — defaults to `~/DICOM Downloads` when none is configured
+- **App icon** — embedded in the Windows executable and shown in the **Help > About** dialog and the user manual title page
+- **Filter debounce** — the results filter waits 150 ms after the last keystroke before re-running
+- **Air-gapped IP detection** — `localIP()` enumerates network interfaces when the UDP probe to `8.8.8.8` fails
+- **Inline server profile validation** — AE Title (required, ≤ 16 chars) and Port (1–65535) are validated in the server editor
+
+### Changed
+- **Results tree selection behaviour** — parent/child-aware: selecting a node selects all its loaded descendants; narrowing and per-child deselection behave intuitively; expanding a selected node auto-selects newly loaded children
+- **Filter popup** — the Filters dropdown is a modal popup that auto-dismisses on outside click
+- Results tree starts fully collapsed after each search; expanding a study triggers the series C-FIND
 
 ### Fixed
-- **Filters popup validation error** — re-opening the Filters panel after a search no longer shows a spurious date-parse error on empty date fields; root cause was `widget.Form`'s validation machinery calling the broken `DateEntry` validator via its helper-text system; replaced with a plain `layout.NewFormLayout` container that has no validation hooks
-- **Cancel retrieve** — pressing Cancel during a retrieve now reliably shows "Retrieve cancelled" and hides the progress bar; previously the status was immediately overwritten by "Received: …" messages because the C-STORE SCP callback and the C-GET callback continued queuing status updates after the context was cancelled; both callbacks now check `ctx.Err()` before posting a UI update, and the SCP callback is silenced on restore after any retrieve ends
-- **Results tree click responsiveness** — selecting or deselecting a row now refreshes only that row (`tree.RefreshItem`) rather than redrawing the entire tree, eliminating the perceptible lag on click
-- **Error 45056 (C-MOVE warning) recovery** — DICOM warning status 0xB000 ("Sub-operations Complete — One or more Failures") is no longer treated as a fatal error; multi-series retrieves continue to the next series rather than aborting; the final status message reports how many targets had warnings alongside the total file count
+- **SCP port left locked on exit** — closing the window (X), File → Quit, and any other termination route now stop the embedded C-STORE listener and release its port; previously only the Disconnect button did, so the port could stay bound after the app closed and block a restart. `StorageSCP.Stop()` now closes the listener synchronously, and an app-stopped lifecycle hook acts as a final safety net. If the port is still in use when connecting (e.g. after an unclean kill that bypasses shutdown), the SCP retries the bind briefly and then reports a clear, actionable message ("port N is already in use — another copy of dicomqr may still be running…") in a dialog rather than a raw socket error
+- **Connection-state data races** — the active client, C-STORE SCP, query context, and active profile are now guarded by a mutex, removing the race (and possible nil-deref) between disconnect on the UI goroutine and an in-flight retrieve
+- **Download directory validated up front** — a retrieve now fails fast with a clear message if the download folder cannot be written, rather than erroring per received file
+- **Filters popup validation error** — re-opening the Filters panel after a search no longer shows a spurious date-parse error on empty date fields
+- **Cancel retrieve** — pressing Cancel reliably shows "Retrieve cancelled"; the C-STORE and C-GET callbacks check `ctx.Err()` before posting UI updates
+- **Error 45056 (C-MOVE warning) recovery** — DICOM warning status 0xB000 is no longer treated as fatal; multi-series retrieves continue and the final status reports warning counts
+- **Path-length guard** — each folder component is truncated to 64 characters; the path falls back to a flat `<downloadDir>/<sopInstanceUID>.dcm` layout when it would exceed 255 characters
+- **Windows reserved device names** — path components matching `CON`, `NUL`, `PRN`, `AUX`, `COM1`–`COM9`, `LPT1`–`LPT9` are prefixed with `_`
+
+### Internal
+- Data-race fixes for `state`, `StorageSCP.downloadDir`, and `scp.OnFileReceived` (mutex-guarded)
+- Atomic settings write (temp-file + `os.Rename`) to prevent settings corruption on crash
+- `sort.Search`-based sorted insert replaces `sort.Slice`-on-every-insert (O(N log N) vs O(N² log N))
+- `applyFilter` deferred out of the per-insert path — called once per batch
+- `tree.RefreshItem(id)` replaces full `tree.Refresh()` after series lazy-load
 
 ---
 

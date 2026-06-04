@@ -26,7 +26,7 @@ import (
 	sqweekdialog "github.com/sqweek/dialog"
 )
 
-const version = "0.2.0"
+const version = "1.0.0"
 
 // buildDate is injected at link time: -ldflags "-X main.buildDate=YYYY-MM-DD"
 var buildDate string
@@ -66,10 +66,17 @@ func main() {
 	a := app.NewWithID("com.jeffreyleal.dicomqr")
 	a.SetIcon(appIcon)
 	w := a.NewWindow("dicomqr")
-	w.Resize(fyne.NewSize(900, 650))
 
 	ensureDefaultSettings()
 	cfg := loadSettings()
+
+	// Restore the persisted window size, falling back to the default for fresh
+	// installs or implausibly small saved values (Phase 5-2B).
+	if cfg.WindowWidth > 200 && cfg.WindowHeight > 150 {
+		w.Resize(fyne.NewSize(cfg.WindowWidth, cfg.WindowHeight))
+	} else {
+		w.Resize(fyne.NewSize(900, 650))
+	}
 
 	currentTheme := newAppTheme(cfg.DarkTheme)
 	if cfg.FontName != "" {
@@ -88,10 +95,11 @@ func main() {
 		client        *DicomClient
 		activeProfile ServerProfile
 		scp           *StorageSCP
-		cancelQuery   context.CancelFunc
-		cancelConnect context.CancelFunc
+		cancelQuery   context.CancelFunc // UI-goroutine only
+		cancelConnect context.CancelFunc // UI-goroutine only
 		connCtx       context.Context
 		cancelConn    context.CancelFunc
+		connMu        sync.Mutex // guards client, scp, activeProfile, connCtx, cancelConn
 	)
 
 	// Thread-safe state accessors (Phase 1-A)
@@ -104,6 +112,59 @@ func main() {
 		stateMu.Lock()
 		defer stateMu.Unlock()
 		state = s
+	}
+
+	// Thread-safe accessors for the active connection objects (Phase 5-1A).
+	// These are written by the connect goroutine and read by the query, retrieve,
+	// echo, and branch-open goroutines. disconnect nils them on the UI goroutine
+	// while a retrieve may still be reading, so every access is guarded by connMu.
+	getClient := func() *DicomClient {
+		connMu.Lock()
+		defer connMu.Unlock()
+		return client
+	}
+	getSCP := func() *StorageSCP {
+		connMu.Lock()
+		defer connMu.Unlock()
+		return scp
+	}
+	getActiveProfile := func() ServerProfile {
+		connMu.Lock()
+		defer connMu.Unlock()
+		return activeProfile
+	}
+	getConnCtx := func() context.Context {
+		connMu.Lock()
+		defer connMu.Unlock()
+		return connCtx
+	}
+	setConn := func(c *DicomClient, s *StorageSCP, p ServerProfile, ctx context.Context, cancel context.CancelFunc) {
+		connMu.Lock()
+		defer connMu.Unlock()
+		client, scp, activeProfile, connCtx, cancelConn = c, s, p, ctx, cancel
+	}
+	// clearConn nils every connection field and returns the SCP and cancel func
+	// so the caller can stop them outside the lock.
+	clearConn := func() (*StorageSCP, context.CancelFunc) {
+		connMu.Lock()
+		defer connMu.Unlock()
+		s, cancel := scp, cancelConn
+		client, scp, activeProfile, connCtx, cancelConn = nil, nil, ServerProfile{}, nil, nil
+		return s, cancel
+	}
+
+	// shutdownSCP stops the embedded C-STORE listener and releases its port. It
+	// must run on every termination path (window close, Quit menu, app-stopped
+	// lifecycle hook) so the SCP never outlives the app and holds the port against
+	// a restart (Phase 5-2F). It is safe to call multiple times — clearConn
+	// returns a nil SCP after the first call.
+	shutdownSCP := func() {
+		if s, cancel := clearConn(); s != nil {
+			if cancel != nil {
+				cancel()
+			}
+			s.Stop()
+		}
 	}
 
 	// ── Status bar ──────────────────────────────────────────────────────────
@@ -133,16 +194,102 @@ func main() {
 	model := newResultsModel()
 	selectedNodes := make(map[string]bool)
 
-	// tree is declared here so onTapped can reference it before widget.NewTree returns.
+	// tree is declared here so the selection helpers can reference it before
+	// widget.NewTree returns.
 	var tree *widget.Tree
 
-	onTapped := func(id string) {
+	// clearSubtree removes id and every loaded descendant from selectedNodes.
+	var clearSubtree func(string)
+	clearSubtree = func(id string) {
 		if selectedNodes[id] {
 			delete(selectedNodes, id)
-		} else {
-			selectedNodes[id] = true
+			tree.RefreshItem(id)
 		}
+		for _, child := range model.childUIDs(id) {
+			clearSubtree(child)
+		}
+	}
+
+	// selectSubtree adds id and every loaded descendant to selectedNodes.
+	var selectSubtree func(string)
+	selectSubtree = func(id string) {
+		selectedNodes[id] = true
 		tree.RefreshItem(id)
+		for _, child := range model.childUIDs(id) {
+			selectSubtree(child)
+		}
+	}
+
+	// nodeOrAncestorSelected reports whether id or any of its ancestors is selected.
+	nodeOrAncestorSelected := func(id string) bool {
+		for cur := id; cur != ""; cur = model.parentOf(cur) {
+			if selectedNodes[cur] {
+				return true
+			}
+		}
+		return false
+	}
+
+	onTapped := func(id string) {
+		// Find the outermost selected ancestor (if any).
+		topAncestor := ""
+		for anc := model.parentOf(id); anc != ""; anc = model.parentOf(anc) {
+			if selectedNodes[anc] {
+				topAncestor = anc
+			}
+		}
+
+		if topAncestor != "" && selectedNodes[id] {
+			// Node is selected and an ancestor is also selected (node was
+			// auto-selected when the parent was chosen). The user wants to
+			// deselect just this node: clear it and its loaded descendants,
+			// then deselect every ancestor up to and including topAncestor.
+			clearSubtree(id)
+			for anc := model.parentOf(id); anc != ""; anc = model.parentOf(anc) {
+				if selectedNodes[anc] {
+					delete(selectedNodes, anc)
+					tree.RefreshItem(anc)
+				}
+				if anc == topAncestor {
+					break
+				}
+			}
+			return
+		}
+
+		if topAncestor != "" {
+			// Node is unselected but an ancestor is selected. Narrow the
+			// selection down to just this node's subtree.
+			clearSubtree(topAncestor)
+			selectSubtree(id)
+			return
+		}
+
+		if selectedNodes[id] {
+			// Node is selected with no selected ancestors: toggle it off
+			// together with all loaded descendants.
+			clearSubtree(id)
+			return
+		}
+
+		// Node is unselected with no selected ancestors: select it and all
+		// loaded descendants.
+		selectSubtree(id)
+	}
+
+	// selectAll selects every currently visible (filtered) root and its loaded
+	// descendants; clearSelection drops the whole selection (Phase 5-2C).
+	selectAll := func() {
+		for _, id := range model.activeRoots() {
+			selectSubtree(id)
+		}
+	}
+	clearSelection := func() {
+		if len(selectedNodes) == 0 {
+			return
+		}
+		selectedNodes = make(map[string]bool)
+		tree.Refresh()
 	}
 
 	// startRetrieve is assigned below after the retrieve variables are in scope.
@@ -172,8 +319,14 @@ func main() {
 			row.ct.Text = model.labelFor(id)
 			row.ct.TextSize = theme.TextSize()
 			if selectedNodes[id] {
-				row.ct.Color = theme.Color(theme.ColorNamePrimary)
-				row.ct.TextStyle = fyne.TextStyle{Bold: true}
+				// Selected rows use the user-configured appearance (Phase 5-2E);
+				// an empty SelectionColor follows the theme's primary colour.
+				if cfg.SelectionColor != "" {
+					row.ct.Color = hexToColor(cfg.SelectionColor)
+				} else {
+					row.ct.Color = theme.Color(theme.ColorNamePrimary)
+				}
+				row.ct.TextStyle = fyne.TextStyle{Bold: cfg.SelectionBold, Italic: cfg.SelectionItalic}
 			} else {
 				row.ct.Color = theme.Color(theme.ColorNameForeground)
 				row.ct.TextStyle = fyne.TextStyle{}
@@ -189,10 +342,12 @@ func main() {
 		model.markSeriesLoaded(id) // mark before goroutine to prevent duplicate queries
 		_, studyUID, _, _ := model.uidsForNode(id)
 		go func() {
-			if connCtx == nil {
+			cctx := getConnCtx()
+			cl := getClient()
+			if cctx == nil || cl == nil {
 				return
 			}
-			ch, err := client.Find(connCtx, "SERIES", map[string]string{"StudyInstanceUID": studyUID})
+			ch, err := cl.Find(cctx, "SERIES", map[string]string{"StudyInstanceUID": studyUID})
 			if err != nil {
 				return
 			}
@@ -208,6 +363,12 @@ func main() {
 				for _, r := range series {
 					model.addSeries(r.StudyInstanceUID, r.SeriesInstanceUID,
 						r.Modality, r.SeriesNumber, r.SeriesDescription, r.NumInstances)
+				}
+				// Auto-select newly loaded series if the study or any ancestor is selected.
+				if nodeOrAncestorSelected(id) {
+					for _, child := range model.childUIDs(id) {
+						selectedNodes[child] = true
+					}
 				}
 				model.applyFilter()
 				tree.RefreshItem(id)
@@ -238,7 +399,7 @@ func main() {
 	modalityCheck.Horizontal = true
 
 	doSearch := func() {
-		if getState() != stateConnected || client == nil {
+		if getState() != stateConnected || getClient() == nil {
 			dialog.ShowInformation("Not connected", "Connect to a DICOM server first.", w)
 			return
 		}
@@ -297,6 +458,16 @@ func main() {
 			go func() {
 				defer cancel()
 
+				cl := getClient()
+				prof := getActiveProfile()
+				if cl == nil {
+					fyne.Do(func() {
+						queryProgress.Hide()
+						statusLabel.SetText("Not connected")
+					})
+					return
+				}
+
 				type queryResult struct {
 					results []FindResult
 					err     error
@@ -308,7 +479,7 @@ func main() {
 					wg.Add(1)
 					go func(p map[string]string) {
 						defer wg.Done()
-						ch, err := client.Find(ctx, activeProfile.InfoModel, p)
+						ch, err := cl.Find(ctx, prof.InfoModel, p)
 						if err != nil {
 							resultsCh <- queryResult{err: err}
 							return
@@ -354,15 +525,29 @@ func main() {
 					})
 					return
 				}
-				fyne.Do(func() {
-					total := len(allResults)
-					for i, r := range allResults {
-						model.addStudy(r.PatientName, r.PatientID, r.StudyInstanceUID,
-							r.StudyDate, r.StudyDescription, r.AccessionNumber, r.ModalitiesInStudy)
-						if (i+1)%10 == 0 {
-							statusLabel.SetText(fmt.Sprintf("Loading results… %d/%d", i+1, total))
-						}
+				// Insert results in batches across successive UI frames so the
+				// window stays responsive on large result sets and the live count
+				// actually paints; inserting everything in one fyne.Do would freeze
+				// the UI thread for the whole batch (Phase 5-1C).
+				total := len(allResults)
+				const insertBatch = 200
+				for start := 0; start < total; start += insertBatch {
+					end := start + insertBatch
+					if end > total {
+						end = total
 					}
+					batch, shown := allResults[start:end], end
+					fyne.Do(func() {
+						for _, r := range batch {
+							model.addStudy(r.PatientName, r.PatientID, r.StudyInstanceUID,
+								r.StudyDate, r.StudyDescription, r.AccessionNumber, r.ModalitiesInStudy)
+						}
+						statusLabel.SetText(fmt.Sprintf("Loading results… %d/%d", shown, total))
+						tree.Refresh()
+					})
+					time.Sleep(10 * time.Millisecond) // yield so the UI can paint between batches
+				}
+				fyne.Do(func() {
 					model.applyFilter()
 					tree.Refresh()
 					queryProgress.Hide()
@@ -528,16 +713,17 @@ func main() {
 				setConnState(stateDisconnected, "Connection cancelled")
 				return
 			}
-			client = c
-			activeProfile = profile
 
 			s := NewStorageSCP(cfg.LocalAETitle, cfg.LocalSCPPort, cfg.DownloadDir)
 			if err := s.Start(); err != nil {
 				setConnState(stateDisconnected, "SCP error: "+err.Error())
+				// Show the full message in a dialog — the status bar truncates the
+				// actionable "port in use" guidance.
+				fyne.Do(func() { dialog.ShowError(err, w) })
 				return
 			}
-			scp = s
-			connCtx, cancelConn = context.WithCancel(context.Background())
+			cctx, cancelC := context.WithCancel(context.Background())
+			setConn(c, s, profile, cctx, cancelC)
 
 			setConnState(stateConnected, fmt.Sprintf("Connected: %s@%s:%d  |  SCP %s (AE: %s)",
 				profile.RemoteAETitle, profile.Host, profile.Port, s.ListenAddr(), cfg.LocalAETitle))
@@ -552,24 +738,23 @@ func main() {
 		if cancelQuery != nil {
 			cancelQuery()
 		}
-		if cancelConn != nil {
-			cancelConn()
+		s, cancelC := clearConn()
+		if cancelC != nil {
+			cancelC()
 		}
-		if scp != nil {
-			scp.Stop()
-			scp = nil
+		if s != nil {
+			s.Stop()
 		}
-		client = nil
-		activeProfile = ServerProfile{}
 		setConnState(stateDisconnected, "Disconnected")
 	}
 
 	echoBtn.OnTapped = func() {
-		if client == nil {
+		cl := getClient()
+		if cl == nil {
 			return
 		}
 		go func() {
-			if err := client.Echo(context.Background()); err != nil {
+			if err := cl.Echo(context.Background()); err != nil {
 				setStatus("C-ECHO failed: " + err.Error())
 			} else {
 				setStatus("C-ECHO success")
@@ -615,8 +800,8 @@ func main() {
 	downloadDirEntry.SetPlaceHolder("Select download folder…")
 	downloadDirEntry.OnChanged = func(dir string) {
 		cfg.DownloadDir = dir
-		if scp != nil {
-			scp.SetDownloadDir(dir)
+		if sc := getSCP(); sc != nil {
+			sc.SetDownloadDir(dir)
 		}
 		saveSettings(cfg)
 	}
@@ -655,20 +840,29 @@ func main() {
 	// targets without duplicating the full retrieve loop (Phase 4-E).
 	var startRetrieveTargets func(targets []retrieveTarget)
 	startRetrieveTargets = func(targets []retrieveTarget) {
-		if getState() != stateConnected || client == nil {
+		cl := getClient()
+		sc := getSCP()
+		if getState() != stateConnected || cl == nil {
 			dialog.ShowInformation("Not connected", "Connect to a DICOM server first.", w)
 			return
 		}
-		method := activeProfile.RetrieveMethod
+		method := getActiveProfile().RetrieveMethod
 		if method == "" {
 			method = "MOVE"
 		}
 		if method == "MOVE" || method == "AUTO" {
-			if scp == nil || !scp.IsRunning() {
+			if sc == nil || !sc.IsRunning() {
 				dialog.ShowInformation("SCP not running",
 					fmt.Sprintf("The local C-STORE SCP is not listening.\n\nDisconnect and reconnect to restart it.\nExpected port: %d  AE title: %s", cfg.LocalSCPPort, cfg.LocalAETitle), w)
 				return
 			}
+		}
+
+		// Fail fast if the download directory cannot be written (Phase 5-2D),
+		// rather than surfacing a C-STORE error per received file.
+		if err := dirWritable(cfg.DownloadDir); err != nil {
+			dialog.ShowError(err, w)
+			return
 		}
 
 		count := len(targets)
@@ -696,11 +890,11 @@ func main() {
 
 			var fileCount int64
 
-			// For C-MOVE: intercept scp.OnFileReceived to count and report files.
+			// For C-MOVE: intercept sc.OnFileReceived to count and report files.
 			var origOnFileReceived func(string)
-			if scp != nil && (method == "MOVE" || method == "AUTO") {
-				origOnFileReceived = scp.OnFileReceived()
-				scp.SetOnFileReceived(func(path string) {
+			if sc != nil && (method == "MOVE" || method == "AUTO") {
+				origOnFileReceived = sc.OnFileReceived()
+				sc.SetOnFileReceived(func(path string) {
 					atomic.AddInt64(&fileCount, 1)
 					if ctx.Err() == nil {
 						fyne.Do(func() { statusLabel.SetText("Received: " + path) })
@@ -708,8 +902,8 @@ func main() {
 				})
 			}
 			restoreSCP := func() {
-				if scp != nil {
-					scp.SetOnFileReceived(origOnFileReceived)
+				if sc != nil {
+					sc.SetOnFileReceived(origOnFileReceived)
 				}
 			}
 
@@ -747,12 +941,12 @@ func main() {
 				var err error
 				switch method {
 				case "GET":
-					err = client.Get(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, getCallback)
+					err = cl.Get(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, getCallback)
 				case "AUTO":
-					err = client.Get(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, getCallback)
+					err = cl.Get(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, getCallback)
 					if err != nil && ctx.Err() == nil {
 						log.Printf("retrieve: c-get failed (%v), falling back to c-move", err)
-						err = client.Move(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, cfg.LocalAETitle, func(p MoveProgress) {
+						err = cl.Move(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, cfg.LocalAETitle, func(p MoveProgress) {
 							sub := p.Remaining + p.Completed + p.Failed + p.Warning
 							if sub > 0 {
 								frac := (float64(i) + float64(p.Completed)/float64(sub)) / float64(count)
@@ -761,7 +955,7 @@ func main() {
 						})
 					}
 				default: // "MOVE"
-					err = client.Move(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, cfg.LocalAETitle, func(p MoveProgress) {
+					err = cl.Move(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, cfg.LocalAETitle, func(p MoveProgress) {
 						sub := p.Remaining + p.Completed + p.Failed + p.Warning
 						if sub > 0 {
 							frac := (float64(i) + float64(p.Completed)/float64(sub)) / float64(count)
@@ -779,6 +973,13 @@ func main() {
 					errCount++
 					failed = append(failed, tgt)
 				}
+
+				// Advance the bar per completed target. C-MOVE also updates it
+				// finely via its progress callback above; this guarantees C-GET
+				// (which carries no sub-operation count) still shows progress and
+				// the bar reaches 100% on the final target (Phase 5-2A).
+				frac := float64(idx) / float64(count)
+				fyne.Do(func() { progressBar.SetValue(frac) })
 			}
 
 			restoreSCP()
@@ -806,7 +1007,7 @@ func main() {
 	}
 
 	startRetrieve = func(nodeIDs []string) {
-		if getState() != stateConnected || client == nil {
+		if getState() != stateConnected || getClient() == nil {
 			dialog.ShowInformation("Not connected", "Connect to a DICOM server first.", w)
 			return
 		}
@@ -875,7 +1076,9 @@ func main() {
 			container.NewHBox(openFolderBtn, browseBtn),
 			downloadDirEntry,
 		),
-		container.NewHBox(retrieveBtn, cancelRetrieveBtn),
+		container.NewHBox(retrieveBtn, cancelRetrieveBtn, layout.NewSpacer(),
+			widget.NewButton("Select All", selectAll),
+			widget.NewButton("Clear Selection", clearSelection)),
 	)
 
 	// ── Search bar (filter above tree) ───────────────────────────────────────
@@ -897,11 +1100,15 @@ func main() {
 		})
 	}
 	filterBar := container.NewBorder(nil, nil, nil,
-		widget.NewButton("Clear", func() {
-			filterEntry.SetText("")
-			model.setFilter("")
-			tree.Refresh()
-		}),
+		container.NewHBox(
+			widget.NewButton("Expand All", func() { tree.OpenAllBranches() }),
+			widget.NewButton("Collapse All", func() { tree.CloseAllBranches() }),
+			widget.NewButton("Clear", func() {
+				filterEntry.SetText("")
+				model.setFilter("")
+				tree.Refresh()
+			}),
+		),
 		filterEntry,
 	)
 
@@ -918,6 +1125,10 @@ func main() {
 		&desktop.CustomShortcut{KeyName: fyne.KeyR, Modifier: fyne.KeyModifierShortcutDefault},
 		func(_ fyne.Shortcut) { retrieveBtn.OnTapped() },
 	)
+	w.Canvas().AddShortcut(
+		&desktop.CustomShortcut{KeyName: fyne.KeyEscape},
+		func(_ fyne.Shortcut) { clearSelection() },
+	)
 
 	// ── Menus ─────────────────────────────────────────────────────────────────
 	fileMenu := fyne.NewMenu("File",
@@ -929,10 +1140,11 @@ func main() {
 				cfg = updated
 				profileSelect.Options = profileNames()
 				profileSelect.Refresh()
+				tree.Refresh() // re-render selected rows with the new selection style
 			})
 		}),
 		fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Quit", func() { a.Quit() }),
+		fyne.NewMenuItem("Quit", func() { shutdownSCP(); a.Quit() }),
 	)
 
 	queryMenu := fyne.NewMenu("Query",
@@ -1057,6 +1269,24 @@ func main() {
 	bottom := container.NewVBox(retrievePanel, statusBar)
 
 	w.SetContent(container.NewBorder(top, bottom, nil, nil, tree))
+
+	// Persist the window size on close (Phase 5-2B) and stop the SCP so the port
+	// is released (Phase 5-2F) before the window — and the app — closes.
+	w.SetCloseIntercept(func() {
+		sz := w.Canvas().Size()
+		if sz.Width > 0 && sz.Height > 0 {
+			cfg.WindowWidth = sz.Width
+			cfg.WindowHeight = sz.Height
+			saveSettings(cfg)
+		}
+		shutdownSCP()
+		w.Close()
+	})
+
+	// Safety net: stop the SCP if the app terminates by any route that bypasses
+	// the close intercept above (Phase 5-2F).
+	a.Lifecycle().SetOnStopped(shutdownSCP)
+
 	w.ShowAndRun()
 }
 
@@ -1073,7 +1303,7 @@ func setupLogFile() {
 		return
 	}
 	logPath := filepath.Join(dir, "dicom.log")
-	os.Remove(logPath)
+	os.Rename(logPath, filepath.Join(dir, "dicom.log.1")) // rotate previous session; ignore error
 	f, err := os.Create(logPath)
 	if err != nil {
 		return

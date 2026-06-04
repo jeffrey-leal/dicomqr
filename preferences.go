@@ -155,6 +155,25 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 		})
 	}()
 
+	// Selected-row appearance controls (Phase 5-2E).
+	chosenSelColor := hexToColor(cfg.SelectionColor) // empty/invalid → default blue
+	selColorSwatch := canvas.NewRectangle(chosenSelColor)
+	selColorSwatch.SetMinSize(fyne.NewSize(40, 20))
+	selColorBtn := widget.NewButton("Choose colour…", func() {
+		picker := dialog.NewColorPicker("Selection colour",
+			"Colour applied to selected tree rows", func(c color.Color) {
+				chosenSelColor = c
+				selColorSwatch.FillColor = c
+				selColorSwatch.Refresh()
+			}, w)
+		picker.Advanced = true
+		picker.Show()
+	})
+	selBoldCheck := widget.NewCheck("Bold", nil)
+	selBoldCheck.SetChecked(cfg.SelectionBold)
+	selItalicCheck := widget.NewCheck("Italic", nil)
+	selItalicCheck.SetChecked(cfg.SelectionItalic)
+
 	// UI section
 	uiHeader := widget.NewLabel("UI")
 	uiHeader.TextStyle = fyne.TextStyle{Bold: true}
@@ -164,6 +183,8 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 		widget.NewForm(
 			widget.NewFormItem("Theme", themeSelect),
 			widget.NewFormItem("Tree font", fontSelect),
+			widget.NewFormItem("Selection colour", container.NewHBox(selColorSwatch, selColorBtn)),
+			widget.NewFormItem("Selection style", container.NewHBox(selBoldCheck, selItalicCheck)),
 		),
 	)
 
@@ -278,12 +299,17 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 		}
 
 		updated := Settings{
-			DarkTheme:    current.isDark,
-			FontName:     current.fontName,
-			LocalAETitle: localAEEntry.Text,
-			LocalSCPPort: port,
-			DownloadDir:  cfg.DownloadDir,
-			Profiles:     pendingProfiles,
+			DarkTheme:       current.isDark,
+			FontName:        current.fontName,
+			LocalAETitle:    localAEEntry.Text,
+			LocalSCPPort:    port,
+			DownloadDir:     cfg.DownloadDir,
+			Profiles:        pendingProfiles,
+			WindowWidth:     cfg.WindowWidth,
+			WindowHeight:    cfg.WindowHeight,
+			SelectionColor:  colorToHex(chosenSelColor),
+			SelectionBold:   selBoldCheck.Checked,
+			SelectionItalic: selItalicCheck.Checked,
 		}
 		saveSettings(updated)
 		a.Settings().SetTheme(current)

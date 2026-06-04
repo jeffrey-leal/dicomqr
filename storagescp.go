@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	netdicom "github.com/algm/go-netdicom"
@@ -36,8 +38,12 @@ type StorageSCP struct {
 	cbMu           sync.Mutex
 	onFileReceived func(path string)
 
-	running bool
-	cancel  context.CancelFunc
+	// running, cancel, and ln are guarded by cancelMu; running is also readable
+	// via atomic load for lock-free hot-path checks.
+	cancelMu sync.Mutex
+	running  atomic.Bool
+	cancel   context.CancelFunc
+	ln       net.Listener
 }
 
 // DownloadDir returns the download directory (thread-safe, Phase 1-B).
@@ -90,15 +96,20 @@ func NewStorageSCP(localAETitle string, port int, downloadDir string) *StorageSC
 // Start begins listening on the configured port. Returns an error if the
 // port is already in use or the download directory cannot be created.
 func (s *StorageSCP) Start() error {
-	if s.running {
+	s.cancelMu.Lock()
+	if s.running.Load() {
+		s.cancelMu.Unlock()
 		return nil
 	}
+	s.cancelMu.Unlock()
+
 	if s.DownloadDir() == "" {
 		return errors.New("download directory is not configured")
 	}
 	if err := os.MkdirAll(s.DownloadDir(), 0o755); err != nil {
 		return fmt.Errorf("cannot create download directory: %w", err)
 	}
+	cleanupStaleTempFiles(s.DownloadDir())
 
 	params := netdicom.ServiceProviderParams{
 		AETitle: s.localAETitle,
@@ -117,15 +128,37 @@ func (s *StorageSCP) Start() error {
 	// Use "tcp4" to create an IPv4-only socket. net.Listen("tcp", ...) on
 	// Windows binds to [::] (IPv6), and since Windows defaults to
 	// IPV6_V6ONLY=1 that socket refuses IPv4 connections from the PACS.
-	ln, err := net.Listen("tcp4", fmt.Sprintf(":%d", s.port))
+	//
+	// Retry the bind briefly to ride out the short window after an unclean exit
+	// (e.g. the previous instance was killed via Task Manager, bypassing the
+	// graceful shutdown) during which the OS may not yet have released the port.
+	// If the port is still taken after the retries, return a clear, actionable
+	// message rather than the raw socket error.
+	addr := fmt.Sprintf(":%d", s.port)
+	var ln net.Listener
+	var err error
+	for attempt := 0; ; attempt++ {
+		ln, err = net.Listen("tcp4", addr)
+		if err == nil || !errors.Is(err, syscall.EADDRINUSE) || attempt >= 2 {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 	if err != nil {
+		if errors.Is(err, syscall.EADDRINUSE) {
+			return fmt.Errorf("port %d is already in use — another copy of dicomqr may still be running. "+
+				"Close it (check Task Manager for dicomqr.exe) and try connecting again", s.port)
+		}
 		return fmt.Errorf("storage SCP: listen on port %d: %w", s.port, err)
 	}
 	s.listenAddr = ln.Addr().String()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	s.cancelMu.Lock()
 	s.cancel = cancel
-	s.running = true
+	s.ln = ln
+	s.running.Store(true)
+	s.cancelMu.Unlock()
 
 	// Close the listener when the context is cancelled (Stop() called).
 	go func() { <-ctx.Done(); ln.Close() }()
@@ -147,18 +180,27 @@ func (s *StorageSCP) ListenAddr() string { return s.listenAddr }
 
 // Stop shuts down the listener and cancels all in-flight connections.
 func (s *StorageSCP) Stop() {
-	if !s.running {
+	s.cancelMu.Lock()
+	defer s.cancelMu.Unlock()
+	if !s.running.Load() {
 		return
 	}
-	s.running = false
+	s.running.Store(false)
 	if s.cancel != nil {
 		s.cancel()
 		s.cancel = nil
 	}
+	// Close the listener synchronously so the port is released immediately on
+	// return, rather than asynchronously via the context-cancel goroutine. This
+	// guarantees the port is free for an immediate application restart.
+	if s.ln != nil {
+		s.ln.Close()
+		s.ln = nil
+	}
 }
 
 // IsRunning reports whether the SCP is currently listening.
-func (s *StorageSCP) IsRunning() bool { return s.running }
+func (s *StorageSCP) IsRunning() bool { return s.running.Load() }
 
 // handleCStore writes one incoming DICOM object to a structured subfolder.
 // Strategy: stream the payload to a temp file first (avoiding memory pressure
@@ -211,6 +253,15 @@ func (s *StorageSCP) handleCStore(
 	}
 
 	dest := organizeFilePath(s.DownloadDir(), patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber, sopInstanceUID)
+
+	// Skip writing if the file already exists; discard the temp file and return
+	// success so the PACS doesn't retry. Do not invoke callOnFileReceived —
+	// the UI file count reflects only newly written files.
+	if _, statErr := os.Stat(dest); statErr == nil {
+		os.Remove(tmpPath)
+		return dimse.Success
+	}
+
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		os.Remove(tmpPath)
 		return dimse.Status{Status: dimse.CStoreOutOfResources, ErrorComment: err.Error()}
@@ -388,6 +439,13 @@ func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID str
 
 	dest := organizeFilePath(downloadDir, patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber, sopInstanceUID)
 
+	// Skip writing if the file already exists; discard the temp file.
+	// The caller does not invoke the status callback for skipped files.
+	if _, statErr := os.Stat(dest); statErr == nil {
+		os.Remove(tmpPath)
+		return dest, nil
+	}
+
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		os.Remove(tmpPath)
 		return "", err
@@ -402,4 +460,39 @@ func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID str
 	}
 
 	return dest, nil
+}
+
+// dirWritable verifies that dir exists (creating it if necessary) and is
+// writable, by creating and removing a probe file. Returns a descriptive error
+// so the caller can fail a retrieve up front rather than per received file.
+func dirWritable(dir string) error {
+	if dir == "" {
+		return errors.New("download directory is not configured")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("cannot create download directory: %w", err)
+	}
+	probe, err := os.CreateTemp(dir, ".write_test_*.tmp")
+	if err != nil {
+		return fmt.Errorf("download directory is not writable: %w", err)
+	}
+	name := probe.Name()
+	probe.Close()
+	os.Remove(name)
+	return nil
+}
+
+// cleanupStaleTempFiles removes any .recv_*.tmp files left in dir by a
+// previous session that was killed mid-transfer.
+func cleanupStaleTempFiles(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		n := e.Name()
+		if !e.IsDir() && strings.HasPrefix(n, ".recv_") && strings.HasSuffix(n, ".tmp") {
+			os.Remove(filepath.Join(dir, n))
+		}
+	}
 }

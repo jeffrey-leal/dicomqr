@@ -18,6 +18,16 @@ type Settings struct {
 	LocalSCPPort int             `json:"localSCPPort"`
 	DownloadDir  string          `json:"downloadDir"`
 	Profiles     []ServerProfile `json:"profiles"`
+
+	// Window size persisted across sessions (Phase 5-2B); zero means use default.
+	WindowWidth  float32 `json:"windowWidth"`
+	WindowHeight float32 `json:"windowHeight"`
+
+	// Appearance of selected tree rows (Phase 5-2E). SelectionColor is an
+	// RRGGBBAA hex string; empty means follow the theme's primary colour.
+	SelectionColor  string `json:"selectionColor"`
+	SelectionBold   bool   `json:"selectionBold"`
+	SelectionItalic bool   `json:"selectionItalic"`
 }
 
 func appSettingsDir() (string, error) {

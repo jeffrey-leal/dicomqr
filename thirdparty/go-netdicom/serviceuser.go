@@ -611,6 +611,12 @@ func (su *ServiceUser) CMove(qrLevel QRLevel, moveDestination string, filter []*
 		}
 		if resp.Status.Status != dimse.StatusPending {
 			if resp.Status.Status != dimse.StatusSuccess {
+				// 0xBxxx are DICOM warning statuses (e.g. 0xB000 Sub-operations
+				// Complete with Failures). The transfer finished; treat as success.
+				if resp.Status.Status&0xF000 == 0xB000 {
+					dicomlog.Vprintf(0, "dicom.serviceUser: C-MOVE completed with warning status 0x%04X", resp.Status.Status)
+					return nil
+				}
 				return fmt.Errorf("dicom.serviceUser: C-MOVE failed: %v", resp.Status)
 			}
 			return nil
