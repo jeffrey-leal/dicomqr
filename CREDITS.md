@@ -38,11 +38,24 @@ Sections referenced:
 | Library | Author / Maintainer | License | Purpose |
 |---|---|---|---|
 | [fyne.io/fyne/v2](https://fyne.io) v2.7.3 | Fyne.io contributors | BSD 3-Clause | GUI framework |
-| [algm/go-netdicom](https://github.com/algm/go-netdicom) v0.1.0 | Alan Griffin (fork of grailbio) | BSD 3-Clause | DICOM network protocol (C-ECHO, C-FIND, C-MOVE, C-STORE SCP) |
-| [grailbio/go-netdicom](https://github.com/grailbio/go-netdicom) | Yasushi Saito / GRAIL Inc. | BSD 3-Clause | Original DICOM networking library (base of go-netdicom fork) |
+| [algm/go-netdicom](https://github.com/algm/go-netdicom) v0.1.0 | Alan Griffin (fork of grailbio) | Apache 2.0 | DICOM network protocol (C-ECHO, C-FIND, C-MOVE, C-STORE SCP) |
+| [grailbio/go-netdicom](https://github.com/grailbio/go-netdicom) | Yasushi Saito / GRAIL Inc. | Apache 2.0 | Original DICOM networking library (base of go-netdicom fork) |
 | [grailbio/go-dicom](https://github.com/grailbio/go-dicom) | GRAIL Inc. | Apache 2.0 | DICOM dataset encoding / file header writing |
 | [suyashkumar/dicom](https://github.com/suyashkumar/dicom) v1.1.0 | Suyash Kumar | MIT | DICOM file parsing for received files |
 | [sqweek/dialog](https://github.com/sqweek/dialog) | sqweek | ISC | Native Windows file/folder picker dialogs |
 
 A vendored copy of `algm/go-netdicom` is included under `thirdparty/go-netdicom`
-with its original BSD 3-Clause licence intact.
+with its original Apache 2.0 licence intact.
+
+---
+
+## Project License
+
+dicomqr's own source code is released under the MIT License — see the
+[LICENSE](LICENSE) file.
+
+The third-party libraries listed above are used under their respective licenses
+(BSD 3-Clause, Apache 2.0, MIT, and ISC), each of which permits this use with
+attribution. The vendored copy of go-netdicom in `thirdparty/go-netdicom` is
+distributed under the Apache License 2.0, with its original `LICENSE` file
+retained.
