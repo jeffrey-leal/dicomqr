@@ -27,7 +27,7 @@ import (
 	sqweekdialog "github.com/sqweek/dialog"
 )
 
-const version = "1.1.0"
+const version = "1.2.0"
 
 // LED colours for connection and SCP state indicators.
 var (

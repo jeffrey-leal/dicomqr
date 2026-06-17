@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.2.0] — 2026-06-17
+
+### Added
+
+- **Request uncompressed transfer syntax** — each server profile now has a "Request uncompressed transfer syntax only" checkbox in the profile editor. When enabled, dicomqr restricts the A-ASSOCIATE-RQ presentation contexts to Explicit VR Little Endian and Implicit VR Little Endian only, causing a conformant PACS to transcode compressed pixel data before delivery. Applies to both C-GET (SCU transfer syntax list) and C-MOVE (embedded C-STORE SCP rejects compressed syntaxes at association time with `PresentationContextProviderRejectionTransferSyntaxNotSupported`).
+
+### Fixed
+
+- **Image viewer: compressed pixel data error** — files using JPEG 2000 (Lossless/Lossy), JPEG-LS (Lossless/Near-Lossless), JPEG Lossless Non-Hierarchical, or RLE Lossless transfer syntaxes now display a clear, actionable message ("use Open in Viewer") instead of the cryptic "Invalid JPEG Format: missing SOI marker" error that appeared because the suyashkumar/dicom library unconditionally passes all encapsulated frames to `jpeg.Decode`
+- **Image viewer: undefined-length uncompressed pixel data** — DICOM files from certain vendors that store uncompressed pixel data with an undefined-length VL are now decoded correctly. The suyashkumar/dicom library previously treated undefined-length pixel data as encapsulated (JPEG), causing the same JPEG decode failure on some systems. A raw-pixel fallback path now reinterprets the bytes natively using the image dimensions, bit depth, rescale parameters, and photometric interpretation from the dataset; this was the root cause of the "same data works on one system but not another" behaviour
+
+### Internal
+
+- Vendored `thirdparty/go-netdicom` extended: `ServiceProviderParams.AcceptedTransferSyntaxes []string` — when non-empty, the service provider selects only offered transfer syntaxes that appear in the list during A-ASSOCIATE-RQ negotiation, rejecting contexts where none match; `contextmanager.go` patched to iterate all offered syntaxes rather than blindly picking the first
+- `viewer.go` — `unsupportedTransferSyntaxNames` map for proactive transfer syntax detection; `renderRawPixelFallback` for native pixel decode of misidentified encapsulated frames; `dicomIntParam` helper for integer dataset lookup
+
+---
+
 ## [1.1.0] — 2026-06-17
 
 ### Added

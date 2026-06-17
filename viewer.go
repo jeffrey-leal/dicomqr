@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"image"
@@ -477,11 +478,152 @@ func formatDicomTime(s string) string {
 	return s
 }
 
+// unsupportedTransferSyntaxNames maps encapsulated DICOM Transfer Syntax UIDs
+// to readable format names. The suyashkumar/dicom library passes all
+// encapsulated frames to jpeg.Decode regardless of transfer syntax, so any
+// format other than JPEG Baseline (1.2.840.10008.1.2.4.50) and JPEG Extended
+// (1.2.840.10008.1.2.4.51) fails with a misleading JPEG decode error.
+var unsupportedTransferSyntaxNames = map[string]string{
+	"1.2.840.10008.1.2.4.57": "JPEG Lossless Non-Hierarchical",
+	"1.2.840.10008.1.2.4.70": "JPEG Lossless (Process 14, SV1)",
+	"1.2.840.10008.1.2.4.80": "JPEG-LS Lossless",
+	"1.2.840.10008.1.2.4.81": "JPEG-LS Near-Lossless",
+	"1.2.840.10008.1.2.4.90": "JPEG 2000 Lossless",
+	"1.2.840.10008.1.2.4.91": "JPEG 2000",
+	"1.2.840.10008.1.2.5":    "RLE Lossless",
+}
+
 // viewerState holds the rendered image and a display label for one DICOM instance.
 type viewerState struct {
 	img   image.Image
 	label string
 	ann   imageAnnotations
+}
+
+// dicomIntParam reads an integer attribute from a suyashkumar Dataset, returning 0 if absent.
+func dicomIntParam(ds sdicom.Dataset, t tag.Tag) int {
+	e, err := ds.FindElementByTag(t)
+	if err != nil {
+		return 0
+	}
+	vals := sdicom.MustGetInts(e.Value)
+	if len(vals) == 0 {
+		return 0
+	}
+	return vals[0]
+}
+
+// renderRawPixelFallback decodes raw uncompressed pixel bytes as a DICOM image
+// using the image dimensions and bit depth supplied by the caller. It applies
+// the same W/L windowing and auto-windowing logic as the native frame path.
+//
+// This is invoked when the suyashkumar/dicom library wraps native pixels in an
+// EncapsulatedFrame — which happens when the PixelData element uses an
+// undefined-length VL (technically non-conformant but common in older DICOM
+// implementations) with an uncompressed transfer syntax.
+func renderRawPixelFallback(data []byte, rows, cols, samplesPerPixel, bitsAlloc int,
+	wc, ww float64, hasWindow bool, slope, intercept float64, isSigned bool, photometric string) (image.Image, error) {
+
+	pixelsPerFrame := rows * cols
+	if pixelsPerFrame <= 0 {
+		return nil, errors.New("raw pixel fallback: invalid image dimensions")
+	}
+
+	// ── RGB ───────────────────────────────────────────────────────────────────
+	if samplesPerPixel == 3 {
+		bytesNeeded := pixelsPerFrame * 3
+		if bitsAlloc > 8 {
+			bytesNeeded *= 2
+		}
+		if len(data) < bytesNeeded {
+			return nil, fmt.Errorf("raw pixel fallback: data too short for RGB (%d < %d)", len(data), bytesNeeded)
+		}
+		maxVal := float64(int(1)<<uint(bitsAlloc)) - 1
+		if maxVal <= 0 {
+			maxVal = 255
+		}
+		img := image.NewNRGBA(image.Rect(0, 0, cols, rows))
+		if bitsAlloc <= 8 {
+			for i := 0; i < pixelsPerFrame; i++ {
+				img.Pix[i*4] = uint8(float64(data[i*3]) / maxVal * 255)
+				img.Pix[i*4+1] = uint8(float64(data[i*3+1]) / maxVal * 255)
+				img.Pix[i*4+2] = uint8(float64(data[i*3+2]) / maxVal * 255)
+				img.Pix[i*4+3] = 255
+			}
+		} else {
+			for i := 0; i < pixelsPerFrame; i++ {
+				r := float64(binary.LittleEndian.Uint16(data[i*6:])) / maxVal * 255
+				g := float64(binary.LittleEndian.Uint16(data[i*6+2:])) / maxVal * 255
+				b := float64(binary.LittleEndian.Uint16(data[i*6+4:])) / maxVal * 255
+				img.Pix[i*4] = clampToUint8(r)
+				img.Pix[i*4+1] = clampToUint8(g)
+				img.Pix[i*4+2] = clampToUint8(b)
+				img.Pix[i*4+3] = 255
+			}
+		}
+		return img, nil
+	}
+
+	// ── Grayscale ─────────────────────────────────────────────────────────────
+	bytesNeeded := pixelsPerFrame
+	if bitsAlloc > 8 {
+		bytesNeeded *= 2
+	}
+	if len(data) < bytesNeeded {
+		return nil, fmt.Errorf("raw pixel fallback: data too short for grayscale (%d < %d)", len(data), bytesNeeded)
+	}
+
+	vals := make([]float64, pixelsPerFrame)
+	if bitsAlloc <= 8 {
+		for i := 0; i < pixelsPerFrame; i++ {
+			vals[i] = float64(data[i])*slope + intercept
+		}
+	} else {
+		for i := 0; i < pixelsPerFrame; i++ {
+			raw := float64(binary.LittleEndian.Uint16(data[i*2:]))
+			if isSigned {
+				raw = float64(int16(binary.LittleEndian.Uint16(data[i*2:])))
+			}
+			vals[i] = raw*slope + intercept
+		}
+	}
+
+	if !hasWindow || ww <= 0 {
+		sorted := make([]float64, len(vals))
+		copy(sorted, vals)
+		sort.Float64s(sorted)
+		n := len(sorted)
+		if n > 0 {
+			lo, hi := sorted[n/100], sorted[(n*99)/100]
+			if hi > lo {
+				wc, ww = (lo+hi)/2, hi-lo
+				hasWindow = true
+			}
+		}
+	}
+
+	invert := photometric == "MONOCHROME1"
+	img := image.NewGray(image.Rect(0, 0, cols, rows))
+	lower := wc - ww/2
+
+	for i, v := range vals {
+		var out float64
+		if !hasWindow || ww <= 0 {
+			maxRaw := float64(int(1)<<uint(bitsAlloc)) - 1
+			if maxRaw <= 0 {
+				maxRaw = 65535
+			}
+			out = v / maxRaw * 255
+		} else {
+			out = (v - lower) / ww * 255
+		}
+		px := clampToUint8(out)
+		if invert {
+			px = 255 - px
+		}
+		img.Pix[i] = px
+	}
+	return img, nil
 }
 
 // loadDicomImage parses a DICOM file and returns a windowed image.Image.
@@ -502,13 +644,44 @@ func loadDicomImage(path string) (viewerState, error) {
 		return viewerState{}, errors.New("no pixel data in file")
 	}
 
+	// Detect encapsulated transfer syntaxes the built-in viewer cannot decode
+	// before calling renderDicomFrame, so the user gets a clear message instead
+	// of a raw "missing SOI marker" JPEG error from the underlying library.
+	if e, err2 := ds.FindElementByTag(tag.TransferSyntaxUID); err2 == nil {
+		if strs := sdicom.MustGetStrings(e.Value); len(strs) > 0 {
+			if name, unsup := unsupportedTransferSyntaxNames[strings.TrimSpace(strs[0])]; unsup {
+				return viewerState{}, fmt.Errorf(
+					"%s compressed images cannot be decoded by the built-in viewer\n\nUse Open in Viewer to open this file in an external DICOM viewer.", name)
+			}
+		}
+	}
+
 	wc, ww, hasWindow := dicomWindowParams(ds)
 	slope, intercept := dicomRescaleParams(ds)
 	isSigned := dicomPixelRepresentation(ds) == 1
 	bitsAlloc := dicomBitsAllocated(ds)
 	photometric := dicomPhotometricInterp(ds)
 
+	// Dimensions are needed for the raw-pixel fallback path below.
+	rows := dicomIntParam(ds, tag.Rows)
+	cols := dicomIntParam(ds, tag.Columns)
+	samplesPerPixel := dicomIntParam(ds, tag.SamplesPerPixel)
+	if samplesPerPixel <= 0 {
+		samplesPerPixel = 1
+	}
+
 	img, err := renderDicomFrame(frames[0], wc, ww, hasWindow, slope, intercept, isSigned, bitsAlloc, photometric)
+
+	// Fallback: some DICOM implementations store uncompressed pixel data with
+	// an undefined-length VL, which the library mistakes for encapsulated (JPEG)
+	// data. When jpeg.Decode fails, re-interpret the raw bytes natively.
+	if err != nil && frames[0].IsEncapsulated() && rows > 0 && cols > 0 {
+		img, err = renderRawPixelFallback(
+			frames[0].EncapsulatedData.Data,
+			rows, cols, samplesPerPixel, bitsAlloc,
+			wc, ww, hasWindow, slope, intercept, isSigned, photometric,
+		)
+	}
 	if err != nil {
 		return viewerState{}, err
 	}
@@ -606,7 +779,11 @@ func dicomPhotometricInterp(ds sdicom.Dataset) string {
 // which adapts well to modalities like PET/NM where per-image brightness varies.
 func renderDicomFrame(f *frame.Frame, wc, ww float64, hasWindow bool, slope, intercept float64, isSigned bool, bitsAlloc int, photometric string) (image.Image, error) {
 	if f.IsEncapsulated() {
-		return f.GetImage() // JPEG: decoded by standard library
+		img, err := f.GetImage()
+		if err != nil {
+			return nil, fmt.Errorf("cannot decode compressed pixel data (%w)\n\nUse Open in Viewer to open this file in an external DICOM viewer.", err)
+		}
+		return img, nil
 	}
 
 	nf, err := f.GetNativeFrame()

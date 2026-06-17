@@ -1,6 +1,6 @@
 # dicomqr
 
-**User Manual  v1.1.0**
+**User Manual  v1.2.0**
 
 June 17, 2026
 
@@ -25,6 +25,7 @@ Key capabilities:
 - Preview DICOM images in the built-in viewer with W/L windowing, DICOM annotation overlays, and study overview grids
 - Import DICOM files from external folders into the organised download folder
 - Support for multiple saved server profiles with independent connection and retrieve settings
+- Optionally request uncompressed pixel data transfer per server profile, ensuring the built-in viewer can display all received images regardless of how the PACS stores them
 - Automatic wildcard search — trailing `*` appended to text fields so partial names match without manual wildcarding
 - Customisable appearance — selection colour, font style, external viewer path, and window size are remembered between sessions
 
@@ -91,6 +92,7 @@ A server profile stores the connection details for one PACS destination. Profile
 | Info model | The DICOM Query/Retrieve information model. `study` = Study Root (most common). `patient` = Patient Root. `patient-study-only` = legacy retired model used by some older systems; SERIES-level queries are not available with this model. |
 | Retrieve method | C-MOVE (default) instructs the PACS to push files to the local C-STORE SCP listener. C-GET requests that the PACS return files over the same association — no inbound port or PACS-side destination registration is required. Auto tries C-GET first and falls back to C-MOVE if the PACS rejects it. |
 | Connect timeout | Seconds to wait for the initial C-ECHO before reporting a failure. Default: 10 s. |
+| Transfer | When 'Request uncompressed transfer syntax only' is ticked, dicomqr restricts its A-ASSOCIATE negotiation to Explicit VR Little Endian and Implicit VR Little Endian only. A conformant PACS must transcode compressed pixel data before sending. Useful when the PACS stores data in JPEG 2000 or JPEG-LS format that the built-in viewer cannot decode. Leave unticked unless needed — some PACS systems cannot transcode and will fail the transfer. |
 
 The first profile in the list is selected by default when the application starts.
 
@@ -325,6 +327,8 @@ The series viewer displays one image at a time with a slider to navigate through
 
 The bottom bar contains an instance counter (e.g. `45 / 120`), a navigation slider, an Annotations checkbox (see Section 8.3.3), and an info label showing pixel dimensions and W/L values.
 
+Compressed pixel data — the built-in viewer decodes JPEG Baseline and uncompressed (native) pixel data. Files stored in JPEG 2000, JPEG-LS, JPEG Lossless, or RLE Lossless formats cannot be decoded and display a message explaining the limitation with a suggestion to use Open in Viewer. To avoid this, enable 'Request uncompressed transfer syntax only' in the server profile before retrieving (see Section 4.1).
+
 
 #### 8.3.2  Study Overview Grid
 
@@ -532,6 +536,7 @@ Profile editor fields:
 | Info model | `study` — Study Root (default, most common). `patient` — Patient Root. `patient-study-only` — legacy retired model; SERIES-level lazy-load is suppressed automatically. |
 | Retrieve method | C-MOVE / C-GET / Auto — see Section 4.1. |
 | Connect timeout | Seconds before a connection attempt is considered failed. |
+| Transfer | When ticked, negotiates only uncompressed transfer syntaxes — see Section 4.1 for full details and caveats. |
 
 
 ### 14.3  Retrieve Section
@@ -558,7 +563,7 @@ The status bar at the bottom of the window provides real-time feedback. A colour
 
 | Situation | Status bar text |
 |---|---|
-| Application started, not connected | `v1.1.0` |
+| Application started, not connected | `v1.2.0` |
 | Connecting to server | `Connecting…` |
 | Connected | `Connected: <AE>@<host>:<port>` |
 | Connection cancelled | `Connection cancelled` |
@@ -619,6 +624,7 @@ Each entry in the `profiles` array:
 | `infoModel` | `"study"`, `"patient"`, or `"patient-study-only"`. |
 | `retrieveMethod` | `"MOVE"`, `"GET"`, or `"AUTO"`. Omitting defaults to C-MOVE. |
 | `connectTimeout` | Connection timeout in seconds. 0 uses the default (10 s). |
+| `transferUncompressed` | When true, the A-ASSOCIATE negotiation for C-GET and C-MOVE offers only uncompressed transfer syntaxes. Default: false. |
 
 The Annotations overlay toggle is stored in the application's Fyne preferences (not in settings.json) and persists automatically between sessions.
 
@@ -637,6 +643,8 @@ Windows Firewall — An inbound rule permitting TCP connections on the SCP port 
 Information model — If queries return no results, try changing the Info model in the server profile. Some PACS require Study Root, others Patient Root. A small number of legacy systems require the Patient/Study Only model (patient-study-only).
 
 Worklist server — The Modality Worklist SOP class is typically served by a RIS or dedicated MWL broker, not the PACS itself. Create a separate server profile pointing to that system and select it in the Worklist tab.
+
+Compressed pixel data — if the PACS stores images in JPEG 2000, JPEG-LS, or other compressed formats that the built-in viewer cannot decode, enable 'Request uncompressed transfer syntax only' in the server profile. The PACS will transcode on the fly if it supports transcoding. If the PACS does not support transcoding, the transfer will fail for those SOP classes; use the external viewer integration instead.
 
 IPv4 connectivity — dicomqr listens on an IPv4 socket only. Ensure the address shown in Help > Client info… is the correct IPv4 address on the same network as the PACS.
 
