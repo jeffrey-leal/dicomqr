@@ -17,6 +17,7 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	sqweekdialog "github.com/sqweek/dialog"
 )
 
 // appTheme wraps a base Fyne theme and optionally overrides the font.
@@ -261,6 +262,19 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 	localPortEntry := widget.NewEntry()
 	localPortEntry.SetText(fmt.Sprintf("%d", cfg.LocalSCPPort))
 
+	downloadDirEntry := widget.NewEntry()
+	downloadDirEntry.SetText(cfg.DownloadDir)
+	downloadDirEntry.SetPlaceHolder("Select download folder…")
+	dirBrowseBtn := widget.NewButton("Browse…", func() {
+		go func() {
+			dir, err := sqweekdialog.Directory().Browse()
+			if err != nil {
+				return
+			}
+			fyne.Do(func() { downloadDirEntry.SetText(dir) })
+		}()
+	})
+
 	retHeader := widget.NewLabel("Retrieve")
 	retHeader.TextStyle = fyne.TextStyle{Bold: true}
 	retSection := container.NewVBox(
@@ -269,6 +283,42 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 		widget.NewForm(
 			widget.NewFormItem("Local AE Title", localAEEntry),
 			widget.NewFormItem("Local SCP port", localPortEntry),
+			widget.NewFormItem("Download folder",
+				container.NewBorder(nil, nil, nil, dirBrowseBtn, downloadDirEntry)),
+		),
+	)
+
+	// Viewer section
+	viewerPathEntry := widget.NewEntry()
+	viewerPathEntry.SetText(cfg.ViewerPath)
+	viewerPathEntry.SetPlaceHolder("Path to DICOM viewer executable…")
+	viewerBrowseBtn := widget.NewButton("Browse…", func() {
+		go func() {
+			path, err := sqweekdialog.File().Filter("Executable", "exe").Load()
+			if err != nil {
+				return
+			}
+			fyne.Do(func() { viewerPathEntry.SetText(path) })
+		}()
+	})
+	detectBtn := widget.NewButton("Auto-detect", func() {
+		if p := DetectDefaultViewer(); p != "" {
+			viewerPathEntry.SetText(p)
+		} else {
+			dialog.ShowInformation("Not found",
+				"No known DICOM viewer was detected.\nInstall MicroDicom or RadiAnt, or browse to your viewer manually.", w)
+		}
+	})
+
+	viewerHeader := widget.NewLabel("Image Viewer")
+	viewerHeader.TextStyle = fyne.TextStyle{Bold: true}
+	viewerSection := container.NewVBox(
+		viewerHeader,
+		widget.NewSeparator(),
+		container.NewBorder(nil, nil,
+			widget.NewLabel("External viewer"),
+			container.NewHBox(viewerBrowseBtn, detectBtn),
+			viewerPathEntry,
 		),
 	)
 
@@ -303,13 +353,14 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 			FontName:        current.fontName,
 			LocalAETitle:    localAEEntry.Text,
 			LocalSCPPort:    port,
-			DownloadDir:     cfg.DownloadDir,
+			DownloadDir:     downloadDirEntry.Text,
 			Profiles:        pendingProfiles,
 			WindowWidth:     cfg.WindowWidth,
 			WindowHeight:    cfg.WindowHeight,
 			SelectionColor:  colorToHex(chosenSelColor),
 			SelectionBold:   selBoldCheck.Checked,
 			SelectionItalic: selItalicCheck.Checked,
+			ViewerPath:      viewerPathEntry.Text,
 		}
 		saveSettings(updated)
 		a.Settings().SetTheme(current)
@@ -324,7 +375,7 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 
 	minWidth := canvas.NewRectangle(color.Transparent)
 	minWidth.SetMinSize(fyne.NewSize(640, 0))
-	content := container.NewStack(minWidth, container.NewVBox(uiSection, connSection, retSection, buttonRow))
+	content := container.NewStack(minWidth, container.NewVBox(uiSection, connSection, retSection, viewerSection, buttonRow))
 	d = dialog.NewCustomWithoutButtons("Preferences", content, w)
 	d.Show()
 }
@@ -366,7 +417,7 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 	}
 	timeoutEntry.SetPlaceHolder("10 (default)")
 
-	modelSelect := widget.NewSelect([]string{"study", "patient"}, nil)
+	modelSelect := widget.NewSelect([]string{"study", "patient", "patient-study-only"}, nil)
 	modelSelect.SetSelected(p.InfoModel)
 
 	retrieveMethodSelect := widget.NewSelect([]string{"C-MOVE (default)", "C-GET", "Auto"}, nil)

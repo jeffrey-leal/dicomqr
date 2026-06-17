@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"image/color"
 	"io"
 	"log"
 	"os"
@@ -26,7 +27,15 @@ import (
 	sqweekdialog "github.com/sqweek/dialog"
 )
 
-const version = "1.0.0"
+const version = "1.1.0"
+
+// LED colours for connection and SCP state indicators.
+var (
+	ledGray  = color.NRGBA{R: 0x88, G: 0x88, B: 0x88, A: 0xFF}
+	ledAmber = color.NRGBA{R: 0xFF, G: 0xAA, B: 0x00, A: 0xFF}
+	ledGreen = color.NRGBA{R: 0x00, G: 0xBB, B: 0x44, A: 0xFF}
+	ledRed   = color.NRGBA{R: 0xCC, G: 0x22, B: 0x22, A: 0xFF}
+)
 
 // buildDate is injected at link time: -ldflags "-X main.buildDate=YYYY-MM-DD"
 var buildDate string
@@ -100,6 +109,18 @@ func main() {
 		connCtx       context.Context
 		cancelConn    context.CancelFunc
 		connMu        sync.Mutex // guards client, scp, activeProfile, connCtx, cancelConn
+
+		// refreshLocalTree re-renders the Local Browse tab tree after preferences change.
+		// Assigned once buildLocalBrowseContent is called during layout setup.
+		refreshLocalTree = func() {}
+
+		// refreshImportContent updates the Import tab destination label after preferences change.
+		// Assigned once buildImportContent is called during layout setup.
+		refreshImportContent = func() {}
+
+		// refreshWorklist updates the Worklist tab's server profile dropdown after preferences change.
+		// Assigned once buildWorklistContent is called during layout setup.
+		refreshWorklist = func() {}
 	)
 
 	// Thread-safe state accessors (Phase 1-A)
@@ -175,6 +196,16 @@ func main() {
 	progressBar := widget.NewProgressBar()
 	progressBar.Hide()
 
+	// connLED is the small coloured square preceding the status text.
+	// gray = disconnected, amber = connecting, green = connected.
+	connLED := canvas.NewRectangle(ledGray)
+	connLED.SetMinSize(fyne.NewSize(12, 12))
+
+	// scpLED and scpStatusLbl show the embedded C-STORE SCP state in the connection panel.
+	scpLED := canvas.NewRectangle(ledGray)
+	scpLED.SetMinSize(fyne.NewSize(12, 12))
+	scpStatusLbl := widget.NewLabel("SCP: not running")
+
 	setStatus := func(msg string) { fyne.Do(func() { statusLabel.SetText(msg) }) }
 
 	go func() {
@@ -185,7 +216,7 @@ func main() {
 	}()
 
 	statusBar := container.NewVBox(
-		container.NewHBox(statusLabel, layout.NewSpacer(), clockLabel),
+		container.NewHBox(connLED, statusLabel, layout.NewSpacer(), clockLabel),
 		queryProgress,
 		progressBar,
 	)
@@ -295,6 +326,18 @@ func main() {
 	// startRetrieve is assigned below after the retrieve variables are in scope.
 	var startRetrieve func(nodeIDs []string)
 
+	// openInViewer launches the configured external DICOM viewer with path as its
+	// argument. path may be a file or a directory; most viewers accept both.
+	openInViewer := func(path string) {
+		vp := cfg.ViewerPath
+		if vp == "" {
+			dialog.ShowInformation("No viewer configured",
+				"Set an external DICOM viewer in File → Preferences → Image Viewer.", w)
+			return
+		}
+		go exec.Command(vp, path).Start()
+	}
+
 	onMenu := func(id string, pos fyne.Position) {
 		_, studyUID, seriesUID, _ := model.uidsForNode(id)
 		uid := seriesUID
@@ -304,7 +347,11 @@ func main() {
 		retrieveItem := fyne.NewMenuItem("Retrieve", func() { startRetrieve([]string{id}) })
 		copyUID := fyne.NewMenuItem("Copy UID", func() { w.Clipboard().SetContent(uid) })
 		copyLabel := fyne.NewMenuItem("Copy label", func() { w.Clipboard().SetContent(model.labelFor(id)) })
-		popup := widget.NewPopUpMenu(fyne.NewMenu("", retrieveItem, fyne.NewMenuItemSeparator(), copyUID, copyLabel), w.Canvas())
+		popup := widget.NewPopUpMenu(fyne.NewMenu("",
+			retrieveItem,
+			fyne.NewMenuItemSeparator(),
+			copyUID, copyLabel,
+		), w.Canvas())
 		popup.ShowAtPosition(pos)
 	}
 
@@ -337,6 +384,10 @@ func main() {
 
 	tree.OnBranchOpened = func(id string) {
 		if !strings.HasPrefix(id, "S:") || model.isSeriesLoaded(id) {
+			return
+		}
+		// Patient/Study Only information model has no SERIES level — suppress lazy load.
+		if getActiveProfile().InfoModel == "patient-study-only" {
 			return
 		}
 		model.markSeriesLoaded(id) // mark before goroutine to prevent duplicate queries
@@ -650,6 +701,7 @@ func main() {
 		fyne.Do(func() {
 			switch s {
 			case stateDisconnected:
+				connLED.FillColor = ledGray
 				connectBtn.Enable()
 				disconnectBtn.SetText("Disconnect")
 				disconnectBtn.Disable()
@@ -657,6 +709,7 @@ func main() {
 				searchBtn.Disable()
 				searchTopBtn.Disable()
 			case stateConnected:
+				connLED.FillColor = ledGreen
 				connectBtn.Disable()
 				disconnectBtn.SetText("Disconnect")
 				disconnectBtn.Enable()
@@ -664,11 +717,13 @@ func main() {
 				searchBtn.Enable()
 				searchTopBtn.Enable()
 			case stateBusy:
+				connLED.FillColor = ledAmber
 				connectBtn.Disable()
 				disconnectBtn.SetText("Cancel")
 				disconnectBtn.Enable()
 				echoBtn.Disable()
 			}
+			connLED.Refresh()
 			statusLabel.SetText(msg)
 		})
 	}
@@ -716,17 +771,27 @@ func main() {
 
 			s := NewStorageSCP(cfg.LocalAETitle, cfg.LocalSCPPort, cfg.DownloadDir)
 			if err := s.Start(); err != nil {
+				fyne.Do(func() {
+					scpLED.FillColor = ledRed
+					scpLED.Refresh()
+					scpStatusLbl.SetText("SCP: error — " + err.Error())
+				})
 				setConnState(stateDisconnected, "SCP error: "+err.Error())
 				// Show the full message in a dialog — the status bar truncates the
 				// actionable "port in use" guidance.
 				fyne.Do(func() { dialog.ShowError(err, w) })
 				return
 			}
+			fyne.Do(func() {
+				scpLED.FillColor = ledGreen
+				scpLED.Refresh()
+				scpStatusLbl.SetText(fmt.Sprintf("SCP: listening on %s (AE: %s)", s.ListenAddr(), cfg.LocalAETitle))
+			})
 			cctx, cancelC := context.WithCancel(context.Background())
 			setConn(c, s, profile, cctx, cancelC)
 
-			setConnState(stateConnected, fmt.Sprintf("Connected: %s@%s:%d  |  SCP %s (AE: %s)",
-				profile.RemoteAETitle, profile.Host, profile.Port, s.ListenAddr(), cfg.LocalAETitle))
+			setConnState(stateConnected, fmt.Sprintf("Connected: %s@%s:%d",
+				profile.RemoteAETitle, profile.Host, profile.Port))
 		}()
 	}
 
@@ -745,6 +810,9 @@ func main() {
 		if s != nil {
 			s.Stop()
 		}
+		scpLED.FillColor = ledGray
+		scpLED.Refresh()
+		scpStatusLbl.SetText("SCP: not running")
 		setConnState(stateDisconnected, "Disconnected")
 	}
 
@@ -767,6 +835,7 @@ func main() {
 			container.NewHBox(widget.NewLabel("Server:"), profileSelect, filtersBtn, searchTopBtn),
 			container.NewHBox(connectBtn, disconnectBtn, echoBtn),
 		),
+		container.NewHBox(scpLED, scpStatusLbl),
 		widget.NewSeparator(),
 	)
 
@@ -795,35 +864,15 @@ func main() {
 	}
 
 	// ── Retrieve panel ───────────────────────────────────────────────────────
-	downloadDirEntry := widget.NewEntry()
-	downloadDirEntry.SetText(cfg.DownloadDir)
-	downloadDirEntry.SetPlaceHolder("Select download folder…")
-	downloadDirEntry.OnChanged = func(dir string) {
-		cfg.DownloadDir = dir
-		if sc := getSCP(); sc != nil {
-			sc.SetDownloadDir(dir)
-		}
-		saveSettings(cfg)
-	}
-
-	browseBtn := widget.NewButton("Browse…", func() {
-		go func() {
-			dir, err := sqweekdialog.Directory().Browse()
-			if err != nil {
-				return
-			}
-			// SetText triggers downloadDirEntry.OnChanged which updates cfg and scp.
-			fyne.Do(func() { downloadDirEntry.SetText(dir) })
-		}()
-	})
+	// Download folder is configured in Preferences; displayed here read-only.
+	folderLabel := widget.NewLabel(cfg.DownloadDir)
+	folderLabel.Truncation = fyne.TextTruncateEllipsis
 
 	openFolderBtn := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {
-		dir := cfg.DownloadDir
-		if dir == "" {
-			dialog.ShowInformation("No folder set", "Select a download folder first.", w)
+		if cfg.DownloadDir == "" {
 			return
 		}
-		go exec.Command("explorer", dir).Start()
+		go exec.Command("explorer", cfg.DownloadDir).Start()
 	})
 
 	var cancelRetrieve context.CancelFunc
@@ -1069,16 +1118,25 @@ func main() {
 		}
 	})
 
+	openInViewerBtn := widget.NewButton("Open in Viewer", func() { openInViewer(cfg.DownloadDir) })
+	if cfg.ViewerPath == "" {
+		openInViewerBtn.Disable()
+	}
+
 	retrievePanel := container.NewVBox(
 		widget.NewSeparator(),
 		container.NewBorder(nil, nil,
-			widget.NewLabel("Download to:"),
-			container.NewHBox(openFolderBtn, browseBtn),
-			downloadDirEntry,
+			widget.NewLabel("Download folder:"),
+			openFolderBtn,
+			folderLabel,
 		),
-		container.NewHBox(retrieveBtn, cancelRetrieveBtn, layout.NewSpacer(),
+		container.NewHBox(
+			retrieveBtn, cancelRetrieveBtn,
+			openInViewerBtn,
+			layout.NewSpacer(),
 			widget.NewButton("Select All", selectAll),
-			widget.NewButton("Clear Selection", clearSelection)),
+			widget.NewButton("Clear Selection", clearSelection),
+		),
 	)
 
 	// ── Search bar (filter above tree) ───────────────────────────────────────
@@ -1138,13 +1196,25 @@ func main() {
 		fyne.NewMenuItem("Preferences…", func() {
 			showPreferencesDialog(a, w, currentTheme, &cfg, func(updated Settings) {
 				cfg = updated
+				folderLabel.SetText(cfg.DownloadDir)
+				if sc := getSCP(); sc != nil {
+					sc.SetDownloadDir(cfg.DownloadDir)
+				}
+				if cfg.ViewerPath == "" {
+					openInViewerBtn.Disable()
+				} else {
+					openInViewerBtn.Enable()
+				}
 				profileSelect.Options = profileNames()
 				profileSelect.Refresh()
-				tree.Refresh() // re-render selected rows with the new selection style
+				tree.Refresh()
+				refreshLocalTree()
+				refreshImportContent()
+				refreshWorklist()
 			})
 		}),
 		fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Quit", func() { shutdownSCP(); a.Quit() }),
+		fyne.NewMenuItem("Quit", func() { saveSettings(cfg); shutdownSCP(); a.Quit() }),
 	)
 
 	queryMenu := fyne.NewMenu("Query",
@@ -1206,6 +1276,8 @@ func main() {
 		bd = "unknown"
 	}
 	helpMenu := fyne.NewMenu("Help",
+		fyne.NewMenuItem("Activity Log…", func() { showLogDialog(w) }),
+		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("About", func() {
 			iconImg := canvas.NewImageFromResource(appIcon)
 			iconImg.FillMode = canvas.ImageFillContain
@@ -1265,20 +1337,41 @@ func main() {
 	w.SetMainMenu(fyne.NewMainMenu(fileMenu, queryMenu, helpMenu))
 
 	// ── Layout ────────────────────────────────────────────────────────────────
-	top := container.NewVBox(connPanel, filterBar)
-	bottom := container.NewVBox(retrievePanel, statusBar)
+	pacsContent := container.NewBorder(
+		container.NewVBox(connPanel, filterBar),
+		retrievePanel,
+		nil, nil,
+		tree,
+	)
 
-	w.SetContent(container.NewBorder(top, bottom, nil, nil, tree))
+	var localContent fyne.CanvasObject
+	localContent, refreshLocalTree = buildLocalBrowseContent(a, w, &cfg, openInViewer)
 
-	// Persist the window size on close (Phase 5-2B) and stop the SCP so the port
-	// is released (Phase 5-2F) before the window — and the app — closes.
+	var importContent fyne.CanvasObject
+	importContent, refreshImportContent = buildImportContent(a, w, &cfg)
+
+	var worklistContent fyne.CanvasObject
+	worklistContent, refreshWorklist = buildWorklistContent(w, &cfg)
+
+	tabs := container.NewAppTabs(
+		container.NewTabItem("PACS Query", pacsContent),
+		container.NewTabItem("Worklist", worklistContent),
+		container.NewTabItem("Local Browse", localContent),
+		container.NewTabItem("Import", importContent),
+	)
+
+	w.SetContent(container.NewBorder(nil, statusBar, nil, nil, tabs))
+
+	// Persist settings on close and stop the SCP so the port is released before
+	// the window — and the app — closes. Window size is only updated when valid
+	// (non-zero) so a minimised or off-screen close does not clobber the saved size.
 	w.SetCloseIntercept(func() {
 		sz := w.Canvas().Size()
-		if sz.Width > 0 && sz.Height > 0 {
+		if sz.Width > 200 && sz.Height > 150 {
 			cfg.WindowWidth = sz.Width
 			cfg.WindowHeight = sz.Height
-			saveSettings(cfg)
 		}
+		saveSettings(cfg)
 		shutdownSCP()
 		w.Close()
 	})
@@ -1308,6 +1401,6 @@ func setupLogFile() {
 	if err != nil {
 		return
 	}
-	log.SetOutput(io.MultiWriter(os.Stderr, f))
+	log.SetOutput(io.MultiWriter(os.Stderr, f, appLog))
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 }

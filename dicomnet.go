@@ -234,6 +234,8 @@ func levelToQRLevel(level string) netdicom.QRLevel {
 		return netdicom.QRLevelSeries
 	case "PATIENT":
 		return netdicom.QRLevelPatient
+	case "PATIENT-STUDY-ONLY":
+		return netdicom.QRLevelPatientStudyOnly
 	default:
 		return netdicom.QRLevelStudy
 	}
@@ -341,6 +343,222 @@ func elementsToFindResult(elems []*dicom.Element) FindResult {
 			if n, err2 := strconv.Atoi(s); err2 == nil {
 				r.NumInstances = n
 			}
+		}
+	}
+	return r
+}
+
+// StoreProgress reports per-file progress from StoreFiles.
+type StoreProgress struct {
+	Done  int
+	Total int
+	Path  string
+	Err   error // nil on success
+}
+
+// StoreFiles sends each file in paths to the remote PACS via C-STORE SCU.
+// onProgress is called after each file attempt. The goroutine checks ctx
+// between files so cancellation stops the loop promptly. Returns nil when all
+// files have been attempted; ctx.Err() when cancelled.
+func (c *DicomClient) StoreFiles(ctx context.Context, paths []string, onProgress func(StoreProgress)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	su, err := netdicom.NewServiceUser(netdicom.ServiceUserParams{
+		CalledAETitle:  c.profile.RemoteAETitle,
+		CallingAETitle: c.localAETitle,
+		SOPClasses:     sopclass.StorageClasses,
+	})
+	if err != nil {
+		return fmt.Errorf("c-store: create service user: %w", err)
+	}
+
+	type result struct{ err error }
+	resultCh := make(chan result, 1)
+
+	go func() {
+		defer su.Release()
+		su.Connect(fmt.Sprintf("%s:%d", c.profile.Host, c.profile.Port))
+
+		total := len(paths)
+		for i, path := range paths {
+			if ctx.Err() != nil {
+				resultCh <- result{ctx.Err()}
+				return
+			}
+			ds, readErr := dicom.ReadDataSetFromFile(path, dicom.ReadOptions{})
+			var fileErr error
+			if readErr != nil {
+				fileErr = readErr
+			} else {
+				fileErr = su.CStore(ds)
+			}
+			if onProgress != nil {
+				onProgress(StoreProgress{Done: i + 1, Total: total, Path: path, Err: fileErr})
+			}
+		}
+		resultCh <- result{nil}
+	}()
+
+	select {
+	case r := <-resultCh:
+		return r.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// WorklistResult holds one Modality Worklist C-FIND response item.
+// Err is set on error items; all other fields are zero when Err != nil.
+// Scheduled attributes are extracted from the ScheduledProcedureStepSequence.
+type WorklistResult struct {
+	Err                    error
+	PatientName            string
+	PatientID              string
+	AccessionNumber        string
+	StudyInstanceUID       string
+	RequestedProcedureDesc string
+	RequestedProcedureID   string
+	ScheduledDate          string
+	ScheduledTime          string
+	Modality               string
+	ScheduledStation       string
+	ProcedureStepDesc      string
+}
+
+// FindWorklist sends a C-FIND against the Modality Worklist Information Model
+// (1.2.840.10008.5.1.4.31, PS3.4 K.4). Results are streamed on the returned
+// channel, which is closed when the query completes or ctx is cancelled.
+func (c *DicomClient) FindWorklist(ctx context.Context, params map[string]string) (<-chan WorklistResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	su, err := netdicom.NewServiceUser(netdicom.ServiceUserParams{
+		CalledAETitle:  c.profile.RemoteAETitle,
+		CallingAETitle: c.localAETitle,
+		SOPClasses:     sopclass.QRFindClasses, // includes 1.2.840.10008.5.1.4.31
+	})
+	if err != nil {
+		return nil, fmt.Errorf("worklist c-find: create service user: %w", err)
+	}
+
+	out := make(chan WorklistResult, 128)
+
+	go func() {
+		defer close(out)
+		defer su.Release()
+		su.Connect(fmt.Sprintf("%s:%d", c.profile.Host, c.profile.Port))
+
+		for r := range su.CFind(netdicom.QRLevelWorklist, buildWorklistFilter(params)) {
+			if r.Err != nil {
+				select {
+				case out <- WorklistResult{Err: r.Err}:
+				case <-ctx.Done():
+				}
+				return
+			}
+			select {
+			case out <- elementsToWorklistResult(r.Elements):
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return out, nil
+}
+
+// buildWorklistFilter builds a Modality Worklist C-FIND identifier dataset.
+// The ScheduledProcedureStepSequence (SQ 0040,0100) is included as a single
+// item containing schedule-level matching and return keys (PS3.4 K.6.1.3).
+func buildWorklistFilter(params map[string]string) []*dicom.Element {
+	childElems := []*dicom.Element{
+		dicom.MustNewElement(dicomtag.Modality, params["Modality"]),
+		dicom.MustNewElement(dicomtag.ScheduledProcedureStepStartDate, params["ScheduledDate"]),
+		dicom.MustNewElement(dicomtag.ScheduledProcedureStepStartTime, ""),
+		dicom.MustNewElement(dicomtag.ScheduledProcedureStepDescription, ""),
+		dicom.MustNewElement(dicomtag.ScheduledProcedureStepID, ""),
+		dicom.MustNewElement(dicomtag.ScheduledStationAETitle, ""),
+		dicom.MustNewElement(dicomtag.ScheduledStationName, ""),
+		dicom.MustNewElement(dicomtag.ScheduledPerformingPhysicianName, ""),
+	}
+
+	// Wrap children in an Item element (FFFE,E000), then in the SQ element.
+	itemArgs := make([]interface{}, len(childElems))
+	for i, e := range childElems {
+		itemArgs[i] = e
+	}
+	seqItem := dicom.MustNewElement(dicomtag.Item, itemArgs...)
+	seq := dicom.MustNewElement(dicomtag.ScheduledProcedureStepSequence, seqItem)
+
+	return []*dicom.Element{
+		dicom.MustNewElement(dicomtag.SpecificCharacterSet, "ISO_IR 192"),
+		dicom.MustNewElement(dicomtag.PatientName, params["PatientName"]),
+		dicom.MustNewElement(dicomtag.PatientID, params["PatientID"]),
+		dicom.MustNewElement(dicomtag.AccessionNumber, params["AccessionNumber"]),
+		dicom.MustNewElement(dicomtag.StudyInstanceUID, ""),
+		dicom.MustNewElement(dicomtag.RequestedProcedureDescription, ""),
+		dicom.MustNewElement(dicomtag.RequestedProcedureID, ""),
+		seq,
+	}
+}
+
+// elementsToWorklistResult extracts a WorklistResult from one C-FIND response.
+// Top-level patient/study tags are read directly; schedule attributes are read
+// from items inside the ScheduledProcedureStepSequence.
+func elementsToWorklistResult(elems []*dicom.Element) WorklistResult {
+	var r WorklistResult
+	for _, elem := range elems {
+		if elem.Tag == dicomtag.ScheduledProcedureStepSequence {
+			for _, v := range elem.Value {
+				item, ok := v.(*dicom.Element)
+				if !ok || item.Tag != dicomtag.Item {
+					continue
+				}
+				for _, child := range item.Value {
+					ce, ok := child.(*dicom.Element)
+					if !ok {
+						continue
+					}
+					s, err := ce.GetString()
+					if err != nil {
+						continue
+					}
+					switch ce.Tag {
+					case dicomtag.Modality:
+						r.Modality = s
+					case dicomtag.ScheduledProcedureStepStartDate:
+						r.ScheduledDate = s
+					case dicomtag.ScheduledProcedureStepStartTime:
+						r.ScheduledTime = s
+					case dicomtag.ScheduledProcedureStepDescription:
+						r.ProcedureStepDesc = s
+					case dicomtag.ScheduledStationName:
+						r.ScheduledStation = s
+					}
+				}
+			}
+			continue
+		}
+		s, err := elem.GetString()
+		if err != nil {
+			continue
+		}
+		switch elem.Tag {
+		case dicomtag.PatientName:
+			r.PatientName = s
+		case dicomtag.PatientID:
+			r.PatientID = s
+		case dicomtag.AccessionNumber:
+			r.AccessionNumber = s
+		case dicomtag.StudyInstanceUID:
+			r.StudyInstanceUID = s
+		case dicomtag.RequestedProcedureDescription:
+			r.RequestedProcedureDesc = s
+		case dicomtag.RequestedProcedureID:
+			r.RequestedProcedureID = s
 		}
 	}
 	return r

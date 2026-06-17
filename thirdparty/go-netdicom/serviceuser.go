@@ -269,6 +269,14 @@ const (
 	// QRLevelSeries chooses Study-Root QR model, but using "SERIES" QueryRetrieveLevel.  P3.4, C.3.2
 	QRLevelSeries
 
+	// QRLevelPatientStudyOnly chooses the Patient/Study Only QR model (PS3.4, C.3.3 — retired).
+	// Supports PATIENT and STUDY levels only; SERIES queries are not available.
+	QRLevelPatientStudyOnly
+
+	// QRLevelWorklist sends a Modality Worklist C-FIND (1.2.840.10008.5.1.4.31, PS3.4 K.4).
+	// Only C-FIND is valid; QueryRetrieveLevel is not included in the identifier dataset.
+	QRLevelWorklist
+
 	qrOpCFind qrOpType = iota
 	qrOpCGet
 	qrOpCMove
@@ -311,6 +319,22 @@ func encodeQRPayload(opType qrOpType, qrLevel QRLevel, filter []*dicom.Element, 
 		if qrLevel == QRLevelSeries {
 			qrLevelString = "SERIES"
 		}
+	case QRLevelPatientStudyOnly:
+		switch opType {
+		case qrOpCFind:
+			sopClassUID = "1.2.840.10008.5.1.4.1.2.3.1"
+		case qrOpCGet:
+			sopClassUID = "1.2.840.10008.5.1.4.1.2.3.3"
+		case qrOpCMove:
+			sopClassUID = "1.2.840.10008.5.1.4.1.2.3.2"
+		}
+		qrLevelString = "STUDY"
+	case QRLevelWorklist:
+		if opType != qrOpCFind {
+			return contextManagerEntry{}, nil, fmt.Errorf("modality worklist does not support C-MOVE or C-GET")
+		}
+		sopClassUID = dicomuid.ModalityWorklistInformationFind
+		qrLevelString = "" // worklist identifier dataset carries no QueryRetrieveLevel attribute (PS3.4 K.4)
 	default:
 		return contextManagerEntry{}, nil, fmt.Errorf("Invalid C-FIND QR lever: %d", qrLevel)
 	}
@@ -358,7 +382,7 @@ func encodeQRPayload(opType qrOpType, qrLevel QRLevel, filter []*dicom.Element, 
 		}
 		allElems = append(allElems, elem)
 	}
-	if !foundQRLevel {
+	if !foundQRLevel && qrLevelString != "" {
 		allElems = append(allElems, dicom.MustNewElement(dicomtag.QueryRetrieveLevel, qrLevelString))
 	}
 	// DICOM PS3.5 §7.1: elements must be in ascending tag order.

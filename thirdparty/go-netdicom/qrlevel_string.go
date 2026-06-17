@@ -11,11 +11,13 @@ func _() {
 	_ = x[QRLevelPatient-0]
 	_ = x[QRLevelStudy-1]
 	_ = x[QRLevelSeries-2]
+	_ = x[QRLevelPatientStudyOnly-3]
+	_ = x[QRLevelWorklist-4]
 }
 
-const _QRLevel_name = "QRLevelPatientQRLevelStudyQRLevelSeries"
+const _QRLevel_name = "QRLevelPatientQRLevelStudyQRLevelSeriesQRLevelPatientStudyOnlyQRLevelWorklist"
 
-var _QRLevel_index = [...]uint8{0, 14, 26, 39}
+var _QRLevel_index = [...]uint8{0, 14, 26, 39, 62, 77}
 
 func (i QRLevel) String() string {
 	if i < 0 || i >= QRLevel(len(_QRLevel_index)-1) {

@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,6 +42,7 @@ type resultNode struct {
 	accession    string // study nodes
 	modalities   string // study nodes
 	seriesNumber string // series nodes
+	seriesDesc   string // series nodes
 	modality     string // series nodes
 	numInstances int    // series nodes
 }
@@ -142,6 +145,7 @@ func (m *resultsModel) addSeries(studyUID, seriesUID, modality, seriesNumber, se
 			sortKey:           fmt.Sprintf("%010d", n),
 			parentID:          sID,
 			seriesNumber:      seriesNumber,
+			seriesDesc:        seriesDesc,
 			modality:          modality,
 			numInstances:      numInstances,
 		}
@@ -258,6 +262,95 @@ func (m *resultsModel) uidsForNode(id string) (patientID, studyUID, seriesUID, s
 		return
 	}
 	return n.patientID, n.studyInstanceUID, n.seriesInstanceUID, n.sopInstanceUID
+}
+
+// localFolderFor returns the best local folder path for a given tree node,
+// using the same hierarchy as organizeFilePath. It tries the most-specific
+// path first (series → study → patient → downloadDir), returning the first
+// that exists on disk, or downloadDir when none do.
+func (m *resultsModel) localFolderFor(id, downloadDir string) string {
+	if downloadDir == "" {
+		return ""
+	}
+	n, ok := m.nodes[id]
+	if !ok {
+		return downloadDir
+	}
+
+	// Build folder name components using the same sanitize/truncate rules as
+	// organizeFilePath in storagescp.go (same package, so helpers are accessible).
+	patFolder := func(name, pid string) string {
+		f := sanitize(name)
+		if f == "" {
+			f = "Unknown Patient"
+		}
+		if pid != "" {
+			f += " (" + sanitize(pid) + ")"
+		}
+		return truncateRunes(f, 64)
+	}
+	studyFolder := func(desc, date string) string {
+		f := sanitize(desc)
+		if f == "" {
+			f = "Unknown Study"
+		}
+		if date != "" {
+			f += " (" + sanitize(date) + ")"
+		}
+		return truncateRunes(f, 64)
+	}
+	seriesFolder := func(desc, num string) string {
+		f := sanitize(desc)
+		if f == "" {
+			f = "Unknown Series"
+		}
+		if num != "" {
+			f += " (" + sanitize(num) + ")"
+		}
+		return truncateRunes(f, 64)
+	}
+
+	// Collect path components based on node kind.
+	var components []string
+	switch n.kind {
+	case kindSeries:
+		study, ok := m.nodes["S:"+n.studyInstanceUID]
+		if !ok {
+			return downloadDir
+		}
+		pat, ok := m.nodes["P:"+n.patientID]
+		if !ok {
+			return downloadDir
+		}
+		components = []string{
+			patFolder(pat.patientName, n.patientID),
+			studyFolder(study.studyDesc, study.studyDate),
+			seriesFolder(n.seriesDesc, n.seriesNumber),
+		}
+	case kindStudy:
+		pat, ok := m.nodes["P:"+n.patientID]
+		if !ok {
+			return downloadDir
+		}
+		components = []string{
+			patFolder(pat.patientName, n.patientID),
+			studyFolder(n.studyDesc, n.studyDate),
+		}
+	case kindPatient:
+		components = []string{patFolder(n.patientName, n.patientID)}
+	default:
+		return downloadDir
+	}
+
+	// Try the most-specific path first, falling back to broader paths.
+	for len(components) > 0 {
+		p := filepath.Join(append([]string{downloadDir}, components...)...)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+		components = components[:len(components)-1]
+	}
+	return downloadDir
 }
 
 // ExportRow is one flat record produced for CSV/JSON export.

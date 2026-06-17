@@ -7,6 +7,26 @@ import (
 	"path/filepath"
 )
 
+// defaultViewerCandidates lists well-known DICOM viewer executables, checked in
+// order. The first one that exists on disk becomes the default ViewerPath.
+var defaultViewerCandidates = []string{
+	`C:\Program Files\MicroDicom\mDicom.exe`,
+	`C:\Program Files (x86)\MicroDicom\mDicom.exe`,
+	`C:\Program Files\RadiAnt DICOM Viewer\RadiAntViewer.exe`,
+	`C:\Program Files (x86)\RadiAnt DICOM Viewer\RadiAntViewer.exe`,
+}
+
+// DetectDefaultViewer returns the path of the first known DICOM viewer found
+// on disk, or "" if none is installed.
+func DetectDefaultViewer() string {
+	for _, p := range defaultViewerCandidates {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
 //go:embed defaults/settings.json
 var defaultSettingsJSON []byte
 
@@ -28,6 +48,10 @@ type Settings struct {
 	SelectionColor  string `json:"selectionColor"`
 	SelectionBold   bool   `json:"selectionBold"`
 	SelectionItalic bool   `json:"selectionItalic"`
+
+	// ViewerPath is the full path to an external DICOM viewer executable.
+	// Empty means no external viewer is configured.
+	ViewerPath string `json:"viewerPath"`
 }
 
 func appSettingsDir() (string, error) {

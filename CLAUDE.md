@@ -29,21 +29,28 @@ CGO_ENABLED=1 CC=/c/msys64/mingw64/bin/gcc.exe \
 
 | File | Purpose |
 |---|---|
-| `main.go` | App entry point, window layout, menu bar, connection panel, query panel, retrieve panel, status bar |
+| `main.go` | App entry point, window layout, tab container, menu bar, connection panel, query panel, retrieve panel, status bar, connection/SCP LEDs |
 | `resultsmodel.go` | `resultsModel` — tree data structure for C-FIND query results |
 | `queryrow.go` | `queryRow` — Fyne widget for results tree rows (hover tooltip, right-click menu) |
-| `dicomnet.go` | `DicomClient` — SCU wrapper for C-ECHO, C-FIND, C-MOVE |
+| `dicomnet.go` | `DicomClient` — SCU wrapper for C-ECHO, C-FIND, C-MOVE, C-GET, C-STORE, Modality Worklist |
 | `storagescp.go` | `StorageSCP` — embedded C-STORE SCP listener that receives C-MOVE deliveries |
+| `localbrowse.go` | Local Browse tab — scan download folder, push to PACS, delete local files, preview routing |
+| `importtab.go` | Import tab — scan external folder and copy selected files into the download folder |
+| `worklist.go` | Worklist tab — Modality Worklist C-FIND with independent server selector |
+| `viewer.go` | Internal image viewer, study overview grid, DICOM annotation overlay, thumbnail widget |
+| `logcapture.go` | In-memory log ring buffer and Activity Log dialog |
 | `settings.go` | `Settings` struct, load/save, embedded defaults |
 | `serverprofile.go` | `ServerProfile` struct for saved server connections |
 | `preferences.go` | `appTheme`, system font scanner, preferences dialog |
 | `dicomfile.go` | `isDICOMFile` — magic-byte verification |
+| `export.go` | CSV and JSON export of query results |
 
 ## Key dependencies
 
 - `fyne.io/fyne/v2 v2.7.3` — GUI framework
-- `github.com/algm/go-netdicom` — DICOM networking (C-ECHO, C-FIND, C-MOVE SCU, C-STORE SCP)
-- `github.com/suyashkumar/dicom v1.1.0` — DICOM file parsing (for received files)
+- `github.com/algm/go-netdicom` — DICOM networking (C-ECHO, C-FIND, C-MOVE SCU, C-STORE SCP/SCU, Worklist); vendored under `thirdparty/go-netdicom` with local patches for `QRLevelPatientStudyOnly` and `QRLevelWorklist`
+- `github.com/suyashkumar/dicom v1.1.0` — DICOM file parsing (local files, image rendering, annotation extraction)
+- `github.com/grailbio/go-dicom` — DICOM dataset encoding used by the C-STORE SCU and SCP
 - `github.com/sqweek/dialog` — native Windows file/folder picker
 
 ## Documentation
