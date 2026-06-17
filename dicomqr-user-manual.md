@@ -28,7 +28,6 @@ Key capabilities:
 - Automatic wildcard search — trailing `*` appended to text fields so partial names match without manual wildcarding
 - Customisable appearance — selection colour, font style, external viewer path, and window size are remembered between sessions
 
-
 ## 2  Getting Started
 
 
@@ -37,7 +36,6 @@ Key capabilities:
 - Windows 10 or later (64-bit)
 - Network access to a DICOM PACS server
 - A configured PACS that accepts DICOM associations from this workstation
-
 
 ### 2.2  PACS Registration
 
@@ -56,16 +54,16 @@ For C-MOVE file retrieval to work, the PACS must be able to initiate an outbound
 
 ### 2.3  Starting the Application
 
-Double-click `dicomqr.exe` to launch the application. The main window opens and the status bar shows the application version. The window is restored to the size it had when last closed.
+Double-click `dicomqr.exe` to launch the application. The main window opens with an empty results tree and the status bar showing the application version. The window is restored to the size it had when last closed.
 
 
 ## 3  The Main Window
 
 The main window is divided into a connection panel at the top, a tab area in the centre, and a status bar at the bottom.
 
-**Connection panel** — the topmost area, visible from all tabs. Left side: server profile selector, Filters button, Search button. Right side: Connect, Disconnect, and Test (C-ECHO) buttons. A second row shows the SCP status indicator.
+Connection panel — the topmost area, visible from all tabs. Left side: server profile selector, Filters button, Search button. Right side: Connect, Disconnect, and Test (C-ECHO) buttons. A second row shows the SCP status indicator.
 
-**Tab area** — four tabs:
+Tab area — four tabs:
 
 | Tab | Purpose |
 |---|---|
@@ -74,7 +72,7 @@ The main window is divided into a connection panel at the top, a tab area in the
 | Local Browse | Browse, preview, push, and delete files in the download folder. |
 | Import | Copy DICOM files from an external folder into the download folder. |
 
-**Status bar** — the bottom strip. A coloured LED indicator precedes the status text. A clock shows the current date and time. A progress bar appears during queries and retrieves.
+Status bar — the bottom strip. A coloured LED indicator precedes the status text. A clock shows the current date and time. A progress bar appears during queries and retrieves.
 
 
 ## 4  Connecting to a PACS Server
@@ -140,29 +138,33 @@ Click Disconnect (or select File > Disconnect) to close the session. Any in-prog
 
 ### 5.1  Opening the Filters Panel
 
-Click Filters ▾ in the server row to open the search criteria panel. The panel floats over the results tree and contains the search fields along with Search, Clear, and Close buttons. Click Filters ▾ again, or click Close, to dismiss it. Values are preserved between open and close cycles.
+Click Filters ▾ in the server row to open the search criteria panel. The panel floats over the results tree and contains the search fields along with Search, Clear, and Close buttons. Click Filters ▾ again, or click Close inside the panel, to dismiss it. Values typed in the fields are preserved between open and close cycles.
 
 
 ### 5.2  Search Fields
 
 | Field | Description |
 |---|---|
-| Patient Name | Matches the DICOM Patient Name attribute. Supports wildcard characters: `*` matches any sequence, `?` matches one character. Format: FAMILY^GIVEN or a partial name (e.g. DOE*). A trailing `*` is appended automatically. Leave blank to match all patients. |
-| Patient ID | Matches the DICOM Patient ID (MRN). Supports wildcards. A trailing `*` is appended automatically. |
-| Accession No | Matches the DICOM Accession Number. Supports wildcards. A trailing `*` is appended automatically. |
-| Study Date From | Start of study date range. Click the calendar icon to open a date picker, or type directly. Leave blank for no lower bound. |
-| Study Date To | End of study date range. Leave blank for no upper bound. |
-| Modality | Restricts results to one or more modalities. Tick any combination: CT, MR, PT, NM, US, CR, DX, XA, RF. Multiple modalities are queried concurrently and merged. Leave all unticked to include all modalities. |
+| Patient Name | Matches the DICOM Patient Name attribute. Supports DICOM wildcard characters: `*` matches any sequence of characters, `?` matches a single character. Format: FAMILY^GIVEN or a partial name with wildcards (e.g. DOE*). A trailing `*` is appended automatically if the value does not already end with one. Leave blank to match all patients. |
+| Patient ID | Matches the DICOM Patient ID (MRN). Supports wildcards. A trailing `*` is appended automatically. Leave blank to match all IDs. |
+| Accession No | Matches the DICOM Accession Number. Supports wildcards. A trailing `*` is appended automatically. Leave blank to match all accession numbers. |
+| Study Date From | The start of the study date range. Click the calendar icon to open a month-view date picker and select a date, or type directly into the field. Leave blank for no lower bound. |
+| Study Date To | The end of the study date range. Click the calendar icon to open a month-view date picker and select a date, or type directly into the field. Leave blank for no upper bound. |
+| Modality | Restricts results to one or more imaging modalities. Tick any combination: CT, MR, PT, NM, US, CR, DX, XA, RF. When multiple modalities are ticked, a separate query is sent for each and the results are merged. Leave all checkboxes unticked to include all modalities. |
+
+At least one field should be populated before searching. Sending a completely unconstrained query (all fields blank, no modalities ticked) may return a very large result set or be rejected by the PACS.
 
 
 ### 5.3  Running a Search
 
-Click Search inside the panel or in the server row, or press Ctrl+Enter. The panel closes and the query is sent. Pressing Enter in the Patient Name, Patient ID, or Accession No field also runs the search.
+With the Filters panel open, click Search inside the panel, or click the Search button in the server row, or press Ctrl+Enter. The panel closes, the results tree clears, and the query is sent to the PACS. The status bar shows "Querying…" during the search and reports the number of studies returned when complete.
+
+Pressing Enter while the cursor is in the Patient Name, Patient ID, or Accession No field also runs the search and closes the panel.
 
 
 ### 5.4  Clearing the Search
 
-Click Clear inside the Filters panel to reset all fields and clear the results tree. Alternatively, select Query > Clear results.
+Click Clear inside the Filters panel to reset all search fields to their defaults and clear the results tree. Alternatively, select Query > Clear results.
 
 
 ## 6  Query Results
@@ -172,39 +174,59 @@ Click Clear inside the Filters panel to reset all fields and clear the results t
 
 Results are displayed in an expandable tree with three levels:
 
-**Patient** — one node per unique patient.
+Patient — one node per unique patient. The label shows the patient name and, where present, the patient ID in parentheses.
 
-**Study** — one or more studies under each patient. The label shows the study date, description, accession number, and modalities.
+Study — one or more studies under each patient. The label shows the study date, study description, accession number, and the set of modalities present in the study.
 
-**Series** — one or more series under each study. The label shows the series number, modality, description, and image count. Series are loaded on demand when a study node is expanded.
+Series — one or more series under each study. The label shows the series number, modality, series description, and image count.
 
-Results are sorted: patients alphabetically, studies chronologically (oldest first), series numerically by series number.
+Results are sorted automatically: patients alphabetically by name, studies within a patient chronologically by date (oldest first), and series within a study numerically by series number.
+
+The tree starts fully collapsed after each search. Click the expand arrow next to a patient node to reveal its studies. Click the expand arrow next to a study node to load its series — dicomqr sends a separate C-FIND query to the PACS at this point to retrieve series-level information. The series list is fetched once per study per session; collapsing and re-expanding a study does not repeat the query.
+
+The Expand All and Collapse All buttons above the tree open or close every branch at once. Expanding all branches also triggers the series C-FIND for any study that has not yet loaded its series.
+
+Large result sets are inserted into the tree in batches so the window stays responsive; the status bar shows a `Loading results… N/total` count while the batch is being added.
 
 
 ### 6.2  Filtering Results
 
-Type any text into the filter bar above the results tree to show only rows whose label contains the typed text (case-insensitive). Click Clear at the right of the filter bar to remove the filter.
+Type any text into the filter bar above the results tree. The tree immediately redraws to show only rows whose label contains the typed text (case-insensitive). Parent nodes that contain a matching descendant are always shown. Click Clear at the right of the filter bar to remove the filter and restore the full tree.
+
+The filter acts on the already-loaded results and does not send a new query to the PACS.
 
 
 ### 6.3  Selecting Items for Retrieval
 
-Click any row to select it; click again to deselect. Multiple rows at any level may be selected simultaneously. Selected rows are highlighted in the configured colour (see Section 14.1).
+Click any row in the results tree to select it. Selected rows are highlighted using the colour and font style configured in Preferences > UI (by default, bold in the theme's primary accent colour — see Section 11.1). Click the same row again to deselect it. Multiple rows at any level (patient, study, or series) may be selected simultaneously.
 
-Select All / Clear Selection buttons are in the retrieve panel. Esc also clears the selection. Press Ctrl+C to copy the label of any selected row to the clipboard.
+The Select All button (in the retrieve panel) selects every currently visible row and its loaded descendants; Clear Selection clears the entire selection. Pressing Esc also clears the current selection.
+
+Series nodes are only visible after a study has been expanded. Expand a study first, then select individual series for retrieval.
+
+Selection behaviour during retrieval:
+
+- Patient node selected — all studies under that patient are retrieved.
+- Study node selected — the entire study is retrieved as a single C-MOVE request.
+- Series node(s) selected — each selected series is retrieved individually.
+- Mixed selection — if a study and one or more of its series are both selected, the study-level retrieve takes precedence and the series are not sent as duplicate requests.
+Press Ctrl+C to copy the full label text of any selected row to the clipboard.
 
 
 ### 6.4  Right-Click Context Menu
 
+Right-clicking any row in the results tree opens a context menu:
+
 | Option | Action |
 |---|---|
 | Retrieve | Retrieves the right-clicked node directly, regardless of the current selection. |
-| Copy UID | Copies the Study or Series Instance UID to the clipboard. |
-| Copy label | Copies the full display label to the clipboard. |
+| Copy UID | Copies the Study Instance UID or Series Instance UID of the row to the clipboard. |
+| Copy label | Copies the full display label of the row to the clipboard. |
 
 
 ### 6.5  Tooltips
 
-Hovering over a study or series row for approximately 0.6 seconds shows a tooltip with UID and accession or modality information.
+Hovering the mouse cursor over a study or series row for approximately 0.6 seconds displays a tooltip showing the Study Instance UID and Accession Number (for study rows) or the Series Instance UID and Modality (for series rows). Moving the cursor off the row dismisses the tooltip immediately.
 
 
 ## 7  Retrieving Files
@@ -212,26 +234,66 @@ Hovering over a study or series row for approximately 0.6 seconds shows a toolti
 
 ### 7.1  Prerequisites
 
-For C-MOVE: the application must be connected, the SCP must be running, the PACS must have the local AE Title / IP / port registered, and the download folder must be configured and writable.
+The conditions required depend on the Retrieve method configured for the server profile (see Section 4.1).
 
-For C-GET: the application must be connected and the download folder must be configured. No inbound port or destination registration is required.
+For C-MOVE (default):
 
-For Auto: C-GET is tried first; if the PACS rejects it, the request falls back to C-MOVE.
+- The application must be connected to a PACS server (status bar shows "Connected").
+- The embedded C-STORE listener must be running. It starts automatically when a connection is established.
+- The PACS must have the local AE Title, IP address, and port registered as a known destination. See Section 2.2.
+- The download folder must be configured. Click Browse… next to the Download to field in the retrieve panel.
+- At least one item must be selected in the results tree.
+For C-GET:
+
+- The application must be connected to a PACS server.
+- The download folder must be configured.
+- At least one item must be selected.
+No inbound SCP port or PACS-side destination AE registration is required for C-GET. The PACS returns files over the existing outbound connection.
+
+For Auto: dicomqr attempts C-GET first. If the PACS rejects C-GET, it retries each item using C-MOVE. The C-MOVE prerequisites above apply as a fallback.
+
+Regardless of method, dicomqr verifies that the download folder exists and is writable before a retrieve begins. If it is not, an error dialog is shown and no retrieve is started.
 
 
 ### 7.2  Starting a Retrieve
 
-Select one or more rows, then click Retrieve Selected (or Query > Retrieve Selected). A progress bar appears. The status bar shows each file path as it arrives.
+Select one or more rows in the results tree, then click Retrieve Selected (or select Query > Retrieve Selected). dicomqr issues a retrieve request for each selected item using the method configured in the server profile:
+
+- C-MOVE — dicomqr sends a C-MOVE request; the PACS pushes files to the local C-STORE SCP listener, which writes them to the download folder.
+- C-GET — dicomqr sends a C-GET request; the PACS streams files back over the same association directly.
+- Auto — dicomqr attempts C-GET; if the PACS rejects it, the request is retried using C-MOVE.
+Selecting a study retrieves all of its series in one request; selecting individual series retrieves each independently. A progress bar appears and advances as each study or series is transferred.
 
 
-### 7.3  Completion and Errors
+### 7.3  Progress
 
-On success the status bar shows `Retrieved N files successfully`. If some targets failed, a dialog offers to retry only the failed targets.
+The progress bar tracks completion across all selected studies and series, advancing as each study or series finishes. For C-MOVE the bar also advances within a study as individual files arrive; for C-GET it advances once per completed target. As each file arrives, the status bar briefly shows the path of the received file.
 
 
-### 7.4  Cancelling
+### 7.4  Completion
 
-Click Cancel in the retrieve panel to abort. Files already written to disk are not removed.
+When all files have been received successfully, the progress bar disappears and the status bar shows:
+
+```
+Retrieved N files successfully
+```
+
+If one or more targets encountered a recoverable DICOM error (for example, a warning status from the PACS indicating that some sub-operations failed), the status bar shows the number of files received alongside the number of targets that had problems:
+
+```
+Retrieved N files (X/Y targets had errors — see log)
+```
+
+In this case a dialog also appears offering to retry only the failed targets. Accepting re-runs the retrieve loop for just those items, leaving already-retrieved files in place. Details of the errors are written to `dicom.log` in `%USERPROFILE%\.dicomqr\`.
+
+
+### 7.5  Cancelling a Retrieve
+
+Click Cancel in the retrieve panel (or select Query > Cancel retrieve) to abort an in-progress retrieval. Files that have already been written to disk are not removed. The status bar shows:
+
+```
+Retrieve cancelled
+```
 
 
 ## 8  Local Browse Tab
@@ -251,25 +313,23 @@ Type in the filter bar to narrow the tree. Expand All, Collapse All, and Clear b
 
 ### 8.3  Previewing Images
 
-Right-click any node and select **Preview Images**:
+Right-click any node and select Preview Images:
 
-- **Series node** — opens the series viewer (see Section 8.3.1).
-- **Study node** — opens the study overview grid (see Section 8.3.2).
-- **Patient node** — Preview Images is disabled (too many files to be useful at this level).
+- Series node — opens the series viewer (see Section 8.3.1).
+- Study node — opens the study overview grid (see Section 8.3.2).
+- Patient node — Preview Images is disabled (too many files to be useful at this level).
 
 #### 8.3.1  Series Viewer
 
 The series viewer displays one image at a time with a slider to navigate through the sorted series. It opens at the middle slice.
 
-The bottom bar contains:
-- An instance counter (e.g. `45 / 120`)
-- A navigation slider
-- An **Annotations** checkbox (see Section 8.3.3)
-- An info label showing pixel dimensions and W/L values
+The bottom bar contains an instance counter (e.g. `45 / 120`), a navigation slider, an Annotations checkbox (see Section 8.3.3), and an info label showing pixel dimensions and W/L values.
+
 
 #### 8.3.2  Study Overview Grid
 
 The overview window shows one thumbnail per series — the middle slice of each series rendered in parallel. Thumbnails are arranged in a three-column grid. Double-click any thumbnail to open that series in the full series viewer.
+
 
 #### 8.3.3  DICOM Annotation Overlay
 
@@ -282,38 +342,31 @@ When Annotations is checked in the series viewer, a four-corner overlay is drawn
 | Bottom-left | Modality, series number and description, slice thickness, protocol |
 | Bottom-right (right-aligned) | Instance number / total, slice location, pixel spacing, W/L values |
 
-Anatomical orientation markers (R/L, A/P, H/F) are centred on the four image edges and derived from the `ImageOrientationPatient` direction cosines in DICOM LPS patient coordinates.
+Anatomical orientation markers (R/L, A/P, H/F) are centred on the four image edges and derived from the ImageOrientationPatient direction cosines in DICOM LPS patient coordinates.
 
 The Annotations checkbox state persists between sessions.
 
 
 ### 8.4  Opening in External Viewer
 
-The **Open in Viewer** button in the bottom bar and the right-click menu item open the node's folder in the configured external DICOM viewer. These controls are disabled when no viewer path is configured in Preferences. **Open folder** opens the folder in Windows Explorer instead.
+The Open in Viewer button in the bottom bar and the right-click menu item open the node's folder in the configured external DICOM viewer. These controls are disabled when no viewer path is configured in Preferences. Open folder opens the folder in Windows Explorer instead.
 
 
 ### 8.5  Pushing to a PACS
 
-Right-click any node and select **Push to PACS…**, or select items and click **Push Selected…**, to send files to a remote PACS via C-STORE SCU.
+Right-click any node and select Push to PACS…, or select items and click Push Selected…, to send files to a remote PACS via C-STORE SCU.
 
-A dialog appears with:
-- A destination selector (any configured server profile)
-- A progress bar and per-file counter
-- A Cancel button
-
-The push creates a new association per operation and does not require the PACS tab to be connected.
+A dialog appears with a destination selector (any configured server profile), a progress bar and per-file counter, and a Cancel button. The push creates a new association per operation and does not require the PACS tab to be connected.
 
 
 ### 8.6  Deleting Local Files
 
-Right-click any node and select **Delete…**, or select items and click **Delete Selected…**, to permanently remove files from disk. A confirmation dialog shows the file count and total size. After deletion, empty directories are pruned and the tree is rescanned automatically.
+Right-click any node and select Delete…, or select items and click Delete Selected…, to permanently remove files from disk. A confirmation dialog shows the file count and total size. After deletion, empty directories are pruned and the tree is rescanned automatically.
 
-**Warning:** Deletion is permanent. Files are not moved to the Recycle Bin.
+Warning: Deletion is permanent. Files are not moved to the Recycle Bin.
 
 
 ### 8.7  Selection Controls
-
-The bottom bar provides:
 
 | Control | Action |
 |---|---|
@@ -335,7 +388,7 @@ Enter or browse to a source folder and click Scan. dicomqr walks the folder and 
 
 ### 9.2  Selecting and Importing
 
-Click rows in the tree to select them. Click **Import Selected** to copy the selected files. Files already present in the destination (same SOP Instance UID at the same destination path) are skipped; the status label reports imported, already-present, and failed counts.
+Click rows in the tree to select them. Click Import Selected to copy the selected files. Files already present in the destination (same SOP Instance UID at the same destination path) are skipped; the status label reports imported, already-present, and failed counts.
 
 Select All and Clear Selection buttons are provided. The filter bar narrows the tree in the same way as the other tabs.
 
@@ -347,9 +400,9 @@ The Worklist tab queries a Modality Worklist server for scheduled imaging proced
 
 ### 10.1  Selecting a Worklist Server
 
-Choose any configured server profile from the **Worklist server** dropdown. The dropdown updates when server profiles are added or removed in Preferences. The query connects to the selected profile's host, port, and AE Title for each query and releases the association immediately after.
+Choose any configured server profile from the Worklist server dropdown. The dropdown updates when server profiles are added or removed in Preferences. The query connects to the selected profile's host, port, and AE Title for each query and releases the association immediately after.
 
-Note: the Modality Worklist SOP class (1.2.840.10008.5.1.4.31) must be enabled on the target server. In most environments this is a separate system from the PACS (a RIS or dedicated MWL service) — configure a server profile pointing to that system.
+Note: the Modality Worklist SOP class (1.2.840.10008.5.1.4.31) must be enabled on the target server. In most environments this is a separate system from the PACS — configure a server profile pointing to that system.
 
 
 ### 10.2  Query Fields
@@ -359,27 +412,24 @@ Note: the Modality Worklist SOP class (1.2.840.10008.5.1.4.31) must be enabled o
 | Patient Name | Wildcard-capable patient name match. A trailing `*` is appended automatically. Leave blank to match all patients. |
 | MRN | Wildcard-capable Patient ID match. |
 | Accession | Wildcard-capable Accession Number match. |
-| Modality | Restricts results to one modality. Select `(any)` to include all modalities. |
-| Scheduled date | **Today only** (checked by default) — restricts to today's scheduled date. Uncheck to select a specific date using the calendar picker. Leave blank (unchecked, no date selected) to return all scheduled dates. |
+| Modality | Restricts results to one modality. Select (any) to include all modalities. |
+| Scheduled date | Today only (checked by default) — restricts to today's scheduled date. Uncheck to select a specific date using the calendar picker. Leave blank (unchecked, no date selected) to return all scheduled dates. |
 
-Click **Query Worklist** or press Enter in any text field to run the query. Click **Clear** to reset all fields and clear the results.
+Click Query Worklist or press Enter in any text field to run the query. Click Clear to reset all fields and clear the results.
 
 
 ### 10.3  Results Table
 
 Results are shown in a table with columns: Patient, MRN, Accession, Date, Time, Modality, Procedure, and Station. Click any row to select it.
 
-**Copy Accession** and **Copy Patient** buttons copy the selected row's values to the clipboard.
-
-The status label shows the number of worklist items returned, or any error message.
+Copy Accession and Copy Patient buttons copy the selected row's values to the clipboard. The status label shows the number of worklist items returned, or any error message.
 
 
 ### 10.4  Typical Use Cases
 
-- **Verify a scheduled procedure** — query by patient name or accession to confirm an order reached the worklist server before the patient arrives at the scanner.
-- **Diagnose "patient not on scanner"** — if a technologist cannot find a patient on the modality's worklist, query here; if the entry appears, the problem is in the scanner's MWL configuration; if it does not, the order was not transmitted to the worklist server.
-- **Look up an accession number** — copy the accession and switch to PACS Query to search for the matching study.
-
+- Verify a scheduled procedure — query by patient name or accession to confirm an order reached the worklist server before the patient arrives at the scanner.
+- Diagnose "patient not on scanner" — if a technologist cannot find a patient on the modality's worklist, query here; if the entry appears, the problem is in the scanner's MWL configuration; if it does not, the order was not transmitted to the worklist server.
+- Look up an accession number — copy the accession and switch to PACS Query to search for the matching study.
 
 ## 11  Downloaded Files
 
@@ -403,9 +453,9 @@ Downloads\
                 1.2.840.10008.5.1.4.1.1.2.dcm
 ```
 
-If a metadata field is absent, the corresponding folder falls back to a descriptive placeholder: Unknown Patient, Unknown Study, or Unknown Series. Characters not permitted in Windows file names are replaced with underscores, folder components are truncated to 64 characters, and the path falls back to a flat layout if it would exceed 255 characters.
+If a metadata field is absent from the DICOM file, the corresponding folder component falls back to a descriptive placeholder: Unknown Patient, Unknown Study, or Unknown Series. Characters that are not permitted in Windows file or folder names are replaced with underscores.
 
-Each SOP Instance UID is unique, so files from different studies with the same patient ID and series number are never overwritten.
+Each SOP Instance UID is unique, so files from different studies that share the same patient ID and series number are written to separate subfolders and are never overwritten.
 
 
 ## 12  Menus
@@ -415,7 +465,7 @@ Each SOP Instance UID is unique, so files from different studies with the same p
 
 | Item | Description |
 |---|---|
-| Connect | Connects to the selected server profile. |
+| Connect | Connects to the currently selected server profile. |
 | Disconnect | Ends the current session and stops the local SCP listener. |
 | Preferences… | Opens the Preferences dialog. See Section 14. |
 | Quit | Exits the application. |
@@ -531,9 +581,9 @@ The SCP status indicator row in the connection panel shows:
 
 | Situation | SCP indicator text |
 |---|---|
-| Not connected | `SCP: not running` |
-| SCP listening | `SCP: listening on 0.0.0.0:<port> (AE: <title>)` |
-| SCP failed to start | `SCP: error — <reason>` |
+| Not connected | SCP: not running |
+| SCP listening | SCP: listening on 0.0.0.0:<port> (AE: <title>) |
+| SCP failed to start | SCP: error — <reason> |
 
 
 ---
@@ -545,11 +595,11 @@ Application settings are persisted to `%USERPROFILE%\.dicomqr\settings.json`. Th
 
 | JSON key | Default | Description |
 |---|---|---|
-| `darkTheme` | `false` | Colour theme. `false` = Light, `true` = Dark. |
+| `darkTheme` | `false` | Colour theme. false = Light, true = Dark. |
 | `fontName` | `""` | System font for result tree rows. Empty = built-in font. |
 | `localAETitle` | `"DICOMQR"` | The AE Title presented during DICOM associations. |
 | `localSCPPort` | `11112` | TCP port for the embedded C-STORE listener. |
-| `downloadDir` | `""` | Absolute path of the download folder. Defaults to `~/DICOM Downloads`. |
+| `downloadDir` | `""` | Absolute path of the download folder. Defaults to ~/DICOM Downloads. |
 | `viewerPath` | `""` | Full path to an external DICOM viewer executable. Empty disables the Open in Viewer controls. |
 | `selectionColor` | `""` | Colour applied to selected tree rows (RRGGBBAA hex). Empty follows the theme primary colour. |
 | `selectionBold` | `true` | Whether selected rows are drawn in bold. |
@@ -570,7 +620,7 @@ Each entry in the `profiles` array:
 | `retrieveMethod` | `"MOVE"`, `"GET"`, or `"AUTO"`. Omitting defaults to C-MOVE. |
 | `connectTimeout` | Connection timeout in seconds. 0 uses the default (10 s). |
 
-The **Annotations** overlay toggle is stored in the application's Fyne preferences (not in `settings.json`) and persists automatically between sessions.
+The Annotations overlay toggle is stored in the application's Fyne preferences (not in settings.json) and persists automatically between sessions.
 
 
 ---
@@ -578,17 +628,17 @@ The **Annotations** overlay toggle is stored in the application's Fyne preferenc
 
 ## Appendix B  PACS Configuration Notes
 
-**AE Title registration** — The PACS must have a record of the local AE Title (default DICOMQR) associated with the workstation's IP address and SCP port. Look for "Known Destinations", "Remote AE Configuration", or similar.
+AE Title registration — The PACS must have a record of the local AE Title (default DICOMQR) associated with the workstation's IP address and SCP port. Look for "Known Destinations", "Remote AE Configuration", or similar.
 
-**C-MOVE destination** — For file delivery the PACS must be configured to push files to the local SCP address. The workstation must be reachable at the IP and port shown in Help > Client info…
+C-MOVE destination — For file delivery the PACS must be configured to push files to the local SCP address. The workstation must be reachable at the IP and port shown in Help > Client info…
 
-**Windows Firewall** — An inbound rule permitting TCP connections on the SCP port (default 11112) is required.
+Windows Firewall — An inbound rule permitting TCP connections on the SCP port (default 11112) is required.
 
-**Information model** — If queries return no results, try changing the Info model in the server profile. Some PACS require Study Root, others Patient Root. A small number of legacy systems require the Patient/Study Only model (`patient-study-only`).
+Information model — If queries return no results, try changing the Info model in the server profile. Some PACS require Study Root, others Patient Root. A small number of legacy systems require the Patient/Study Only model (patient-study-only).
 
-**Worklist server** — The Modality Worklist SOP class is typically served by a RIS or dedicated MWL broker, not the PACS itself. Create a separate server profile pointing to that system and select it in the Worklist tab.
+Worklist server — The Modality Worklist SOP class is typically served by a RIS or dedicated MWL broker, not the PACS itself. Create a separate server profile pointing to that system and select it in the Worklist tab.
 
-**IPv4 connectivity** — dicomqr listens on an IPv4 socket only. Ensure the address shown in Help > Client info… is the correct IPv4 address on the same network as the PACS.
+IPv4 connectivity — dicomqr listens on an IPv4 socket only. Ensure the address shown in Help > Client info… is the correct IPv4 address on the same network as the PACS.
 
 
 ---
@@ -635,3 +685,4 @@ Sections referenced:
 | sqweek/dialog | sqweek | ISC | Native Windows file/folder picker dialogs |
 
 A vendored copy of `algm/go-netdicom` is included under `thirdparty/go-netdicom` with its original BSD 3-Clause licence intact.
+
