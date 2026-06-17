@@ -770,6 +770,7 @@ func main() {
 			}
 
 			s := NewStorageSCP(cfg.LocalAETitle, cfg.LocalSCPPort, cfg.DownloadDir)
+			s.SetUncompressedOnly(profile.TransferUncompressed)
 			if err := s.Start(); err != nil {
 				fyne.Do(func() {
 					scpLED.FillColor = ledRed

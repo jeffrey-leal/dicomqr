@@ -11,8 +11,18 @@ import (
 	"github.com/algm/go-netdicom/dimse"
 	"github.com/algm/go-netdicom/sopclass"
 	dicom "github.com/grailbio/go-dicom"
+	"github.com/grailbio/go-dicom/dicomio"
 	"github.com/grailbio/go-dicom/dicomtag"
+	"github.com/grailbio/go-dicom/dicomuid"
 )
+
+// uncompressedTransferSyntaxes lists the two standard uncompressed syntaxes
+// offered when a server profile has TransferUncompressed enabled. A conformant
+// PACS must transcode compressed pixel data to one of these before sending.
+var uncompressedTransferSyntaxes = []string{
+	dicomuid.ExplicitVRLittleEndian,
+	dicomuid.ImplicitVRLittleEndian,
+}
 
 // FindResult holds one C-FIND response item. Err is set on error items;
 // all other fields are zero when Err != nil.
@@ -194,10 +204,15 @@ func (c *DicomClient) Get(ctx context.Context, level, patientID, studyUID, serie
 		return err
 	}
 
+	getTransferSyntaxes := dicomio.StandardTransferSyntaxes
+	if c.profile.TransferUncompressed {
+		getTransferSyntaxes = uncompressedTransferSyntaxes
+	}
 	su, err := netdicom.NewServiceUser(netdicom.ServiceUserParams{
-		CalledAETitle:  c.profile.RemoteAETitle,
-		CallingAETitle: c.localAETitle,
-		SOPClasses:     sopclass.QRGetClasses,
+		CalledAETitle:    c.profile.RemoteAETitle,
+		CallingAETitle:   c.localAETitle,
+		SOPClasses:       sopclass.QRGetClasses,
+		TransferSyntaxes: getTransferSyntaxes,
 	})
 	if err != nil {
 		return fmt.Errorf("c-get: create service user: %w", err)

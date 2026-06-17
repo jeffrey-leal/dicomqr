@@ -45,16 +45,30 @@ type contextManager struct {
 	// is matched against the response PDU and
 	// contextid->{abstractsyntax,transfersyntax} mappings are filled.
 	tmpRequests map[byte]*pdu_item.PresentationContextItem
+
+	// acceptedTransferSyntaxes, when non-empty, restricts which transfer
+	// syntaxes the provider will accept during A-ASSOCIATE-RQ negotiation.
+	// Presentation contexts whose offered syntaxes are not in this set are
+	// rejected with PresentationContextProviderRejectionTransferSyntaxNotSupported.
+	// An empty map means accept all transfer syntaxes (default behaviour).
+	acceptedTransferSyntaxes map[string]bool
 }
 
-// Create an empty contextManager
-func newContextManager(label string) *contextManager {
+// newContextManager creates an empty contextManager.
+// acceptedTSUIDs, when non-nil and non-empty, restricts which transfer syntaxes
+// the provider will accept; pass nil to accept all (service-user / client side).
+func newContextManager(label string, acceptedTSUIDs []string) *contextManager {
+	accepted := make(map[string]bool, len(acceptedTSUIDs))
+	for _, uid := range acceptedTSUIDs {
+		accepted[uid] = true
+	}
 	c := &contextManager{
 		label:                            label,
 		contextIDToAbstractSyntaxNameMap: make(map[byte]*contextManagerEntry),
 		abstractSyntaxNameToContextIDMap: make(map[string]*contextManagerEntry),
 		peerMaxPDUSize:                   16384, // The default value used by Osirix & pynetdicom.
 		tmpRequests:                      make(map[byte]*pdu_item.PresentationContextItem),
+		acceptedTransferSyntaxes:         accepted,
 	}
 	return c
 }
@@ -114,7 +128,7 @@ func (m *contextManager) onAssociateRequest(requestItems []pdu_item.SubItem) ([]
 			}
 		case *pdu_item.PresentationContextItem:
 			var sopUID string
-			var pickedTransferSyntaxUID string
+			var offeredSyntaxes []string
 			for _, subItem := range ri.Items {
 				switch c := subItem.(type) {
 				case *pdu_item.AbstractSyntaxSubItem:
@@ -124,18 +138,37 @@ func (m *contextManager) onAssociateRequest(requestItems []pdu_item.SubItem) ([]
 					}
 					sopUID = c.Name
 				case *pdu_item.TransferSyntaxSubItem:
-					// Just pick the first syntax UID proposed by the client.
-					if pickedTransferSyntaxUID == "" {
-						pickedTransferSyntaxUID = c.Name
-					}
+					offeredSyntaxes = append(offeredSyntaxes, c.Name)
 				default:
 					return nil, fmt.Errorf("dicom.onAssociateRequest: Unknown subitem in PresentationContext: %s",
 						subItem.String())
 				}
 			}
-			if sopUID == "" || pickedTransferSyntaxUID == "" {
+			if sopUID == "" || len(offeredSyntaxes) == 0 {
 				return nil, fmt.Errorf("dicom.onAssociateRequest: SOP or transfersyntax not found in PresentationContext: %v",
 					ri.String())
+			}
+			// Pick the first offered transfer syntax that satisfies the filter.
+			// If no filter is set (empty map), accept the first offered syntax.
+			var pickedTransferSyntaxUID string
+			for _, ts := range offeredSyntaxes {
+				if len(m.acceptedTransferSyntaxes) == 0 || m.acceptedTransferSyntaxes[ts] {
+					pickedTransferSyntaxUID = ts
+					break
+				}
+			}
+			if pickedTransferSyntaxUID == "" {
+				// No offered transfer syntax is in the accepted set — reject.
+				dicomlog.Vprintf(1, "dicom.onAssociateRequest(%s): rejecting %v: none of offered syntaxes %v are in accepted set",
+					m.label, sopUID, offeredSyntaxes)
+				responses = append(responses, &pdu_item.PresentationContextItem{
+					Type:      pdu_item.ItemTypePresentationContextResponse,
+					ContextID: ri.ContextID,
+					Result:    pdu_item.PresentationContextProviderRejectionTransferSyntaxNotSupported,
+					Items:     []pdu_item.SubItem{&pdu_item.TransferSyntaxSubItem{Name: offeredSyntaxes[0]}}})
+				addContextMapping(m, sopUID, offeredSyntaxes[0], ri.ContextID,
+					pdu_item.PresentationContextProviderRejectionTransferSyntaxNotSupported)
+				continue
 			}
 			responses = append(responses, &pdu_item.PresentationContextItem{
 				Type:      pdu_item.ItemTypePresentationContextResponse,
@@ -144,7 +177,6 @@ func (m *contextManager) onAssociateRequest(requestItems []pdu_item.SubItem) ([]
 				Items:     []pdu_item.SubItem{&pdu_item.TransferSyntaxSubItem{Name: pickedTransferSyntaxUID}}})
 			dicomlog.Vprintf(2, "dicom.onAssociateRequest(%s): Provider(%p): addmapping %v %v %v",
 				m.label, m, sopUID, pickedTransferSyntaxUID, ri.ContextID)
-			// TODO(saito) Callback the service provider instead of accepting the sopclass blindly.
 			addContextMapping(m, sopUID, pickedTransferSyntaxUID, ri.ContextID, pdu_item.PresentationContextAccepted)
 		case *pdu_item.UserInformationItem:
 			for _, subItem := range ri.Items {

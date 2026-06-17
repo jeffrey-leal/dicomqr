@@ -12,7 +12,7 @@ import (
 func TestServiceDispatcher_HandleEvent(t *testing.T) {
 	disp := newServiceDispatcher("test")
 
-	cm := newContextManager("cm")
+	cm := newContextManager("cm", nil)
 	// Prepare context mapping for contextID 1
 	entry := &contextManagerEntry{
 		contextID:         1,
@@ -76,7 +76,7 @@ func TestServiceDispatcher_HandleEvent(t *testing.T) {
 
 func TestServiceDispatcher_NewCommandAndFind(t *testing.T) {
 	disp := newServiceDispatcher("test2")
-	cm := newContextManager("cm2")
+	cm := newContextManager("cm2", nil)
 	entry := contextManagerEntry{contextID: 3, abstractSyntaxUID: "1", transferSyntaxUID: "ts"}
 	cm.contextIDToAbstractSyntaxNameMap[3] = &entry
 	cm.abstractSyntaxNameToContextIDMap["1"] = &entry

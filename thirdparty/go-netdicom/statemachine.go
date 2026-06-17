@@ -917,7 +917,7 @@ func runStateMachineForServiceUser(
 	sm := &stateMachine{
 		label:          label,
 		isUser:         true,
-		contextManager: newContextManager(label),
+		contextManager: newContextManager(label, nil), // client side: accept all transfer syntaxes from server
 		userParams:     params,
 		netCh:          make(chan stateEvent, 128),
 		errorCh:        make(chan stateEvent, 128),
@@ -938,11 +938,12 @@ func runStateMachineForServiceProvider(
 	conn net.Conn,
 	upcallCh chan upcallEvent,
 	downcallCh chan stateEvent,
-	label string) {
+	label string,
+	acceptedTransferSyntaxes []string) {
 	sm := &stateMachine{
 		label:          label,
 		isUser:         false,
-		contextManager: newContextManager(label),
+		contextManager: newContextManager(label, acceptedTransferSyntaxes),
 		conn:           conn,
 		netCh:          make(chan stateEvent, 128),
 		errorCh:        make(chan stateEvent, 128),

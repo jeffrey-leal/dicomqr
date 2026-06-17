@@ -44,6 +44,11 @@ type StorageSCP struct {
 	running  atomic.Bool
 	cancel   context.CancelFunc
 	ln       net.Listener
+
+	// uncompressedOnly, when true, causes the SCP to reject any compressed
+	// transfer syntax offered in A-ASSOCIATE-RQ, forcing the PACS to
+	// transcode pixel data before sending. Must be set before Start().
+	uncompressedOnly bool
 }
 
 // DownloadDir returns the download directory (thread-safe, Phase 1-B).
@@ -59,6 +64,11 @@ func (s *StorageSCP) SetDownloadDir(d string) {
 	defer s.dirMu.Unlock()
 	s.downloadDir = d
 }
+
+// SetUncompressedOnly configures whether the SCP will reject compressed
+// transfer syntaxes during A-ASSOCIATE-RQ negotiation. Must be called
+// before Start(). Mirrors the TransferUncompressed flag on the server profile.
+func (s *StorageSCP) SetUncompressedOnly(v bool) { s.uncompressedOnly = v }
 
 // SetOnFileReceived sets the callback (thread-safe, Phase 1-C).
 func (s *StorageSCP) SetOnFileReceived(fn func(path string)) {
@@ -123,6 +133,9 @@ func (s *StorageSCP) Start() error {
 			dataReader io.Reader, _ int64) dimse.Status {
 			return s.handleCStore(transferSyntaxUID, sopClassUID, sopInstanceUID, dataReader)
 		},
+	}
+	if s.uncompressedOnly {
+		params.AcceptedTransferSyntaxes = uncompressedTransferSyntaxes
 	}
 
 	// Use "tcp4" to create an IPv4-only socket. net.Listen("tcp", ...) on

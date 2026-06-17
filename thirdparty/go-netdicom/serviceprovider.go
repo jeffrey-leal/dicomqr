@@ -383,6 +383,14 @@ type ServiceProviderParams struct {
 	TLSConfig *tls.Config
 
 	Verbose bool
+
+	// AcceptedTransferSyntaxes, when non-empty, restricts which transfer
+	// syntaxes the provider will accept in A-ASSOCIATE-RQ negotiation.
+	// Presentation contexts whose offered syntaxes are not in this list are
+	// rejected with TransferSyntaxNotSupported, causing a conformant sender
+	// to retry with an uncompressed syntax or abort the association.
+	// Leave nil (or empty) to accept all transfer syntaxes (default).
+	AcceptedTransferSyntaxes []string
 }
 
 // DefaultMaxPDUSize is the the PDU size advertized by go-netdicom.
@@ -584,7 +592,7 @@ func RunProviderForConn(ctx context.Context, conn net.Conn, params ServiceProvid
 		func(msg dimse.Message, data *dimse.DimseCommand, cs *serviceCommandState) {
 			handleCEcho(params, getConnState(conn), msg.(*dimse.CEchoRq), data, cs)
 		})
-	go runStateMachineForServiceProvider(conn, upcallCh, disp.downcallCh, label)
+	go runStateMachineForServiceProvider(conn, upcallCh, disp.downcallCh, label, params.AcceptedTransferSyntaxes)
 	for event := range upcallCh {
 		disp.handleEvent(event)
 	}

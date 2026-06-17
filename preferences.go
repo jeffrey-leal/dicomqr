@@ -430,6 +430,9 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 		retrieveMethodSelect.SetSelected("C-MOVE (default)")
 	}
 
+	uncompressedCheck := widget.NewCheck("Request uncompressed transfer syntax only", nil)
+	uncompressedCheck.SetChecked(p.TransferUncompressed)
+
 	form := widget.NewForm(
 		widget.NewFormItem("Profile name", nameEntry),
 		widget.NewFormItem("Remote AE Title", aeEntry),
@@ -438,6 +441,7 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 		widget.NewFormItem("Connect timeout (s)", timeoutEntry),
 		widget.NewFormItem("Info model", modelSelect),
 		widget.NewFormItem("Retrieve method", retrieveMethodSelect),
+		widget.NewFormItem("Transfer", uncompressedCheck),
 	)
 
 	dialog.ShowCustomConfirm("Edit Server", "Save", "Cancel", form, func(save bool) {
@@ -469,13 +473,14 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 			retrieveMethod = "AUTO"
 		}
 		onSave(ServerProfile{
-			Name:           nameEntry.Text,
-			RemoteAETitle:  strings.ToUpper(strings.TrimSpace(aeEntry.Text)),
-			Host:           strings.TrimSpace(hostEntry.Text),
-			Port:           port,
-			ConnectTimeout: timeout,
-			InfoModel:      modelSelect.Selected,
-			RetrieveMethod: retrieveMethod,
+			Name:                 nameEntry.Text,
+			RemoteAETitle:        strings.ToUpper(strings.TrimSpace(aeEntry.Text)),
+			Host:                 strings.TrimSpace(hostEntry.Text),
+			Port:                 port,
+			ConnectTimeout:       timeout,
+			InfoModel:            modelSelect.Selected,
+			RetrieveMethod:       retrieveMethod,
+			TransferUncompressed: uncompressedCheck.Checked,
 		})
 	}, w)
 }
