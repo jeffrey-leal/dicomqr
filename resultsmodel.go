@@ -208,7 +208,10 @@ func (m *resultsModel) nodeMatchesFilter(id string) bool {
 }
 
 func (m *resultsModel) activeRoots() []string {
-	if m.filter != "" && m.filtered != nil {
+	// When a filter is active, m.filtered is authoritative even when empty
+	// (no matches). Keying off m.filtered != nil here would wrongly fall back
+	// to showing all roots when a filter matches nothing.
+	if m.filter != "" {
 		return m.filtered
 	}
 	return m.roots

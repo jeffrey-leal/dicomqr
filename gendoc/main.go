@@ -499,7 +499,7 @@ const stylesXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 
 func buildContent(d Formatter) {
 
-	d.Cover("dicomqr", "User Manual  v1.2.0",
+	d.Cover("dicomqr", "User Manual  v1.3.0",
 		time.Now().Format("January 2, 2006"),
 		"A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.")
 
@@ -720,18 +720,47 @@ func buildContent(d Formatter) {
 	d.H2("8.3  Previewing Images")
 	d.P("Right-click any node and select Preview Images:")
 	d.Bullet("Series node — opens the series viewer (see Section 8.3.1).")
-	d.Bullet("Study node — opens the study overview grid (see Section 8.3.2).")
+	d.Bullet("Study node — opens the study overview grid (see Section 8.3.3).")
 	d.Bullet("Patient node — Preview Images is disabled (too many files to be useful at this level).")
 
 	d.H3("8.3.1  Series Viewer")
-	d.P("The series viewer displays one image at a time with a slider to navigate through the sorted series. It opens at the middle slice.")
-	d.P("The bottom bar contains an instance counter (e.g. `45 / 120`), a navigation slider, an Annotations checkbox (see Section 8.3.3), and an info label showing pixel dimensions and W/L values.")
+	d.P("The series viewer displays one image at a time and opens at the middle slice. It supports interactive window/level, zoom and pan, and slice navigation by mouse or keyboard.")
+	d.P("The bottom bar contains an instance counter (e.g. `45 / 120`), a navigation slider, a Window preset dropdown (see Section 8.3.2), an Annotations checkbox (see Section 8.3.4), a Reset button, and an info label showing pixel dimensions and the current W/L values.")
+	d.P("Mouse controls:")
+	d.Table([]Row{
+		{"Action", "Effect"},
+		{"Left-drag", "Adjust window/level — horizontal changes the window width, vertical changes the level (centre). The adjustment is anchored to the point where the drag began."},
+		{"Right-drag", "Zoom — drag up to magnify, down to zoom out (up to 16×)."},
+		{"Middle-drag", "Pan the image when zoomed in."},
+		{"Mouse wheel", "Step to the previous / next slice in the series."},
+		{"Double-click", "Reset zoom and pan to fit the window."},
+	})
+	d.P("Keyboard controls (while the viewer window is focused):")
+	d.Table([]Row{
+		{"Key", "Effect"},
+		{"Up / Left / Page Up", "Previous slice."},
+		{"Down / Right / Page Down", "Next slice."},
+		{"`+` / `-`", "Zoom in / out."},
+		{"Home or F", "Reset zoom and pan to fit."},
+		{"R", "Reset the window to the default (clears any preset or manual adjustment)."},
+	})
+	d.P("The Reset button resets both the view (zoom/pan) and the window to the default. Window/level changes made by dragging or by selecting a preset persist as you scroll through the series.")
 	d.P("Compressed pixel data — the built-in viewer decodes JPEG Baseline and uncompressed (native) pixel data. Files stored in JPEG 2000, JPEG-LS, JPEG Lossless, or RLE Lossless formats cannot be decoded and display a message explaining the limitation with a suggestion to use Open in Viewer. To avoid this, enable 'Request uncompressed transfer syntax only' in the server profile before retrieving (see Section 4.1).")
 
-	d.H3("8.3.2  Study Overview Grid")
+	d.H3("8.3.2  Window/Level Presets")
+	d.P("The Window dropdown in the viewer bottom bar offers preset windows tailored to the image's modality. Selecting a preset applies it to the current slice and to subsequent slices until you adjust the window manually. Default restores the image's own window (from the DICOM Window tags, or an automatic 1st–99th percentile window when absent); Full range maps the entire pixel value range.")
+	d.Table([]Row{
+		{"Modality", "Presets offered"},
+		{"CT", "Default, Full range, plus Hounsfield windows: Brain, Subdural, Soft tissue, Liver, Mediastinum, Bone, Lung."},
+		{"PET (PT)", "Default, Full range, plus 0 → 75% / 50% / 40% / 30% / 20% windows expressed as a fraction of the peak value (a lower percentage raises contrast in low-uptake regions)."},
+		{"MR", "Default, Full range, plus Lower / Higher / Highest contrast windows scaled relative to the image's own window (MR intensities have no absolute scale)."},
+		{"Other", "Default, Full range, Lower contrast, Higher contrast."},
+	})
+
+	d.H3("8.3.3  Study Overview Grid")
 	d.P("The overview window shows one thumbnail per series — the middle slice of each series rendered in parallel. Thumbnails are arranged in a three-column grid. Double-click any thumbnail to open that series in the full series viewer.")
 
-	d.H3("8.3.3  DICOM Annotation Overlay")
+	d.H3("8.3.4  DICOM Annotation Overlay")
 	d.P("When Annotations is checked in the series viewer, a four-corner overlay is drawn within the actual image area (never in the letterbox bars):")
 	d.Table([]Row{
 		{"Corner", "Content"},
@@ -900,7 +929,7 @@ func buildContent(d Formatter) {
 	d.P("The status bar at the bottom of the window provides real-time feedback. A coloured LED indicator (gray / amber / green) precedes the status text.")
 	d.Table([]Row{
 		{"Situation", "Status bar text"},
-		{"Application started, not connected", "`v1.2.0`"},
+		{"Application started, not connected", "`v1.3.0`"},
 		{"Connecting to server", "`Connecting…`"},
 		{"Connected", "`Connected: <AE>@<host>:<port>`"},
 		{"Connection cancelled", "`Connection cancelled`"},

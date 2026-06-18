@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.3.0] — 2026-06-18
+
+### Added
+
+- **Interactive image viewer** — the series viewer now supports direct mouse and keyboard manipulation:
+  - **Window/level by left-drag** — horizontal adjusts window width, vertical adjusts level; the adjustment is anchored to the point where the drag began
+  - **Zoom by right-drag** (up to 16×) and **pan by middle-drag** when zoomed in; **double-click** resets zoom/pan to fit
+  - **Mouse wheel** steps through slices; **arrow keys / Page Up / Page Down** also navigate slices
+  - **Keyboard**: `+`/`-` zoom, `Home`/`F` reset view, `R` reset window
+  - A **Reset** button restores both the view and the window to default. Window/level and zoom/pan persist as you scroll through a series
+- **Modality-specific window/level presets** — a Window dropdown in the viewer offers presets tailored to the image's DICOM Modality:
+  - **CT** — Hounsfield windows: Brain, Subdural, Soft tissue, Liver, Mediastinum, Bone, Lung
+  - **PET (PT)** — windows expressed as a fraction of the peak value: 0 → 75% / 50% / 40% / 30% / 20%
+  - **MR** — contrast windows scaled relative to the image's own window (Lower / Higher / Highest contrast), since MR intensities have no absolute scale
+  - All sets include Default (the image's own/auto window) and Full range (the entire pixel value range)
+
+### Fixed
+
+- **Results filter showed all patients when nothing matched** — typing a filter string in the PACS Query results that matched no node incorrectly displayed every patient instead of an empty tree. The filter now correctly distinguishes "no filter" from "filter matched nothing"
+- **Smooth window/level dragging** — eliminated image flicker during a window/level drag. The viewer now scales on the GPU (avoiding a per-refresh CPU resample that starved the paint loop), re-windows into a reused buffer (no per-tick allocation), defers the annotation-overlay rebuild to drag end, and computes the window from absolute mouse displacement anchored to the press point (fixing a first-move jump and a Window/Level axis swap)
+
+### Internal
+
+- `viewer.go` — `decodedFrame` now separates pixel decode from windowing (`renderInto` into a reusable buffer), enabling cheap re-windowing; new `imageViewport` custom widget handles mouse/scroll/keyboard input, zoom/pan via `SubImage` cropping, and modality preset selection (`wlPreset`/`presetsForModality`)
+- `viewer_test.go` — unit tests for window rendering, default-window computation, preset resolution (CT/PET/MR), modality selection, and clamp helpers
+
+---
+
 ## [1.2.0] — 2026-06-17
 
 ### Added
