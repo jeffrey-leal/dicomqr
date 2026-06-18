@@ -1,6 +1,6 @@
 # dicomqr
 
-**User Manual  v1.3.0**
+**User Manual  v1.4.0**
 
 June 18, 2026
 
@@ -22,7 +22,7 @@ Key capabilities:
 - Automatically organise downloaded files by patient, study, and series
 - Query a Modality Worklist server independently of the active PACS connection
 - Browse local DICOM files in the download folder; push them to any PACS via C-STORE or delete them
-- Preview DICOM images in the built-in viewer with W/L windowing, DICOM annotation overlays, and study overview grids
+- Preview DICOM images in the built-in viewer with interactive window/level, zoom and pan, modality-specific W/L presets, colour maps for PET/SPECT, DICOM annotation overlays, and study overview grids
 - Import DICOM files from external folders into the organised download folder
 - Support for multiple saved server profiles with independent connection and retrieve settings
 - Optionally request uncompressed pixel data transfer per server profile, ensuring the built-in viewer can display all received images regardless of how the PACS stores them
@@ -318,14 +318,14 @@ Type in the filter bar to narrow the tree. Expand All, Collapse All, and Clear b
 Right-click any node and select Preview Images:
 
 - Series node — opens the series viewer (see Section 8.3.1).
-- Study node — opens the study overview grid (see Section 8.3.3).
+- Study node — opens the study overview grid (see Section 8.3.4).
 - Patient node — Preview Images is disabled (too many files to be useful at this level).
 
 #### 8.3.1  Series Viewer
 
 The series viewer displays one image at a time and opens at the middle slice. It supports interactive window/level, zoom and pan, and slice navigation by mouse or keyboard.
 
-The bottom bar contains an instance counter (e.g. `45 / 120`), a navigation slider, a Window preset dropdown (see Section 8.3.2), an Annotations checkbox (see Section 8.3.4), a Reset button, and an info label showing pixel dimensions and the current W/L values.
+The bottom bar contains an instance counter (e.g. `45 / 120`), a navigation slider, a Window preset dropdown (see Section 8.3.2), a Colour map dropdown (see Section 8.3.3), an Annotations checkbox (see Section 8.3.5), a Reset button, and an info label showing pixel dimensions and the current W/L values.
 
 Mouse controls:
 
@@ -364,12 +364,30 @@ The Window dropdown in the viewer bottom bar offers preset windows tailored to t
 | Other | Default, Full range, Lower contrast, Higher contrast. |
 
 
-#### 8.3.3  Study Overview Grid
+#### 8.3.3  Colour Maps
+
+The Colour dropdown in the viewer bottom bar applies a colour lookup table to the windowed image — useful for nuclear-medicine studies (PET and SPECT/NM), which are conventionally read in pseudo-colour rather than grayscale. The colour map is applied on top of the current window/level and persists as you scroll through the series until you change it.
+
+For PET (PT) and nuclear-medicine (NM) studies the viewer selects Hot Iron automatically; all other modalities default to Grayscale. The same default colour map is applied to the study overview thumbnails (Section 8.3.4) so the overview matches the viewer.
+
+| Colour map | Description |
+|---|---|
+| Grayscale | Standard grayscale (default for CT, MR, and most modalities). |
+| Inverse Grayscale | Grayscale with the intensity ramp inverted. |
+| Hot Iron | Black → red → yellow → white. Default for PET/NM. |
+| PET | Black → blue → purple → red → orange → yellow → white. |
+| Hot Metal Blue | Like PET but with blue rising earlier (cool shadows, hot highlights). |
+| PET 20 Step | The PET palette quantised into 20 discrete colour bands. |
+
+Colour maps apply only to grayscale (monochrome) images; for images already stored in colour the dropdown is disabled. The maps are faithful renditions of the DICOM standard palettes intended for display and triage.
+
+
+#### 8.3.4  Study Overview Grid
 
 The overview window shows one thumbnail per series — the middle slice of each series rendered in parallel. Thumbnails are arranged in a three-column grid. Double-click any thumbnail to open that series in the full series viewer.
 
 
-#### 8.3.4  DICOM Annotation Overlay
+#### 8.3.5  DICOM Annotation Overlay
 
 When Annotations is checked in the series viewer, a four-corner overlay is drawn within the actual image area (never in the letterbox bars):
 
@@ -597,7 +615,7 @@ The status bar at the bottom of the window provides real-time feedback. A colour
 
 | Situation | Status bar text |
 |---|---|
-| Application started, not connected | `v1.3.0` |
+| Application started, not connected | `v1.4.0` |
 | Connecting to server | `Connecting…` |
 | Connected | `Connected: <AE>@<host>:<port>` |
 | Connection cancelled | `Connection cancelled` |

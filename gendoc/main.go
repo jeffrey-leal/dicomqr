@@ -499,7 +499,7 @@ const stylesXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 
 func buildContent(d Formatter) {
 
-	d.Cover("dicomqr", "User Manual  v1.3.0",
+	d.Cover("dicomqr", "User Manual  v1.4.0",
 		time.Now().Format("January 2, 2006"),
 		"A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.")
 
@@ -514,7 +514,7 @@ func buildContent(d Formatter) {
 	d.Bullet("Automatically organise downloaded files by patient, study, and series")
 	d.Bullet("Query a Modality Worklist server independently of the active PACS connection")
 	d.Bullet("Browse local DICOM files in the download folder; push them to any PACS via C-STORE or delete them")
-	d.Bullet("Preview DICOM images in the built-in viewer with W/L windowing, DICOM annotation overlays, and study overview grids")
+	d.Bullet("Preview DICOM images in the built-in viewer with interactive window/level, zoom and pan, modality-specific W/L presets, colour maps for PET/SPECT, DICOM annotation overlays, and study overview grids")
 	d.Bullet("Import DICOM files from external folders into the organised download folder")
 	d.Bullet("Support for multiple saved server profiles with independent connection and retrieve settings")
 	d.Bullet("Optionally request uncompressed pixel data transfer per server profile, ensuring the built-in viewer can display all received images regardless of how the PACS stores them")
@@ -720,12 +720,12 @@ func buildContent(d Formatter) {
 	d.H2("8.3  Previewing Images")
 	d.P("Right-click any node and select Preview Images:")
 	d.Bullet("Series node — opens the series viewer (see Section 8.3.1).")
-	d.Bullet("Study node — opens the study overview grid (see Section 8.3.3).")
+	d.Bullet("Study node — opens the study overview grid (see Section 8.3.4).")
 	d.Bullet("Patient node — Preview Images is disabled (too many files to be useful at this level).")
 
 	d.H3("8.3.1  Series Viewer")
 	d.P("The series viewer displays one image at a time and opens at the middle slice. It supports interactive window/level, zoom and pan, and slice navigation by mouse or keyboard.")
-	d.P("The bottom bar contains an instance counter (e.g. `45 / 120`), a navigation slider, a Window preset dropdown (see Section 8.3.2), an Annotations checkbox (see Section 8.3.4), a Reset button, and an info label showing pixel dimensions and the current W/L values.")
+	d.P("The bottom bar contains an instance counter (e.g. `45 / 120`), a navigation slider, a Window preset dropdown (see Section 8.3.2), a Colour map dropdown (see Section 8.3.3), an Annotations checkbox (see Section 8.3.5), a Reset button, and an info label showing pixel dimensions and the current W/L values.")
 	d.P("Mouse controls:")
 	d.Table([]Row{
 		{"Action", "Effect"},
@@ -757,10 +757,24 @@ func buildContent(d Formatter) {
 		{"Other", "Default, Full range, Lower contrast, Higher contrast."},
 	})
 
-	d.H3("8.3.3  Study Overview Grid")
+	d.H3("8.3.3  Colour Maps")
+	d.P("The Colour dropdown in the viewer bottom bar applies a colour lookup table to the windowed image — useful for nuclear-medicine studies (PET and SPECT/NM), which are conventionally read in pseudo-colour rather than grayscale. The colour map is applied on top of the current window/level and persists as you scroll through the series until you change it.")
+	d.P("For PET (PT) and nuclear-medicine (NM) studies the viewer selects Hot Iron automatically; all other modalities default to Grayscale. The same default colour map is applied to the study overview thumbnails (Section 8.3.4) so the overview matches the viewer.")
+	d.Table([]Row{
+		{"Colour map", "Description"},
+		{"Grayscale", "Standard grayscale (default for CT, MR, and most modalities)."},
+		{"Inverse Grayscale", "Grayscale with the intensity ramp inverted."},
+		{"Hot Iron", "Black → red → yellow → white. Default for PET/NM."},
+		{"PET", "Black → blue → purple → red → orange → yellow → white."},
+		{"Hot Metal Blue", "Like PET but with blue rising earlier (cool shadows, hot highlights)."},
+		{"PET 20 Step", "The PET palette quantised into 20 discrete colour bands."},
+	})
+	d.P("Colour maps apply only to grayscale (monochrome) images; for images already stored in colour the dropdown is disabled. The maps are faithful renditions of the DICOM standard palettes intended for display and triage.")
+
+	d.H3("8.3.4  Study Overview Grid")
 	d.P("The overview window shows one thumbnail per series — the middle slice of each series rendered in parallel. Thumbnails are arranged in a three-column grid. Double-click any thumbnail to open that series in the full series viewer.")
 
-	d.H3("8.3.4  DICOM Annotation Overlay")
+	d.H3("8.3.5  DICOM Annotation Overlay")
 	d.P("When Annotations is checked in the series viewer, a four-corner overlay is drawn within the actual image area (never in the letterbox bars):")
 	d.Table([]Row{
 		{"Corner", "Content"},
@@ -929,7 +943,7 @@ func buildContent(d Formatter) {
 	d.P("The status bar at the bottom of the window provides real-time feedback. A coloured LED indicator (gray / amber / green) precedes the status text.")
 	d.Table([]Row{
 		{"Situation", "Status bar text"},
-		{"Application started, not connected", "`v1.3.0`"},
+		{"Application started, not connected", "`v1.4.0`"},
 		{"Connecting to server", "`Connecting…`"},
 		{"Connected", "`Connected: <AE>@<host>:<port>`"},
 		{"Connection cancelled", "`Connection cancelled`"},

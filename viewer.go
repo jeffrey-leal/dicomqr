@@ -524,23 +524,28 @@ type decodedFrame struct {
 // windowable reports whether window/level adjustment affects this frame.
 func (d *decodedFrame) windowable() bool { return d != nil && d.colorImg == nil }
 
-// render produces a displayable image at the given window centre/width.
-func (d *decodedFrame) render(wc, ww float64) image.Image {
+// render produces a displayable image at the given window centre/width, mapped
+// through the supplied colour map (nil = grayscale).
+func (d *decodedFrame) render(cm *colorMap, wc, ww float64) image.Image {
 	if d.colorImg != nil {
 		return d.colorImg
 	}
-	img := image.NewGray(image.Rect(0, 0, d.cols, d.rows))
-	d.renderInto(img, wc, ww)
+	img := image.NewRGBA(image.Rect(0, 0, d.cols, d.rows))
+	d.renderInto(img, cm, wc, ww)
 	return img
 }
 
-// renderInto windows the frame into an existing *image.Gray (dst must be
-// cols×rows). Reusing a buffer across window changes avoids per-drag allocation
-// and keeps the canvas.Image backing pointer stable, which is important for
-// flicker-free interactive window/level dragging.
-func (d *decodedFrame) renderInto(dst *image.Gray, wc, ww float64) {
+// renderInto windows the frame into an existing *image.RGBA (dst must be
+// cols×rows) and applies the colour map. Reusing a buffer across window/map
+// changes avoids per-drag allocation and keeps the canvas.Image backing pointer
+// stable, which is important for flicker-free interactive window/level dragging.
+// *image.RGBA also uploads to the GPU without conversion.
+func (d *decodedFrame) renderInto(dst *image.RGBA, cm *colorMap, wc, ww float64) {
 	if d.gray == nil {
 		return
+	}
+	if cm == nil {
+		cm = &grayscaleMap
 	}
 	if ww < 1 {
 		ww = 1
@@ -548,14 +553,20 @@ func (d *decodedFrame) renderInto(dst *image.Gray, wc, ww float64) {
 	lower := wc - ww/2
 	inv := d.invert
 	// Divide by ww before scaling to 255 (rather than premultiplying 255/ww) so
-	// that a pixel exactly at the top of the window maps to 255, not 254.
-	// dst.Stride == cols for a cols×rows Gray image, so Pix[i] == pixel i.
+	// that a pixel exactly at the top of the window maps to 255, not 254. The
+	// windowed intensity indexes the colour map. dst.Stride == 4*cols for a
+	// cols×rows RGBA image, so pixel i starts at Pix[i*4].
 	for i, v := range d.gray {
-		out := clampToUint8((float64(v) - lower) / ww * 255)
+		idx := clampToUint8((float64(v) - lower) / ww * 255)
 		if inv {
-			out = 255 - out
+			idx = 255 - idx
 		}
-		dst.Pix[i] = out
+		c := cm.lut[idx]
+		j := i * 4
+		dst.Pix[j] = c[0]
+		dst.Pix[j+1] = c[1]
+		dst.Pix[j+2] = c[2]
+		dst.Pix[j+3] = 255
 	}
 }
 
@@ -705,12 +716,13 @@ var genericPresets = []wlPreset{
 }
 
 // presetsForModality returns the W/L preset list appropriate for a DICOM
-// Modality code (CT, PT = PET, MR), falling back to a generic set.
+// Modality code (CT, PT = PET, NM = SPECT, MR), falling back to a generic set.
 func presetsForModality(mod string) []wlPreset {
 	switch strings.ToUpper(strings.TrimSpace(mod)) {
 	case "CT":
 		return ctPresets
-	case "PT":
+	case "PT", "NM":
+		// PET and SPECT/NM share the same fraction-of-peak brightness windows.
 		return petPresets
 	case "MR":
 		return mrPresets
@@ -871,11 +883,14 @@ func loadDicomImage(path string) (viewerState, error) {
 		return viewerState{}, err
 	}
 
-	img := df.render(df.wc, df.ww)
-	b := img.Bounds()
-	label := fmt.Sprintf("%d × %d", b.Dx(), b.Dy())
 	ann := extractAnnotationsFromDataset(ds)
 	df.modality = ann.modality
+
+	// Render the still image (thumbnails, initial view) through the modality's
+	// default colour map so NM/PET overviews appear in colour like the viewer.
+	img := df.render(colorMapByName(defaultColorMapForModality(df.modality)), df.wc, df.ww)
+	b := img.Bounds()
+	label := fmt.Sprintf("%d × %d", b.Dx(), b.Dy())
 	if df.windowable() {
 		label += fmt.Sprintf("   W:%.0f  L:%.0f", df.ww, df.wc)
 		ann.windowStr = fmt.Sprintf("W: %.0f  L: %.0f", df.ww, df.wc)
@@ -1240,11 +1255,12 @@ type imageViewport struct {
 	img     *canvas.Image
 	overlay *fyne.Container
 
-	frame *decodedFrame
-	base  image.Image // frame rendered at current wc/ww (full frame, pre-crop)
-	buf   *image.Gray // reused windowing buffer for grayscale frames (flicker-free drag)
-	wc    float64
-	ww    float64
+	frame  *decodedFrame
+	base   image.Image // frame rendered at current wc/ww/map (full frame, pre-crop)
+	buf    *image.RGBA // reused windowing buffer for grayscale frames (flicker-free drag)
+	curMap *colorMap   // active colour map applied to grayscale frames
+	wc     float64
+	ww     float64
 
 	zoom         float64 // 1 = fit; >1 = magnified
 	panCX, panCY float64 // crop centre in source-pixel coordinates
@@ -1277,6 +1293,7 @@ func newImageViewport() *imageViewport {
 		img:    canvas.NewImageFromImage(image.NewGray(image.Rect(0, 0, 1, 1))),
 		zoom:   1,
 		wlSens: 1,
+		curMap: &grayscaleMap,
 	}
 	v.img.FillMode = canvas.ImageFillContain
 	// Scale on the GPU (linear). The default ImageScaleSmooth re-runs a CPU
@@ -1337,14 +1354,25 @@ func (v *imageViewport) renderBase(wc, ww float64) {
 		return
 	}
 	if !df.windowable() {
-		v.base = df.render(wc, ww) // colour frame: render returns colorImg
+		v.base = df.render(v.curMap, wc, ww) // colour frame: render returns colorImg
 		return
 	}
 	if v.buf == nil || v.buf.Rect.Dx() != df.cols || v.buf.Rect.Dy() != df.rows {
-		v.buf = image.NewGray(image.Rect(0, 0, df.cols, df.rows))
+		v.buf = image.NewRGBA(image.Rect(0, 0, df.cols, df.rows))
 	}
-	df.renderInto(v.buf, wc, ww)
+	df.renderInto(v.buf, v.curMap, wc, ww)
 	v.base = v.buf
+}
+
+// setColorMap changes the active colour map and re-renders the current frame
+// (no file re-read). For already-colour frames the map has no effect.
+func (v *imageViewport) setColorMap(cm *colorMap) {
+	v.curMap = cm
+	if v.frame == nil {
+		return
+	}
+	v.renderBase(v.wc, v.ww)
+	v.applyDisplay()
 }
 
 // reWindow re-renders at a new window and rebuilds the annotation overlay. Used
@@ -1571,6 +1599,21 @@ func openViewerWindow(a fyne.App, title string, paths []string, collectErr error
 		presetSelect := widget.NewSelect(presetNames(presetList), nil)
 		presetSelect.Selected = "Default"
 
+		// Colour map state. The default map is chosen from the frame's modality
+		// on first load (Hot Iron for PET/NM, Grayscale otherwise) and persists
+		// across slices until the user picks another from the dropdown.
+		curMapName := "Grayscale"
+		var colorMuting bool
+		colorSelect := widget.NewSelect(colorMapNames(), nil)
+		colorSelect.Selected = curMapName
+		colorSelect.OnChanged = func(name string) {
+			if colorMuting {
+				return
+			}
+			curMapName = name
+			viewport.setColorMap(colorMapByName(name))
+		}
+
 		setInfo := func(df *decodedFrame, wc, ww float64) {
 			if df.windowable() {
 				infoLabel.SetText(fmt.Sprintf("%d × %d   W:%.0f  L:%.0f", df.cols, df.rows, ww, wc))
@@ -1605,8 +1648,8 @@ func openViewerWindow(a fyne.App, title string, paths []string, collectErr error
 						counterLbl.SetText(fmt.Sprintf("%d / %d", idx+1, total))
 						return
 					}
-					// Pick the modality-appropriate preset set on the first frame
-					// (and on the rare chance the modality changes mid-series).
+					// Pick the modality-appropriate preset set and colour map on the
+					// first frame (and on the rare chance the modality changes mid-series).
 					if st.frame.modality != currentModality {
 						currentModality = st.frame.modality
 						presetList = presetsForModality(currentModality)
@@ -1617,6 +1660,12 @@ func openViewerWindow(a fyne.App, title string, paths []string, collectErr error
 						presetMuting = false
 						presetName = "Default"
 						userAdjusted = false
+
+						curMapName = defaultColorMapForModality(currentModality)
+						colorMuting = true
+						colorSelect.SetSelected(curMapName)
+						colorMuting = false
+						viewport.curMap = colorMapByName(curMapName) // used by setContent below
 					}
 					wc, ww := targetWindow(st.frame)
 					curWC, curWW = wc, ww
@@ -1624,8 +1673,10 @@ func openViewerWindow(a fyne.App, title string, paths []string, collectErr error
 					setInfo(st.frame, wc, ww)
 					if st.frame.windowable() {
 						presetSelect.Enable()
+						colorSelect.Enable()
 					} else {
 						presetSelect.Disable()
+						colorSelect.Disable()
 					}
 					counterLbl.SetText(fmt.Sprintf("%d / %d", idx+1, total))
 				})
@@ -1711,7 +1762,9 @@ func openViewerWindow(a fyne.App, title string, paths []string, collectErr error
 		})
 
 		controls := container.NewHBox(
-			widget.NewLabel("Window:"), presetSelect, annCheck, resetBtn,
+			widget.NewLabel("Window:"), presetSelect,
+			widget.NewLabel("Colour:"), colorSelect,
+			annCheck, resetBtn,
 		)
 		bottom := container.NewVBox(
 			container.NewCenter(counterLbl),

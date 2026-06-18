@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.4.0] — 2026-06-18
+
+### Added
+
+- **Colour maps for nuclear-medicine studies** — the image viewer can apply a colour lookup table to grayscale images, so PET and SPECT/NM uptake can be read in pseudo-colour rather than grayscale:
+  - A **Colour dropdown** in the viewer bottom bar offers six DICOM-standard palettes: **Grayscale**, **Inverse Grayscale**, **Hot Iron**, **PET**, **Hot Metal Blue**, and **PET 20 Step**
+  - PET (`PT`) and nuclear-medicine (`NM`) studies default to **Hot Iron** automatically; all other modalities default to Grayscale
+  - The colour map composes with window/level and persists as you scroll through a series; the **study overview thumbnails** use the same default map so the overview matches the viewer
+  - The dropdown is disabled for images already stored in colour
+- **SPECT/NM window presets** — `NM` studies now receive the same fraction-of-peak window presets as PET
+
+### Internal
+
+- `colormap.go` — `colorMap` 256-entry RGB LUT type with built-in DICOM-standard palettes (piecewise-linear renditions), `colorMapByName`, and `defaultColorMapForModality`
+- `viewer.go` — `decodedFrame.render`/`renderInto` now produce `*image.RGBA` and apply the active colour map; the viewport carries a reusable RGBA buffer and `curMap`, and `setColorMap` re-renders without re-reading the file. RGBA buffers also upload to the GPU without per-refresh conversion
+- `viewer_test.go` — tests for LUT application, grayscale identity / inverse, map endpoints, name lookup fallback, modality default map, and PET 20 Step quantisation
+
+---
+
 ## [1.3.0] — 2026-06-18
 
 ### Added

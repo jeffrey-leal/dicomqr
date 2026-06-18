@@ -12,15 +12,24 @@ func newTestFrame(vals ...float32) *decodedFrame {
 	return &decodedFrame{rows: 1, cols: len(vals), gray: vals}
 }
 
+// grayOf returns the R channel of pixel i in an RGBA image (R==G==B for the
+// grayscale colour map).
+func grayOf(img *image.RGBA, i int) uint8 { return img.Pix[i*4] }
+
 func TestDecodedFrameRenderWindowMapping(t *testing.T) {
 	// Window centre 100, width 200 → maps [0,200] across [0,255].
 	df := newTestFrame(0, 100, 200, -50, 300)
-	img := df.render(100, 200).(*image.Gray)
+	img := df.render(&grayscaleMap, 100, 200).(*image.RGBA)
 
 	want := []uint8{0, 127, 255, 0, 255} // -50 clamps low, 300 clamps high
 	for i, w := range want {
-		if got := img.Pix[i]; got != w {
+		got := grayOf(img, i)
+		if got != w {
 			t.Errorf("pixel %d: got %d, want %d", i, got, w)
+		}
+		// Grayscale map: R==G==B, opaque alpha.
+		if img.Pix[i*4+1] != got || img.Pix[i*4+2] != got || img.Pix[i*4+3] != 255 {
+			t.Errorf("pixel %d not opaque grayscale: %v", i, img.Pix[i*4:i*4+4])
 		}
 	}
 }
@@ -28,14 +37,28 @@ func TestDecodedFrameRenderWindowMapping(t *testing.T) {
 func TestDecodedFrameRenderMonochrome1Inverts(t *testing.T) {
 	df := newTestFrame(0, 100, 200)
 	df.invert = true
-	img := df.render(100, 200).(*image.Gray)
+	img := df.render(&grayscaleMap, 100, 200).(*image.RGBA)
 
 	// Same window as above but inverted: 0→255, 127→128, 255→0.
 	want := []uint8{255, 128, 0}
 	for i, w := range want {
-		if got := img.Pix[i]; got != w {
+		if got := grayOf(img, i); got != w {
 			t.Errorf("pixel %d: got %d, want %d", i, got, w)
 		}
+	}
+}
+
+func TestDecodedFrameRenderAppliesColorMap(t *testing.T) {
+	// Two pixels at the window extremes: index 0 → first LUT entry, 255 → last.
+	df := newTestFrame(0, 200)
+	img := df.render(&hotIronMap, 100, 200).(*image.RGBA)
+
+	lo, hi := hotIronMap.lut[0], hotIronMap.lut[255]
+	if got := [3]uint8{img.Pix[0], img.Pix[1], img.Pix[2]}; got != lo {
+		t.Errorf("low pixel: got %v, want LUT[0] %v", got, lo)
+	}
+	if got := [3]uint8{img.Pix[4], img.Pix[5], img.Pix[6]}; got != hi {
+		t.Errorf("high pixel: got %v, want LUT[255] %v", got, hi)
 	}
 }
 
@@ -45,7 +68,7 @@ func TestDecodedFrameRenderColorIgnoresWindow(t *testing.T) {
 	if df.windowable() {
 		t.Fatal("colour frame should not be windowable")
 	}
-	if got := df.render(9999, 1); got != image.Image(src) {
+	if got := df.render(&grayscaleMap, 9999, 1); got != image.Image(src) {
 		t.Error("render of a colour frame should return the original image unchanged")
 	}
 }
@@ -53,9 +76,9 @@ func TestDecodedFrameRenderColorIgnoresWindow(t *testing.T) {
 func TestDecodedFrameRenderZeroWidthDoesNotPanic(t *testing.T) {
 	df := newTestFrame(0, 50, 100)
 	// ww < 1 is clamped to 1 internally; just assert it produces a full image.
-	img := df.render(50, 0).(*image.Gray)
-	if len(img.Pix) != 3 {
-		t.Fatalf("expected 3 pixels, got %d", len(img.Pix))
+	img := df.render(&grayscaleMap, 50, 0).(*image.RGBA)
+	if len(img.Pix) != 3*4 {
+		t.Fatalf("expected 3 RGBA pixels, got %d bytes", len(img.Pix))
 	}
 }
 
@@ -202,5 +225,75 @@ func TestClampFloat(t *testing.T) {
 	}
 	if got := clampFloat(99, 1, 16); got != 16.0 {
 		t.Errorf("zoom ceil: got %v, want 16.0", got)
+	}
+}
+
+// ── colour maps ──────────────────────────────────────────────────────────────
+
+func TestGrayscaleMapIsIdentity(t *testing.T) {
+	for i := 0; i < 256; i++ {
+		c := grayscaleMap.lut[i]
+		if c[0] != uint8(i) || c[1] != uint8(i) || c[2] != uint8(i) {
+			t.Fatalf("grayscale[%d] = %v, want {%d,%d,%d}", i, c, i, i, i)
+		}
+	}
+}
+
+func TestInverseGrayMapIsInverted(t *testing.T) {
+	for i := 0; i < 256; i++ {
+		c := inverseGrayMap.lut[i]
+		w := uint8(255 - i)
+		if c[0] != w || c[1] != w || c[2] != w {
+			t.Fatalf("inverse[%d] = %v, want {%d,%d,%d}", i, c, w, w, w)
+		}
+	}
+}
+
+func TestColorMapEndpoints(t *testing.T) {
+	// Every continuous map starts at black and ends at white. (The quantised
+	// PET 20 Step samples band centres, so its endpoints are not pure black/white.)
+	for _, m := range []colorMap{hotIronMap, petMap, hotMetalBlueMap} {
+		if m.lut[0] != [3]uint8{0, 0, 0} {
+			t.Errorf("%s: lut[0] = %v, want black", m.name, m.lut[0])
+		}
+		if m.lut[255] != [3]uint8{255, 255, 255} {
+			t.Errorf("%s: lut[255] = %v, want white", m.name, m.lut[255])
+		}
+	}
+}
+
+func TestColorMapByNameFallsBackToGrayscale(t *testing.T) {
+	if colorMapByName("Hot Iron").name != "Hot Iron" {
+		t.Error("expected Hot Iron by name")
+	}
+	if colorMapByName("nonexistent").name != "Grayscale" {
+		t.Error("unknown map should fall back to Grayscale")
+	}
+}
+
+func TestDefaultColorMapForModality(t *testing.T) {
+	cases := map[string]string{
+		"PT": "Hot Iron",
+		"pt": "Hot Iron",
+		"NM": "Hot Iron",
+		"CT": "Grayscale",
+		"MR": "Grayscale",
+		"":   "Grayscale",
+	}
+	for mod, want := range cases {
+		if got := defaultColorMapForModality(mod); got != want {
+			t.Errorf("defaultColorMapForModality(%q) = %q, want %q", mod, got, want)
+		}
+	}
+}
+
+func TestPet20MapHasSteps(t *testing.T) {
+	// A quantised map must have far fewer distinct colours than a continuous one.
+	distinct := map[[3]uint8]bool{}
+	for i := 0; i < 256; i++ {
+		distinct[pet20Map.lut[i]] = true
+	}
+	if len(distinct) > 20 {
+		t.Errorf("PET 20 Step has %d distinct colours, want <= 20", len(distinct))
 	}
 }
