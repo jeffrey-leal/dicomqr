@@ -6,6 +6,12 @@ A Fyne-based Windows GUI application for querying and retrieving DICOM files fro
 
 Requires CGO and the mingw64 GCC toolchain. **Must be built from an MSYS2 MinGW64 terminal.**
 
+JPEG 2000 decoding (`-tags openjpeg`) requires the OpenJPEG library, installed once with:
+```bash
+pacman -S --needed mingw-w64-x86_64-openjpeg2
+```
+Release builds enable the `openjpeg` tag (libopenjp2 is statically linked — single self-contained exe). Omitting the tag still builds; JPEG 2000 files then report "support not built in" and suggest the external viewer.
+
 Open MSYS2 MinGW64, then:
 
 ```bash
@@ -16,13 +22,13 @@ cd /c/Users/jeffr/source/repos/dicomqr
 Release build:
 ```bash
 CGO_ENABLED=1 CC=/c/msys64/mingw64/bin/gcc.exe GOAMD64=v3 \
-  go build -ldflags="-s -w -H windowsgui -X main.buildDate=$(date +%Y-%m-%d)" -o dicomqr.exe .
+  go build -tags openjpeg -ldflags="-s -w -H windowsgui -X main.buildDate=$(date +%Y-%m-%d)" -o dicomqr.exe .
 ```
 
 Development build (with debug info):
 ```bash
 CGO_ENABLED=1 CC=/c/msys64/mingw64/bin/gcc.exe \
-  go build -ldflags="-X main.buildDate=$(date +%Y-%m-%d)" -o dicomqr.exe .
+  go build -tags openjpeg -ldflags="-X main.buildDate=$(date +%Y-%m-%d)" -o dicomqr.exe .
 ```
 
 ## Project structure
@@ -38,6 +44,9 @@ CGO_ENABLED=1 CC=/c/msys64/mingw64/bin/gcc.exe \
 | `importtab.go` | Import tab — scan external folder and copy selected files into the download folder |
 | `worklist.go` | Worklist tab — Modality Worklist C-FIND with independent server selector |
 | `viewer.go` | Internal image viewer, study overview grid, DICOM annotation overlay, thumbnail widget |
+| `colormap.go` | Colour lookup tables (DICOM-standard palettes) for PET/SPECT pseudo-colour |
+| `jpeg2000_openjpeg.go` | CGO JPEG 2000 decoder via OpenJPEG (`//go:build openjpeg`) |
+| `jpeg2000_stub.go` | Fallback when built without the `openjpeg` tag |
 | `logcapture.go` | In-memory log ring buffer and Activity Log dialog |
 | `settings.go` | `Settings` struct, load/save, embedded defaults |
 | `serverprofile.go` | `ServerProfile` struct for saved server connections |

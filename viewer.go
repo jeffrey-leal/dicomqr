@@ -484,13 +484,15 @@ func formatDicomTime(s string) string {
 // encapsulated frames to jpeg.Decode regardless of transfer syntax, so any
 // format other than JPEG Baseline (1.2.840.10008.1.2.4.50) and JPEG Extended
 // (1.2.840.10008.1.2.4.51) fails with a misleading JPEG decode error.
+// unsupportedTransferSyntaxNames lists encapsulated transfer syntaxes the
+// built-in viewer cannot decode. JPEG 2000 (…4.90/…4.91) is intentionally absent
+// — it is handled by decodeJPEG2000Frame when built with the openjpeg tag, and
+// otherwise reports its own "not built in" message.
 var unsupportedTransferSyntaxNames = map[string]string{
 	"1.2.840.10008.1.2.4.57": "JPEG Lossless Non-Hierarchical",
 	"1.2.840.10008.1.2.4.70": "JPEG Lossless (Process 14, SV1)",
 	"1.2.840.10008.1.2.4.80": "JPEG-LS Lossless",
 	"1.2.840.10008.1.2.4.81": "JPEG-LS Near-Lossless",
-	"1.2.840.10008.1.2.4.90": "JPEG 2000 Lossless",
-	"1.2.840.10008.1.2.4.91": "JPEG 2000",
 	"1.2.840.10008.1.2.5":    "RLE Lossless",
 }
 
@@ -841,16 +843,18 @@ func loadDicomImage(path string) (viewerState, error) {
 		return viewerState{}, errors.New("no pixel data in file")
 	}
 
-	// Detect encapsulated transfer syntaxes the built-in viewer cannot decode
-	// before calling renderDicomFrame, so the user gets a clear message instead
-	// of a raw "missing SOI marker" JPEG error from the underlying library.
+	transferSyntax := ""
 	if e, err2 := ds.FindElementByTag(tag.TransferSyntaxUID); err2 == nil {
 		if strs := sdicom.MustGetStrings(e.Value); len(strs) > 0 {
-			if name, unsup := unsupportedTransferSyntaxNames[strings.TrimSpace(strs[0])]; unsup {
-				return viewerState{}, fmt.Errorf(
-					"%s compressed images cannot be decoded by the built-in viewer\n\nUse Open in Viewer to open this file in an external DICOM viewer.", name)
-			}
+			transferSyntax = strings.TrimSpace(strs[0])
 		}
+	}
+	// Reject encapsulated transfer syntaxes the built-in viewer cannot decode
+	// (JPEG-LS, RLE, lossless JPEG) up front with a clear message instead of a
+	// raw decode error. JPEG 2000 is handled by decodeFrame and is not listed.
+	if name, unsup := unsupportedTransferSyntaxNames[transferSyntax]; unsup {
+		return viewerState{}, fmt.Errorf(
+			"%s compressed images cannot be decoded by the built-in viewer\n\nUse Open in Viewer to open this file in an external DICOM viewer.", name)
 	}
 
 	wc, ww, hasWindow := dicomWindowParams(ds)
@@ -867,12 +871,13 @@ func loadDicomImage(path string) (viewerState, error) {
 		samplesPerPixel = 1
 	}
 
-	df, err := decodeFrame(frames[0], hasWindow, wc, ww, slope, intercept, isSigned, bitsAlloc, photometric)
+	df, err := decodeFrame(frames[0], transferSyntax, hasWindow, wc, ww, slope, intercept, isSigned, bitsAlloc, photometric)
 
 	// Fallback: some DICOM implementations store uncompressed pixel data with
 	// an undefined-length VL, which the library mistakes for encapsulated (JPEG)
-	// data. When jpeg.Decode fails, re-interpret the raw bytes natively.
-	if err != nil && frames[0].IsEncapsulated() && rows > 0 && cols > 0 {
+	// data. When jpeg.Decode fails, re-interpret the raw bytes natively. This
+	// never applies to JPEG 2000, whose bytes are a genuine codestream.
+	if err != nil && frames[0].IsEncapsulated() && rows > 0 && cols > 0 && !isJPEG2000TransferSyntax(transferSyntax) {
 		df, err = decodeRawPixelFallback(
 			frames[0].EncapsulatedData.Data,
 			rows, cols, samplesPerPixel, bitsAlloc,
@@ -972,13 +977,31 @@ func dicomPhotometricInterp(ds sdicom.Dataset) string {
 	return strings.TrimSpace(strs[0])
 }
 
+// jpeg2000TransferSyntaxes are the DICOM JPEG 2000 transfer syntax UIDs
+// (lossless-only and the general JPEG 2000 compression).
+var jpeg2000TransferSyntaxes = map[string]bool{
+	"1.2.840.10008.1.2.4.90": true, // JPEG 2000 Image Compression (Lossless Only)
+	"1.2.840.10008.1.2.4.91": true, // JPEG 2000 Image Compression
+}
+
+func isJPEG2000TransferSyntax(ts string) bool {
+	return jpeg2000TransferSyntaxes[strings.TrimSpace(ts)]
+}
+
 // decodeFrame converts a parsed DICOM frame into a decodedFrame. Grayscale
 // pixels are rescaled (slope/intercept) into a float buffer once so the viewer
 // can re-window them cheaply; colour frames are rendered directly and are not
 // windowable. The default window comes from DICOM Window tags when present,
 // otherwise from the 1st–99th percentile of the rescaled values.
-func decodeFrame(f *frame.Frame, hasWindow bool, wc, ww, slope, intercept float64, isSigned bool, bitsAlloc int, photometric string) (*decodedFrame, error) {
+//
+// transferSyntax selects the decode path for encapsulated frames: JPEG 2000 is
+// handled by the OpenJPEG-backed decoder (decodeJPEG2000Frame); other
+// encapsulated syntaxes fall through to the library's JPEG Baseline decoder.
+func decodeFrame(f *frame.Frame, transferSyntax string, hasWindow bool, wc, ww, slope, intercept float64, isSigned bool, bitsAlloc int, photometric string) (*decodedFrame, error) {
 	if f.IsEncapsulated() {
+		if isJPEG2000TransferSyntax(transferSyntax) {
+			return decodeJPEG2000Frame(f.EncapsulatedData.Data, slope, intercept, hasWindow, wc, ww, photometric)
+		}
 		img, err := f.GetImage()
 		if err != nil {
 			return nil, fmt.Errorf("cannot decode compressed pixel data (%w)\n\nUse Open in Viewer to open this file in an external DICOM viewer.", err)

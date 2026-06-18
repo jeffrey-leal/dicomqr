@@ -499,7 +499,7 @@ const stylesXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 
 func buildContent(d Formatter) {
 
-	d.Cover("dicomqr", "User Manual  v1.4.0",
+	d.Cover("dicomqr", "User Manual  v1.5.0",
 		time.Now().Format("January 2, 2006"),
 		"A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.")
 
@@ -514,7 +514,7 @@ func buildContent(d Formatter) {
 	d.Bullet("Automatically organise downloaded files by patient, study, and series")
 	d.Bullet("Query a Modality Worklist server independently of the active PACS connection")
 	d.Bullet("Browse local DICOM files in the download folder; push them to any PACS via C-STORE or delete them")
-	d.Bullet("Preview DICOM images in the built-in viewer with interactive window/level, zoom and pan, modality-specific W/L presets, colour maps for PET/SPECT, DICOM annotation overlays, and study overview grids")
+	d.Bullet("Preview DICOM images in the built-in viewer with interactive window/level, zoom and pan, modality-specific W/L presets, colour maps for PET/SPECT, DICOM annotation overlays, and study overview grids; decodes JPEG Baseline, JPEG 2000, and uncompressed pixel data")
 	d.Bullet("Import DICOM files from external folders into the organised download folder")
 	d.Bullet("Support for multiple saved server profiles with independent connection and retrieve settings")
 	d.Bullet("Optionally request uncompressed pixel data transfer per server profile, ensuring the built-in viewer can display all received images regardless of how the PACS stores them")
@@ -571,7 +571,7 @@ func buildContent(d Formatter) {
 		{"Info model", "The DICOM Query/Retrieve information model. `study` = Study Root (most common). `patient` = Patient Root. `patient-study-only` = legacy retired model used by some older systems; SERIES-level queries are not available with this model."},
 		{"Retrieve method", "C-MOVE (default) instructs the PACS to push files to the local C-STORE SCP listener. C-GET requests that the PACS return files over the same association — no inbound port or PACS-side destination registration is required. Auto tries C-GET first and falls back to C-MOVE if the PACS rejects it."},
 		{"Connect timeout", "Seconds to wait for the initial C-ECHO before reporting a failure. Default: 10 s."},
-		{"Transfer", "When 'Request uncompressed transfer syntax only' is ticked, dicomqr restricts its A-ASSOCIATE negotiation to Explicit VR Little Endian and Implicit VR Little Endian only. A conformant PACS must transcode compressed pixel data before sending. Useful when the PACS stores data in JPEG 2000 or JPEG-LS format that the built-in viewer cannot decode. Leave unticked unless needed — some PACS systems cannot transcode and will fail the transfer."},
+		{"Transfer", "When 'Request uncompressed transfer syntax only' is ticked, dicomqr restricts its A-ASSOCIATE negotiation to Explicit VR Little Endian and Implicit VR Little Endian only. A conformant PACS must transcode compressed pixel data before sending. Useful when the PACS stores data in a format the built-in viewer cannot decode (e.g. JPEG-LS). Leave unticked unless needed — some PACS systems cannot transcode and will fail the transfer."},
 	})
 	d.P("The first profile in the list is selected by default when the application starts.")
 
@@ -745,7 +745,7 @@ func buildContent(d Formatter) {
 		{"R", "Reset the window to the default (clears any preset or manual adjustment)."},
 	})
 	d.P("The Reset button resets both the view (zoom/pan) and the window to the default. Window/level changes made by dragging or by selecting a preset persist as you scroll through the series.")
-	d.P("Compressed pixel data — the built-in viewer decodes JPEG Baseline and uncompressed (native) pixel data. Files stored in JPEG 2000, JPEG-LS, JPEG Lossless, or RLE Lossless formats cannot be decoded and display a message explaining the limitation with a suggestion to use Open in Viewer. To avoid this, enable 'Request uncompressed transfer syntax only' in the server profile before retrieving (see Section 4.1).")
+	d.P("Compressed pixel data — the built-in viewer decodes JPEG Baseline, JPEG 2000 (lossless and lossy), and uncompressed (native) pixel data. Files stored in JPEG-LS, JPEG Lossless, or RLE Lossless formats cannot be decoded and display a message suggesting Open in Viewer; to view those, either use an external viewer or enable 'Request uncompressed transfer syntax only' in the server profile before retrieving (see Section 4.1).")
 
 	d.H3("8.3.2  Window/Level Presets")
 	d.P("The Window dropdown in the viewer bottom bar offers preset windows tailored to the image's modality. Selecting a preset applies it to the current slice and to subsequent slices until you adjust the window manually. Default restores the image's own window (from the DICOM Window tags, or an automatic 1st–99th percentile window when absent); Full range maps the entire pixel value range.")
@@ -943,7 +943,7 @@ func buildContent(d Formatter) {
 	d.P("The status bar at the bottom of the window provides real-time feedback. A coloured LED indicator (gray / amber / green) precedes the status text.")
 	d.Table([]Row{
 		{"Situation", "Status bar text"},
-		{"Application started, not connected", "`v1.4.0`"},
+		{"Application started, not connected", "`v1.5.0`"},
 		{"Connecting to server", "`Connecting…`"},
 		{"Connected", "`Connected: <AE>@<host>:<port>`"},
 		{"Connection cancelled", "`Connection cancelled`"},
@@ -1011,7 +1011,7 @@ func buildContent(d Formatter) {
 	d.P("Windows Firewall — An inbound rule permitting TCP connections on the SCP port (default 11112) is required.")
 	d.P("Information model — If queries return no results, try changing the Info model in the server profile. Some PACS require Study Root, others Patient Root. A small number of legacy systems require the Patient/Study Only model (patient-study-only).")
 	d.P("Worklist server — The Modality Worklist SOP class is typically served by a RIS or dedicated MWL broker, not the PACS itself. Create a separate server profile pointing to that system and select it in the Worklist tab.")
-	d.P("Compressed pixel data — if the PACS stores images in JPEG 2000, JPEG-LS, or other compressed formats that the built-in viewer cannot decode, enable 'Request uncompressed transfer syntax only' in the server profile. The PACS will transcode on the fly if it supports transcoding. If the PACS does not support transcoding, the transfer will fail for those SOP classes; use the external viewer integration instead.")
+	d.P("Compressed pixel data — the built-in viewer decodes JPEG Baseline and JPEG 2000. If the PACS stores images in JPEG-LS or another compressed format the viewer cannot decode, enable 'Request uncompressed transfer syntax only' in the server profile. The PACS will transcode on the fly if it supports transcoding. If the PACS does not support transcoding, the transfer will fail for those SOP classes; use the external viewer integration instead.")
 	d.P("IPv4 connectivity — dicomqr listens on an IPv4 socket only. Ensure the address shown in Help > Client info… is the correct IPv4 address on the same network as the PACS.")
 
 	// Appendix C

@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.5.0] — 2026-06-18
+
+### Added
+
+- **JPEG 2000 decoding in the built-in viewer** — DICOM images stored with the JPEG 2000 transfer syntaxes (lossless `1.2.840.10008.1.2.4.90` and lossy `…4.91`) now decode and display directly, including local files in Local Browse and Import. Monochrome J2K flows through the normal window/level pipeline (so presets and colour maps apply); colour J2K renders as RGB. Decoding is backed by the OpenJPEG library, statically linked so the executable stays self-contained
+- Release and development build scripts (`build-release.sh`, `build-debug.sh`) and the CLAUDE.md build commands now enable the `openjpeg` build tag
+
+### Changed
+
+- JPEG 2000 is no longer listed among the "cannot be decoded" transfer syntaxes; the viewer's compressed-pixel-data notes and the user manual are updated accordingly
+
+### Internal
+
+- `jpeg2000_openjpeg.go` (`//go:build openjpeg`) — CGO wrapper around OpenJPEG (`libopenjp2`): decodes a J2K/JP2 codestream from memory via custom `opj_stream` read/skip/seek callbacks, returning planar `int32` samples; statically linked with `-DOPJ_STATIC -l:libopenjp2.a` (no DLL dependency, ~0.5 MB larger exe)
+- `jpeg2000_stub.go` (`//go:build !openjpeg`) — fallback so the default build compiles without OpenJPEG; J2K files then report "support not built in"
+- `decodeFrame` now takes the Transfer Syntax UID and routes JPEG 2000 to `decodeJPEG2000Frame`; the raw-pixel fallback is guarded against J2K codestreams; J2K removed from `unsupportedTransferSyntaxNames`
+- Requires the MSYS2 package `mingw-w64-x86_64-openjpeg2`. `testdata/ramp8.j2k` is a lossless fixture (built with `opj_compress`) decoded by the tag-gated unit tests asserting exact pixel values
+
+---
+
 ## [1.4.0] — 2026-06-18
 
 ### Added

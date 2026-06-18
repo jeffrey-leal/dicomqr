@@ -287,6 +287,21 @@ func TestDefaultColorMapForModality(t *testing.T) {
 	}
 }
 
+func TestIsJPEG2000TransferSyntax(t *testing.T) {
+	yes := []string{"1.2.840.10008.1.2.4.90", "1.2.840.10008.1.2.4.91", " 1.2.840.10008.1.2.4.90 "}
+	for _, ts := range yes {
+		if !isJPEG2000TransferSyntax(ts) {
+			t.Errorf("isJPEG2000TransferSyntax(%q) = false, want true", ts)
+		}
+	}
+	no := []string{"1.2.840.10008.1.2.4.50", "1.2.840.10008.1.2.4.80", "1.2.840.10008.1.2.1", ""}
+	for _, ts := range no {
+		if isJPEG2000TransferSyntax(ts) {
+			t.Errorf("isJPEG2000TransferSyntax(%q) = true, want false", ts)
+		}
+	}
+}
+
 func TestPet20MapHasSteps(t *testing.T) {
 	// A quantised map must have far fewer distinct colours than a continuous one.
 	distinct := map[[3]uint8]bool{}
