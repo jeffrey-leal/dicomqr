@@ -410,7 +410,7 @@ Some images — particularly CT and MR "protocol" series — contain one or more
 
 When overlay planes are present, dicomqr composites them onto the image in opaque yellow after applying window/level, so they remain visible at any W/L setting. Multiple overlay planes are all composited in the same pass.
 
-The **Overlays** checkbox in the viewer bottom bar toggles this compositing on and off. The checkbox is hidden for series that contain no overlay planes and appears automatically on the first frame in which overlays are detected. The toggle state persists between sessions.
+The Overlays checkbox in the viewer bottom bar toggles this compositing on and off. The checkbox is hidden for series that contain no overlay planes and appears automatically on the first frame in which overlays are detected. The toggle state persists between sessions.
 
 Note: the obsolete encoding in which overlay bits are packed inside unused bits of the pixel data words (OverlayBitPosition > 0, retired in the DICOM 2004 edition) is not supported and is silently skipped.
 
@@ -421,10 +421,9 @@ Series whose modality is SR (Structured Report), KO (Key Object Selection), AU (
 
 The document viewer window has three areas:
 
-- **Header** — patient name, MRN, date of birth, sex and age; study date, accession number and description; modality, series information, content date/time, and the DICOM completion and verification status flags (e.g. COMPLETE · VERIFIED)
-- **Body** — the SR Content Sequence rendered as scrollable formatted text. CONTAINER items appear as section headings; leaf items appear as labelled value pairs. Supported value types: TEXT, NUM (with measurement units), CODE, DATE, TIME, PNAME, UIDREF, IMAGE (shown as a UID reference), and nested CONTAINERs
-- **Footer** — Prev / Next buttons to step through multi-file series; a counter showing the current document position; a Copy text button that places a plain-text version of the document body on the clipboard
-
+- Header — patient name, MRN, date of birth, sex and age; study date, accession number and description; modality, series information, content date/time, and the DICOM completion and verification status flags (e.g. COMPLETE · VERIFIED)
+- Body — the SR Content Sequence rendered as scrollable formatted text. CONTAINER items appear as section headings; leaf items appear as labelled value pairs. Supported value types: TEXT, NUM (with measurement units), CODE, DATE, TIME, PNAME, UIDREF, IMAGE (shown as a UID reference), and nested CONTAINERs
+- Footer — Prev / Next buttons to step through multi-file series; a counter showing the current document position; a Copy text button that places a plain-text version of the document body on the clipboard
 The viewer opens at document 1 of the series and loads subsequent documents in the background as you navigate.
 
 
@@ -640,7 +639,7 @@ The status bar at the bottom of the window provides real-time feedback. A colour
 
 | Situation | Status bar text |
 |---|---|
-| Application started, not connected | `v1.5.0` |
+| Application started, not connected | `v1.6.0` |
 | Connecting to server | `Connecting…` |
 | Connected | `Connected: <AE>@<host>:<port>` |
 | Connection cancelled | `Connection cancelled` |
@@ -703,7 +702,7 @@ Each entry in the `profiles` array:
 | `connectTimeout` | Connection timeout in seconds. 0 uses the default (10 s). |
 | `transferUncompressed` | When true, the A-ASSOCIATE negotiation for C-GET and C-MOVE offers only uncompressed transfer syntaxes. Default: false. |
 
-The Annotations overlay toggle is stored in the application's Fyne preferences (not in settings.json) and persists automatically between sessions.
+The Annotations and Overlays toggles are stored in the application's Fyne preferences (not in settings.json) and persist automatically between sessions.
 
 
 ---

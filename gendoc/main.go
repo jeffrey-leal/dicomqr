@@ -499,7 +499,7 @@ const stylesXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 
 func buildContent(d Formatter) {
 
-	d.Cover("dicomqr", "User Manual  v1.5.0",
+	d.Cover("dicomqr", "User Manual  v1.6.0",
 		time.Now().Format("January 2, 2006"),
 		"A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.")
 
@@ -514,7 +514,8 @@ func buildContent(d Formatter) {
 	d.Bullet("Automatically organise downloaded files by patient, study, and series")
 	d.Bullet("Query a Modality Worklist server independently of the active PACS connection")
 	d.Bullet("Browse local DICOM files in the download folder; push them to any PACS via C-STORE or delete them")
-	d.Bullet("Preview DICOM images in the built-in viewer with interactive window/level, zoom and pan, modality-specific W/L presets, colour maps for PET/SPECT, DICOM annotation overlays, and study overview grids; decodes JPEG Baseline, JPEG 2000, and uncompressed pixel data")
+	d.Bullet("Preview DICOM images in the built-in viewer with interactive window/level, zoom and pan, modality-specific W/L presets, colour maps for PET/SPECT, DICOM annotation overlays, DICOM overlay plane compositing, and study overview grids; decodes JPEG Baseline, JPEG 2000, and uncompressed pixel data")
+	d.Bullet("View Structured Reports (SR), Key Object Selections (KO), and other non-image DICOM objects in a dedicated scrollable document viewer that renders the SR Content Sequence as formatted text")
 	d.Bullet("Import DICOM files from external folders into the organised download folder")
 	d.Bullet("Support for multiple saved server profiles with independent connection and retrieve settings")
 	d.Bullet("Optionally request uncompressed pixel data transfer per server profile, ensuring the built-in viewer can display all received images regardless of how the PACS stores them")
@@ -725,7 +726,7 @@ func buildContent(d Formatter) {
 
 	d.H3("8.3.1  Series Viewer")
 	d.P("The series viewer displays one image at a time and opens at the middle slice. It supports interactive window/level, zoom and pan, and slice navigation by mouse or keyboard.")
-	d.P("The bottom bar contains an instance counter (e.g. `45 / 120`), a navigation slider, a Window preset dropdown (see Section 8.3.2), a Colour map dropdown (see Section 8.3.3), an Annotations checkbox (see Section 8.3.5), a Reset button, and an info label showing pixel dimensions and the current W/L values.")
+	d.P("The bottom bar contains an instance counter (e.g. `45 / 120`), a navigation slider, a Window preset dropdown (see Section 8.3.2), a Colour map dropdown (see Section 8.3.3), an Annotations checkbox (see Section 8.3.5), an Overlays checkbox (see Section 8.3.6, shown only when overlay planes are present), a Reset button, and an info label showing pixel dimensions and the current W/L values.")
 	d.P("Mouse controls:")
 	d.Table([]Row{
 		{"Action", "Effect"},
@@ -785,6 +786,20 @@ func buildContent(d Formatter) {
 	})
 	d.P("Anatomical orientation markers (R/L, A/P, H/F) are centred on the four image edges and derived from the ImageOrientationPatient direction cosines in DICOM LPS patient coordinates.")
 	d.P("The Annotations checkbox state persists between sessions.")
+
+	d.H3("8.3.6  DICOM Overlay Planes")
+	d.P("Some images — particularly CT and MR \"protocol\" series — contain one or more 1-bit bitmap overlay planes embedded in the DICOM file alongside the pixel data (groups 6000–60FE). These planes carry annotations such as scan limits, region-of-interest boundaries, or facility branding burned in at the modality.")
+	d.P("When overlay planes are present, dicomqr composites them onto the image in opaque yellow after applying window/level, so they remain visible at any W/L setting. Multiple overlay planes are all composited in the same pass.")
+	d.P("The Overlays checkbox in the viewer bottom bar toggles this compositing on and off. The checkbox is hidden for series that contain no overlay planes and appears automatically on the first frame in which overlays are detected. The toggle state persists between sessions.")
+	d.P("Note: the obsolete encoding in which overlay bits are packed inside unused bits of the pixel data words (OverlayBitPosition > 0, retired in the DICOM 2004 edition) is not supported and is silently skipped.")
+
+	d.H3("8.3.7  Structured Report Viewer")
+	d.P("Series whose modality is SR (Structured Report), KO (Key Object Selection), AU (Audio), or PR (Presentation State) contain no pixel data and are automatically opened in the document viewer instead of the image viewer.")
+	d.P("The document viewer window has three areas:")
+	d.Bullet("Header — patient name, MRN, date of birth, sex and age; study date, accession number and description; modality, series information, content date/time, and the DICOM completion and verification status flags (e.g. COMPLETE · VERIFIED)")
+	d.Bullet("Body — the SR Content Sequence rendered as scrollable formatted text. CONTAINER items appear as section headings; leaf items appear as labelled value pairs. Supported value types: TEXT, NUM (with measurement units), CODE, DATE, TIME, PNAME, UIDREF, IMAGE (shown as a UID reference), and nested CONTAINERs")
+	d.Bullet("Footer — Prev / Next buttons to step through multi-file series; a counter showing the current document position; a Copy text button that places a plain-text version of the document body on the clipboard")
+	d.P("The viewer opens at document 1 of the series and loads subsequent documents in the background as you navigate.")
 
 	d.H2("8.4  Opening in External Viewer")
 	d.P("The Open in Viewer button in the bottom bar and the right-click menu item open the node's folder in the configured external DICOM viewer. These controls are disabled when no viewer path is configured in Preferences. Open folder opens the folder in Windows Explorer instead.")
@@ -943,7 +958,7 @@ func buildContent(d Formatter) {
 	d.P("The status bar at the bottom of the window provides real-time feedback. A coloured LED indicator (gray / amber / green) precedes the status text.")
 	d.Table([]Row{
 		{"Situation", "Status bar text"},
-		{"Application started, not connected", "`v1.5.0`"},
+		{"Application started, not connected", "`v1.6.0`"},
 		{"Connecting to server", "`Connecting…`"},
 		{"Connected", "`Connected: <AE>@<host>:<port>`"},
 		{"Connection cancelled", "`Connection cancelled`"},
@@ -1001,7 +1016,7 @@ func buildContent(d Formatter) {
 		{"`connectTimeout`", "Connection timeout in seconds. 0 uses the default (10 s)."},
 		{"`transferUncompressed`", "When true, the A-ASSOCIATE negotiation for C-GET and C-MOVE offers only uncompressed transfer syntaxes. Default: false."},
 	})
-	d.P("The Annotations overlay toggle is stored in the application's Fyne preferences (not in settings.json) and persists automatically between sessions.")
+	d.P("The Annotations and Overlays toggles are stored in the application's Fyne preferences (not in settings.json) and persist automatically between sessions.")
 
 	// Appendix B
 	d.PageBreak()
