@@ -27,7 +27,7 @@ import (
 	sqweekdialog "github.com/sqweek/dialog"
 )
 
-const version = "1.5.0"
+const version = "1.6.0"
 
 // LED colours for connection and SCP state indicators.
 var (
@@ -208,10 +208,26 @@ func main() {
 
 	setStatus := func(msg string) { fyne.Do(func() { statusLabel.SetText(msg) }) }
 
+	// clockDone is closed on every termination path so the clock goroutine
+	// stops calling fyne.Do before Fyne's event loop drains for the last time.
+	// Without this, the goroutine can race against Fyne's shutdown, post to the
+	// internal task queue after it has stopped being drained, and block—which
+	// prevents ShowAndRun from returning and leaves the process in Task Manager.
+	clockDone := make(chan struct{})
+	var clockOnce sync.Once
+	stopClock := func() { clockOnce.Do(func() { close(clockDone) }) }
+
 	go func() {
+		tick := time.NewTicker(time.Second)
+		defer tick.Stop()
 		for {
-			fyne.Do(func() { clockLabel.SetText(time.Now().Format("2006-01-02  15:04:05")) })
-			time.Sleep(time.Second)
+			select {
+			case <-clockDone:
+				return
+			case t := <-tick.C:
+				ts := t.Format("2006-01-02  15:04:05")
+				fyne.Do(func() { clockLabel.SetText(ts) })
+			}
 		}
 	}()
 
@@ -823,7 +839,9 @@ func main() {
 			return
 		}
 		go func() {
-			if err := cl.Echo(context.Background()); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := cl.Echo(ctx); err != nil {
 				setStatus("C-ECHO failed: " + err.Error())
 			} else {
 				setStatus("C-ECHO success")
@@ -1215,7 +1233,7 @@ func main() {
 			})
 		}),
 		fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Quit", func() { saveSettings(cfg); shutdownSCP(); a.Quit() }),
+		fyne.NewMenuItem("Quit", func() { saveSettings(cfg); stopClock(); shutdownSCP(); a.Quit() }),
 	)
 
 	queryMenu := fyne.NewMenu("Query",
@@ -1373,13 +1391,14 @@ func main() {
 			cfg.WindowHeight = sz.Height
 		}
 		saveSettings(cfg)
+		stopClock()
 		shutdownSCP()
 		w.Close()
 	})
 
 	// Safety net: stop the SCP if the app terminates by any route that bypasses
 	// the close intercept above (Phase 5-2F).
-	a.Lifecycle().SetOnStopped(shutdownSCP)
+	a.Lifecycle().SetOnStopped(func() { stopClock(); shutdownSCP() })
 
 	w.ShowAndRun()
 }

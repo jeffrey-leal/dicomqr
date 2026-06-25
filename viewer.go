@@ -521,6 +521,17 @@ type decodedFrame struct {
 	lo, hi         float64 // full rescaled data range, for the "Full range" preset
 	windowFromTags bool    // true if wc/ww came from DICOM Window tags
 	modality       string  // DICOM Modality (CT, PT, MR, …); selects the preset set
+
+	overlays []dicomOverlay // decoded overlay planes, composited during render
+}
+
+// dicomOverlay holds one decoded DICOM overlay plane (groups 6000–60FE).
+// pixels is a flat [rows*cols] byte array: 1 where the overlay bit is set, 0 elsewhere.
+// originRow/Col are 1-based DICOM coordinates of the overlay's top-left corner.
+type dicomOverlay struct {
+	rows, cols           int
+	originRow, originCol int
+	pixels               []byte
 }
 
 // windowable reports whether window/level adjustment affects this frame.
@@ -530,10 +541,27 @@ func (d *decodedFrame) windowable() bool { return d != nil && d.colorImg == nil 
 // through the supplied colour map (nil = grayscale).
 func (d *decodedFrame) render(cm *colorMap, wc, ww float64) image.Image {
 	if d.colorImg != nil {
-		return d.colorImg
+		if len(d.overlays) == 0 {
+			return d.colorImg
+		}
+		// Composite overlays onto a copy so the cached colorImg is not modified.
+		b := d.colorImg.Bounds()
+		dst := image.NewRGBA(b)
+		if src, ok := d.colorImg.(*image.RGBA); ok {
+			copy(dst.Pix, src.Pix)
+		} else {
+			for y := b.Min.Y; y < b.Max.Y; y++ {
+				for x := b.Min.X; x < b.Max.X; x++ {
+					dst.Set(x, y, d.colorImg.At(x, y))
+				}
+			}
+		}
+		d.paintOverlays(dst)
+		return dst
 	}
 	img := image.NewRGBA(image.Rect(0, 0, d.cols, d.rows))
 	d.renderInto(img, cm, wc, ww)
+	d.paintOverlays(img)
 	return img
 }
 
@@ -570,6 +598,111 @@ func (d *decodedFrame) renderInto(dst *image.RGBA, cm *colorMap, wc, ww float64)
 		dst.Pix[j+2] = c[2]
 		dst.Pix[j+3] = 255
 	}
+}
+
+// paintOverlays composites all DICOM overlay planes onto dst in opaque yellow.
+// Called at the end of renderInto (grayscale hot path) and once for colour frames.
+func (d *decodedFrame) paintOverlays(dst *image.RGBA) {
+	for _, ov := range d.overlays {
+		baseRow := ov.originRow - 1
+		baseCol := ov.originCol - 1
+		for r := 0; r < ov.rows; r++ {
+			imgRow := baseRow + r
+			if imgRow < 0 || imgRow >= d.rows {
+				continue
+			}
+			rowBase := r * ov.cols
+			for c := 0; c < ov.cols; c++ {
+				if ov.pixels[rowBase+c] == 0 {
+					continue
+				}
+				imgCol := baseCol + c
+				if imgCol < 0 || imgCol >= d.cols {
+					continue
+				}
+				j := (imgRow*d.cols + imgCol) * 4
+				dst.Pix[j] = 0xFF
+				dst.Pix[j+1] = 0xFF
+				dst.Pix[j+2] = 0x00
+				dst.Pix[j+3] = 0xFF
+			}
+		}
+	}
+}
+
+// extractOverlays scans all dataset elements for DICOM overlay planes in groups
+// 6000–60FE and returns the decoded planes ready for compositing. Overlays that
+// use the deprecated bit-position-in-pixel-data encoding are skipped.
+func extractOverlays(ds sdicom.Dataset) []dicomOverlay {
+	type attrs struct {
+		rows, cols           int
+		originRow, originCol int
+		bitPos               int
+		data                 []byte
+	}
+	groups := make(map[uint16]*attrs)
+
+	for _, elem := range ds.Elements {
+		g := elem.Tag.Group
+		if g < 0x6000 || g > 0x60FE || g%2 != 0 {
+			continue
+		}
+		a := groups[g]
+		if a == nil {
+			a = &attrs{originRow: 1, originCol: 1}
+			groups[g] = a
+		}
+		switch elem.Tag.Element {
+		case 0x0010: // Overlay Rows (US)
+			if ints, ok := elem.Value.GetValue().([]int); ok && len(ints) > 0 {
+				a.rows = ints[0]
+			}
+		case 0x0011: // Overlay Columns (US)
+			if ints, ok := elem.Value.GetValue().([]int); ok && len(ints) > 0 {
+				a.cols = ints[0]
+			}
+		case 0x0050: // Overlay Origin (SS[2]: row, col)
+			if ints, ok := elem.Value.GetValue().([]int); ok && len(ints) >= 2 {
+				a.originRow = ints[0]
+				a.originCol = ints[1]
+			}
+		case 0x0102: // Overlay Bit Position (US)
+			if ints, ok := elem.Value.GetValue().([]int); ok && len(ints) > 0 {
+				a.bitPos = ints[0]
+			}
+		case 0x3000: // Overlay Data (OB or OW)
+			if b, ok := elem.Value.GetValue().([]byte); ok {
+				a.data = b
+			}
+		}
+	}
+
+	var result []dicomOverlay
+	for _, a := range groups {
+		if len(a.data) == 0 || a.rows <= 0 || a.cols <= 0 {
+			continue
+		}
+		if a.bitPos != 0 {
+			// Overlay stored inside pixel-data bit planes (retired 2004); skip.
+			continue
+		}
+		total := a.rows * a.cols
+		pixels := make([]byte, total)
+		for i := 0; i < total; i++ {
+			byteIdx := i / 8
+			if byteIdx < len(a.data) && (a.data[byteIdx]>>uint(i%8))&1 != 0 {
+				pixels[i] = 1
+			}
+		}
+		result = append(result, dicomOverlay{
+			rows:      a.rows,
+			cols:      a.cols,
+			originRow: a.originRow,
+			originCol: a.originCol,
+			pixels:    pixels,
+		})
+	}
+	return result
 }
 
 // computeDefaultWindow fills wc/ww/lo/hi for a freshly decoded grayscale frame.
@@ -890,6 +1023,7 @@ func loadDicomImage(path string) (viewerState, error) {
 
 	ann := extractAnnotationsFromDataset(ds)
 	df.modality = ann.modality
+	df.overlays = extractOverlays(ds)
 
 	// Render the still image (thumbnails, initial view) through the modality's
 	// default colour map so NM/PET overviews appear in colour like the viewer.
@@ -1293,6 +1427,8 @@ type imageViewport struct {
 	idx   int
 	total int
 
+	showOverlays bool // composite overlay planes onto the rendered image
+
 	btn       desktop.MouseButton
 	wlDragged bool // a window/level drag is in progress (defer overlay rebuild)
 
@@ -1313,10 +1449,11 @@ type imageViewport struct {
 
 func newImageViewport() *imageViewport {
 	v := &imageViewport{
-		img:    canvas.NewImageFromImage(image.NewGray(image.Rect(0, 0, 1, 1))),
-		zoom:   1,
-		wlSens: 1,
-		curMap: &grayscaleMap,
+		img:          canvas.NewImageFromImage(image.NewGray(image.Rect(0, 0, 1, 1))),
+		zoom:         1,
+		wlSens:       1,
+		curMap:       &grayscaleMap,
+		showOverlays: true,
 	}
 	v.img.FillMode = canvas.ImageFillContain
 	// Scale on the GPU (linear). The default ImageScaleSmooth re-runs a CPU
@@ -1377,13 +1514,22 @@ func (v *imageViewport) renderBase(wc, ww float64) {
 		return
 	}
 	if !df.windowable() {
-		v.base = df.render(v.curMap, wc, ww) // colour frame: render returns colorImg
+		// Colour frame: compositing overlays creates a new RGBA every call,
+		// so only do it when overlays are present and enabled.
+		if v.showOverlays && len(df.overlays) > 0 {
+			v.base = df.render(v.curMap, wc, ww)
+		} else {
+			v.base = df.colorImg
+		}
 		return
 	}
 	if v.buf == nil || v.buf.Rect.Dx() != df.cols || v.buf.Rect.Dy() != df.rows {
 		v.buf = image.NewRGBA(image.Rect(0, 0, df.cols, df.rows))
 	}
 	df.renderInto(v.buf, v.curMap, wc, ww)
+	if v.showOverlays {
+		df.paintOverlays(v.buf)
+	}
 	v.base = v.buf
 }
 
@@ -1471,6 +1617,18 @@ func (v *imageViewport) setShowAnn(show bool) {
 	} else {
 		v.overlay.Hide()
 	}
+}
+
+func (v *imageViewport) setShowOverlays(show bool) {
+	if v.showOverlays == show {
+		return
+	}
+	v.showOverlays = show
+	if v.frame == nil {
+		return
+	}
+	v.renderBase(v.wc, v.ww)
+	v.applyDisplay()
 }
 
 func (v *imageViewport) resetView() {
@@ -1579,6 +1737,14 @@ func (r *viewportRenderer) Destroy()                     {}
 // openViewerWindow creates and shows the interactive DICOM image viewer window.
 // Must be called from a non-UI goroutine; all widget creation is via fyne.Do.
 func openViewerWindow(a fyne.App, title string, paths []string, collectErr error) {
+	// Route non-image modalities (SR, KO, AU, PR) to the document viewer.
+	if collectErr == nil && len(paths) > 0 {
+		if mod := seriesModality(paths); isDocumentModality(mod) {
+			openSRWindow(a, title, paths)
+			return
+		}
+	}
+
 	fyne.Do(func() {
 		win := a.NewWindow(title)
 
@@ -1599,6 +1765,8 @@ func openViewerWindow(a fyne.App, title string, paths []string, collectErr error
 		viewport := newImageViewport()
 		showAnn := a.Preferences().BoolWithFallback("showAnnotations", true)
 		viewport.setShowAnn(showAnn)
+		showOverlays := a.Preferences().BoolWithFallback("showOverlays", true)
+		viewport.setShowOverlays(showOverlays)
 
 		infoLabel := widget.NewLabel("")
 		infoLabel.Alignment = fyne.TextAlignCenter
@@ -1661,6 +1829,9 @@ func openViewerWindow(a fyne.App, title string, paths []string, collectErr error
 			}
 		}
 
+		// Forward-declared so loadAndShow can reference it before its full initialisation.
+		var overlayCheck *widget.Check
+
 		loadAndShow := func(idx int, keepView bool) {
 			counterLbl.SetText(fmt.Sprintf("%d / %d  (loading…)", idx+1, total))
 			go func() {
@@ -1694,6 +1865,9 @@ func openViewerWindow(a fyne.App, title string, paths []string, collectErr error
 					curWC, curWW = wc, ww
 					viewport.setContent(st.frame, wc, ww, st.ann, idx, total, keepView)
 					setInfo(st.frame, wc, ww)
+					if len(st.frame.overlays) > 0 {
+						overlayCheck.Show()
+					}
 					if st.frame.windowable() {
 						presetSelect.Enable()
 						colorSelect.Enable()
@@ -1754,6 +1928,13 @@ func openViewerWindow(a fyne.App, title string, paths []string, collectErr error
 		})
 		annCheck.SetChecked(showAnn)
 
+		overlayCheck = widget.NewCheck("Overlays", func(checked bool) {
+			a.Preferences().SetBool("showOverlays", checked)
+			viewport.setShowOverlays(checked)
+		})
+		overlayCheck.SetChecked(showOverlays)
+		overlayCheck.Hide()
+
 		resetBtn := widget.NewButton("Reset", func() {
 			viewport.resetView()
 			presetSelect.SetSelected("Default") // fires OnChanged → reset window
@@ -1787,7 +1968,7 @@ func openViewerWindow(a fyne.App, title string, paths []string, collectErr error
 		controls := container.NewHBox(
 			widget.NewLabel("Window:"), presetSelect,
 			widget.NewLabel("Colour:"), colorSelect,
-			annCheck, resetBtn,
+			annCheck, overlayCheck, resetBtn,
 		)
 		bottom := container.NewVBox(
 			container.NewCenter(counterLbl),

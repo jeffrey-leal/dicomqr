@@ -19,6 +19,8 @@ import (
 	dicom "github.com/grailbio/go-dicom"
 	"github.com/grailbio/go-dicom/dicomio"
 	"github.com/grailbio/go-dicom/dicomtag"
+	sdicom "github.com/suyashkumar/dicom"
+	"github.com/suyashkumar/dicom/pkg/tag"
 )
 
 // StorageSCP is an embedded C-STORE SCP that listens for files pushed by a
@@ -253,17 +255,10 @@ func (s *StorageSCP) handleCStore(
 	}
 	tmpFile.Close()
 
-	// Re-open the completed temp file (omitting pixel data) to extract the
-	// metadata tags needed to build the organized subfolder path.
-	var patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber string
-	if ds, parseErr := dicom.ReadDataSetFromFile(tmpPath, dicom.ReadOptions{DropPixelData: true}); parseErr == nil {
-		patientName = scpStringTag(ds, dicomtag.PatientName)
-		patientID = scpStringTag(ds, dicomtag.PatientID)
-		studyDesc = scpStringTag(ds, dicomtag.StudyDescription)
-		studyDate = scpStringTag(ds, dicomtag.StudyDate)
-		seriesDesc = scpStringTag(ds, dicomtag.SeriesDescription)
-		seriesNumber = scpStringTag(ds, dicomtag.SeriesNumber)
-	}
+	// Re-open the completed temp file to extract the metadata tags needed to
+	// build the organized subfolder path. The streaming parser stops at group
+	// 0x0020, so SR Content Sequences (0x0040+) are never visited.
+	patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber := scpParseMetadata(tmpPath)
 
 	dest := organizeFilePath(s.DownloadDir(), patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber, sopInstanceUID)
 
@@ -377,15 +372,55 @@ func truncateRunes(s string, maxRunes int) string {
 	return string(r[:maxRunes])
 }
 
-// scpStringTag returns the string value of a DICOM tag from a dataset, or ""
-// if the tag is absent or cannot be decoded as a string.
-func scpStringTag(ds *dicom.DataSet, tag dicomtag.Tag) string {
-	elem, err := ds.FindElementByTag(tag)
+// scpParseMetadata extracts the six metadata strings used to build the
+// organized folder hierarchy from a received DICOM file. It reads elements
+// sequentially via a streaming parser and stops as soon as it passes group
+// 0x0020, so complex Content Sequences present in SR and other non-image
+// modalities (group 0x0040+) are never visited. Returns empty strings on any
+// parse failure, which causes the caller to fall back to a flat layout.
+func scpParseMetadata(path string) (patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber string) {
+	f, err := os.Open(path)
 	if err != nil {
-		return ""
+		return
 	}
-	s, _ := elem.GetString()
-	return s
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return
+	}
+	p, err := sdicom.NewParser(f, info.Size(), nil, sdicom.SkipPixelData())
+	if err != nil {
+		return
+	}
+	for {
+		elem, err := p.Next()
+		if err != nil {
+			break
+		}
+		if elem.Tag.Group > 0x0020 {
+			break
+		}
+		strs, ok := elem.Value.GetValue().([]string)
+		if !ok || len(strs) == 0 {
+			continue
+		}
+		val := strings.TrimSpace(strs[0])
+		switch elem.Tag {
+		case tag.PatientName:
+			patientName = val
+		case tag.PatientID:
+			patientID = val
+		case tag.StudyDescription:
+			studyDesc = val
+		case tag.StudyDate:
+			studyDate = val
+		case tag.SeriesDescription:
+			seriesDesc = val
+		case tag.SeriesNumber:
+			seriesNumber = val
+		}
+	}
+	return
 }
 
 // scpCopyFile copies src to dst byte-for-byte. Used as a fallback when
@@ -440,15 +475,7 @@ func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID str
 	}
 	tmpFile.Close()
 
-	var patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber string
-	if ds, parseErr := dicom.ReadDataSetFromFile(tmpPath, dicom.ReadOptions{DropPixelData: true}); parseErr == nil {
-		patientName = scpStringTag(ds, dicomtag.PatientName)
-		patientID = scpStringTag(ds, dicomtag.PatientID)
-		studyDesc = scpStringTag(ds, dicomtag.StudyDescription)
-		studyDate = scpStringTag(ds, dicomtag.StudyDate)
-		seriesDesc = scpStringTag(ds, dicomtag.SeriesDescription)
-		seriesNumber = scpStringTag(ds, dicomtag.SeriesNumber)
-	}
+	patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber := scpParseMetadata(tmpPath)
 
 	dest := organizeFilePath(downloadDir, patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber, sopInstanceUID)
 

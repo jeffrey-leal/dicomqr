@@ -1,8 +1,8 @@
 # dicomqr
 
-**User Manual  v1.5.0**
+**User Manual  v1.6.0**
 
-June 18, 2026
+June 25, 2026
 
 A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.
 
@@ -22,7 +22,8 @@ Key capabilities:
 - Automatically organise downloaded files by patient, study, and series
 - Query a Modality Worklist server independently of the active PACS connection
 - Browse local DICOM files in the download folder; push them to any PACS via C-STORE or delete them
-- Preview DICOM images in the built-in viewer with interactive window/level, zoom and pan, modality-specific W/L presets, colour maps for PET/SPECT, DICOM annotation overlays, and study overview grids; decodes JPEG Baseline, JPEG 2000, and uncompressed pixel data
+- Preview DICOM images in the built-in viewer with interactive window/level, zoom and pan, modality-specific W/L presets, colour maps for PET/SPECT, DICOM annotation overlays, DICOM overlay plane compositing, and study overview grids; decodes JPEG Baseline, JPEG 2000, and uncompressed pixel data
+- View Structured Reports (SR), Key Object Selections (KO), and other non-image DICOM objects in a dedicated scrollable document viewer that renders the SR Content Sequence as formatted text
 - Import DICOM files from external folders into the organised download folder
 - Support for multiple saved server profiles with independent connection and retrieve settings
 - Optionally request uncompressed pixel data transfer per server profile, ensuring the built-in viewer can display all received images regardless of how the PACS stores them
@@ -325,7 +326,7 @@ Right-click any node and select Preview Images:
 
 The series viewer displays one image at a time and opens at the middle slice. It supports interactive window/level, zoom and pan, and slice navigation by mouse or keyboard.
 
-The bottom bar contains an instance counter (e.g. `45 / 120`), a navigation slider, a Window preset dropdown (see Section 8.3.2), a Colour map dropdown (see Section 8.3.3), an Annotations checkbox (see Section 8.3.5), a Reset button, and an info label showing pixel dimensions and the current W/L values.
+The bottom bar contains an instance counter (e.g. `45 / 120`), a navigation slider, a Window preset dropdown (see Section 8.3.2), a Colour map dropdown (see Section 8.3.3), an Annotations checkbox (see Section 8.3.5), an Overlays checkbox (see Section 8.3.6, shown only when overlay planes are present), a Reset button, and an info label showing pixel dimensions and the current W/L values.
 
 Mouse controls:
 
@@ -401,6 +402,30 @@ When Annotations is checked in the series viewer, a four-corner overlay is drawn
 Anatomical orientation markers (R/L, A/P, H/F) are centred on the four image edges and derived from the ImageOrientationPatient direction cosines in DICOM LPS patient coordinates.
 
 The Annotations checkbox state persists between sessions.
+
+
+#### 8.3.6  DICOM Overlay Planes
+
+Some images — particularly CT and MR "protocol" series — contain one or more 1-bit bitmap overlay planes embedded in the DICOM file alongside the pixel data (groups 6000–60FE). These planes carry annotations such as scan limits, region-of-interest boundaries, or facility branding burned in at the modality.
+
+When overlay planes are present, dicomqr composites them onto the image in opaque yellow after applying window/level, so they remain visible at any W/L setting. Multiple overlay planes are all composited in the same pass.
+
+The **Overlays** checkbox in the viewer bottom bar toggles this compositing on and off. The checkbox is hidden for series that contain no overlay planes and appears automatically on the first frame in which overlays are detected. The toggle state persists between sessions.
+
+Note: the obsolete encoding in which overlay bits are packed inside unused bits of the pixel data words (OverlayBitPosition > 0, retired in the DICOM 2004 edition) is not supported and is silently skipped.
+
+
+#### 8.3.7  Structured Report Viewer
+
+Series whose modality is SR (Structured Report), KO (Key Object Selection), AU (Audio), or PR (Presentation State) contain no pixel data and are automatically opened in the document viewer instead of the image viewer.
+
+The document viewer window has three areas:
+
+- **Header** — patient name, MRN, date of birth, sex and age; study date, accession number and description; modality, series information, content date/time, and the DICOM completion and verification status flags (e.g. COMPLETE · VERIFIED)
+- **Body** — the SR Content Sequence rendered as scrollable formatted text. CONTAINER items appear as section headings; leaf items appear as labelled value pairs. Supported value types: TEXT, NUM (with measurement units), CODE, DATE, TIME, PNAME, UIDREF, IMAGE (shown as a UID reference), and nested CONTAINERs
+- **Footer** — Prev / Next buttons to step through multi-file series; a counter showing the current document position; a Copy text button that places a plain-text version of the document body on the clipboard
+
+The viewer opens at document 1 of the series and loads subsequent documents in the background as you navigate.
 
 
 ### 8.4  Opening in External Viewer

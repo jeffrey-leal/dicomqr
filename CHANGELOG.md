@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.6.0] — 2026-06-25
+
+### Added
+
+- **Structured Report (SR) and non-image document viewer** — series whose modality is SR, KO, AU, or PR are automatically routed to a dedicated document viewer instead of the image viewer. The document viewer renders the DICOM SR Content Sequence as formatted, scrollable markdown with section headings and labelled value pairs; Prev/Next buttons step through multi-file documents; a Copy text button places plain text on the clipboard; the header displays patient identity, study context, content date/time, and completion and verification status
+- **DICOM overlay plane compositing** — CT, MR, and other images that contain 1-bit bitmap overlay planes (DICOM groups 6000–60FE) now render the overlays composited onto the image in opaque yellow. Overlay planes are decoded at load time from the packed LSB-first bit array and composited after windowing so they remain visible at any W/L setting. The deprecated "bit-position-in-pixel-data" encoding (OverlayBitPosition > 0, retired in DICOM 2004) is silently skipped
+- **Overlays checkbox** — a new Overlays checkbox in the series viewer bottom bar (alongside Annotations) toggles overlay plane compositing on and off; the checkbox is hidden for series that contain no overlay planes; state persists between sessions
+
+### Fixed
+
+- **UI freeze on SR retrieve** — retrieving a Structured Report series or any other non-image DICOM object no longer causes the application to stop responding. The root cause was grailbio's `ReadDataSetFromFile` hanging on SR Content Sequences (0040,A730) — deeply nested SQ elements that the library had no path to skip. The fix replaces both call sites in the C-STORE handler with a fast suyashkumar streaming parse that stops after DICOM group 0x0020
+- **Process remains in Task Manager after exit** — closing the application no longer leaves the process alive after the UI disappears. The intermittent hang was caused by the clock-display goroutine calling `fyne.Do` into Fyne's event queue after the queue had stopped being drained during shutdown — a race window of ~1 second that explains "sometimes but not always". The goroutine is now properly cancelled on all termination paths (window close, Quit menu, and the `OnStopped` lifecycle hook). The C-ECHO button also uses a bounded 30-second context rather than an unbounded `context.Background()`
+
+### Internal
+
+- `srviewer.go` (new) — `parseSRFile` full-dataset parse via suyashkumar/dicom; `walkSRContentSeq` recursive Content Sequence walker handling TEXT, NUM, CODE, DATE, TIME, PNAME, UIDREF, IMAGE, and CONTAINER value types; `srEntriesToMarkdown`/`srEntriesToPlainText` formatters; `openSRWindow` Fyne document viewer; `seriesModality` early-exit streaming parser that stops after group 0x0008; `isDocumentModality` dispatch guard
+- `viewer.go` — `dicomOverlay` struct; `extractOverlays` single-pass scan of dataset elements for groups 6000–60FE with LSB-first bit unpack; `paintOverlays` method composites overlays onto `*image.RGBA`; `imageViewport.showOverlays` flag + `setShowOverlays` method; `renderBase` conditionally applies overlays; SR/document dispatch at `openViewerWindow` entry before `fyne.Do`; `overlayCheck` widget hidden until overlays are detected on the loaded frame
+- `storagescp.go` — `scpParseMetadata` streaming parser replaces both `ReadDataSetFromFile` calls for post-receive metadata extraction; stops at group 0x0020, skipping all SQ elements including SR Content Sequence
+- `main.go` — clock goroutine converted to `time.NewTicker` + `clockDone` channel (closed via `sync.Once` `stopClock` on all three termination paths); echo button bounded with a 30-second timeout context
+
+---
+
 ## [1.5.0] — 2026-06-18
 
 ### Added
