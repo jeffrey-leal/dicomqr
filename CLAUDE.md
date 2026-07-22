@@ -41,6 +41,7 @@ CGO_ENABLED=1 CC=/c/msys64/mingw64/bin/gcc.exe \
 | `dicomnet.go` | `DicomClient` — SCU wrapper for C-ECHO, C-FIND, C-MOVE, C-GET, C-STORE, Modality Worklist |
 | `storagescp.go` | `StorageSCP` — embedded C-STORE SCP listener that receives C-MOVE deliveries |
 | `localbrowse.go` | Local Browse tab — scan download folder, push to PACS, delete local files, preview routing |
+| `catalog.go` | `catalog` — persistent SQLite index (`.dicomqr-index.db` in the download folder) backing the Local Browse tree; nil-safe, WAL, single connection |
 | `importtab.go` | Import tab — scan external folder and copy selected files into the download folder |
 | `worklist.go` | Worklist tab — Modality Worklist C-FIND with independent server selector |
 | `viewer.go` | Internal image viewer, study overview grid, DICOM annotation overlay, thumbnail widget |
@@ -52,6 +53,7 @@ CGO_ENABLED=1 CC=/c/msys64/mingw64/bin/gcc.exe \
 | `serverprofile.go` | `ServerProfile` struct for saved server connections |
 | `preferences.go` | `appTheme`, system font scanner, preferences dialog |
 | `dicomfile.go` | `isDICOMFile` — magic-byte verification |
+| `transcode.go` | Local decompression of received files to Explicit VR LE (JPEG Baseline/Extended, JPEG 2000) for the per-profile "guarantee uncompressed on disk" option |
 | `export.go` | CSV and JSON export of query results |
 
 ## Key dependencies
@@ -61,6 +63,7 @@ CGO_ENABLED=1 CC=/c/msys64/mingw64/bin/gcc.exe \
 - `github.com/suyashkumar/dicom v1.1.0` — DICOM file parsing (local files, image rendering, annotation extraction)
 - `github.com/grailbio/go-dicom` — DICOM dataset encoding used by the C-STORE SCU and SCP
 - `github.com/sqweek/dialog` — native Windows file/folder picker
+- `modernc.org/sqlite` — pure-Go SQLite (no CGO) for the Local Browse persistent index
 
 ## Documentation
 
@@ -76,3 +79,4 @@ CGO_ENABLED=1 CC=/c/msys64/mingw64/bin/gcc.exe \
 - Settings persisted to `~/.dicomqr/settings.json`
 - C-MOVE requires the embedded C-STORE SCP listener (default port 11112) to receive files
 - The local AE Title (default `DICOMQR`) must be registered on the PACS as a known destination
+- The app "owns" the download folder: downloads, imports, and manual scans keep `.dicomqr-index.db` in sync with the folder contents, and touching a tree entry whose files were removed externally prunes it from both the tree and the index

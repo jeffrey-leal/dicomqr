@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -38,6 +40,76 @@ type localSeries struct {
 	numInstances int
 }
 
+// fileMeta is the metadata of one DICOM file needed to place it in the
+// Patient → Study → Series hierarchy (tree model and SQLite catalog).
+type fileMeta struct {
+	path  string
+	size  int64
+	mtime int64
+
+	patientName string
+	patientID   string
+
+	studyUID   string
+	studyDate  string
+	studyDesc  string
+	accession  string
+	modalities string
+
+	seriesUID    string
+	modality     string
+	seriesNumber string
+	seriesDesc   string
+}
+
+// parseLocalFileMeta parses one DICOM file (skipping pixel data) and returns
+// its hierarchy metadata. ok is false when the file is unparsable or missing
+// the Study/Series Instance UIDs.
+func parseLocalFileMeta(path string) (m fileMeta, ok bool) {
+	ds, parseErr := sdicom.ParseFile(path, nil, sdicom.SkipPixelData())
+	if parseErr != nil {
+		return fileMeta{}, false
+	}
+
+	getString := func(t tag.Tag) string {
+		e, findErr := ds.FindElementByTag(t)
+		if findErr != nil {
+			return ""
+		}
+		strs := sdicom.MustGetStrings(e.Value)
+		if len(strs) == 0 {
+			return ""
+		}
+		return strings.TrimSpace(strs[0])
+	}
+
+	m = fileMeta{
+		path:         path,
+		patientName:  getString(tag.PatientName),
+		patientID:    getString(tag.PatientID),
+		studyUID:     getString(tag.StudyInstanceUID),
+		studyDate:    getString(tag.StudyDate),
+		studyDesc:    getString(tag.StudyDescription),
+		accession:    getString(tag.AccessionNumber),
+		modalities:   getString(tag.ModalitiesInStudy),
+		seriesUID:    getString(tag.SeriesInstanceUID),
+		modality:     getString(tag.Modality),
+		seriesNumber: getString(tag.SeriesNumber),
+		seriesDesc:   getString(tag.SeriesDescription),
+	}
+	if m.studyUID == "" || m.seriesUID == "" {
+		return fileMeta{}, false
+	}
+	if m.modality == "" {
+		m.modality = m.modalities
+	}
+	if info, statErr := os.Stat(path); statErr == nil {
+		m.size = info.Size()
+		m.mtime = info.ModTime().Unix()
+	}
+	return m, true
+}
+
 // scanLocalFolder walks dir and returns studies, series, and a map of
 // seriesUID → file paths for every .dcm file found.
 func scanLocalFolder(dir string, progress func(int)) ([]localStudy, []localSeries, map[string][]string, error) {
@@ -56,60 +128,38 @@ func scanLocalFolder(dir string, progress func(int)) ([]localStudy, []localSerie
 			return nil
 		}
 
-		ds, parseErr := sdicom.ParseFile(path, nil, sdicom.SkipPixelData())
-		if parseErr != nil {
+		m, ok := parseLocalFileMeta(path)
+		if !ok {
 			return nil
 		}
 
-		getString := func(t tag.Tag) string {
-			e, findErr := ds.FindElementByTag(t)
-			if findErr != nil {
-				return ""
-			}
-			strs := sdicom.MustGetStrings(e.Value)
-			if len(strs) == 0 {
-				return ""
-			}
-			return strings.TrimSpace(strs[0])
-		}
-
-		studyUID := getString(tag.StudyInstanceUID)
-		seriesUID := getString(tag.SeriesInstanceUID)
-		if studyUID == "" || seriesUID == "" {
-			return nil
-		}
-
-		if _, exists := studyMap[studyUID]; !exists {
-			studyMap[studyUID] = localStudy{
-				patientName: getString(tag.PatientName),
-				patientID:   getString(tag.PatientID),
-				studyUID:    studyUID,
-				studyDate:   getString(tag.StudyDate),
-				studyDesc:   getString(tag.StudyDescription),
-				accession:   getString(tag.AccessionNumber),
-				modalities:  getString(tag.ModalitiesInStudy),
+		if _, exists := studyMap[m.studyUID]; !exists {
+			studyMap[m.studyUID] = localStudy{
+				patientName: m.patientName,
+				patientID:   m.patientID,
+				studyUID:    m.studyUID,
+				studyDate:   m.studyDate,
+				studyDesc:   m.studyDesc,
+				accession:   m.accession,
+				modalities:  m.modalities,
 			}
 		}
 
-		k := seriesKey{studyUID, seriesUID}
+		k := seriesKey{m.studyUID, m.seriesUID}
 		if sr, exists := seriesMap[k]; exists {
 			sr.numInstances++
 		} else {
-			modality := getString(tag.Modality)
-			if modality == "" {
-				modality = studyMap[studyUID].modalities
-			}
 			seriesMap[k] = &localSeries{
-				studyUID:     studyUID,
-				seriesUID:    seriesUID,
-				modality:     modality,
-				seriesNumber: getString(tag.SeriesNumber),
-				seriesDesc:   getString(tag.SeriesDescription),
+				studyUID:     m.studyUID,
+				seriesUID:    m.seriesUID,
+				modality:     m.modality,
+				seriesNumber: m.seriesNumber,
+				seriesDesc:   m.seriesDesc,
 				numInstances: 1,
 			}
 		}
 
-		filesByUID[seriesUID] = append(filesByUID[seriesUID], path)
+		filesByUID[m.seriesUID] = append(filesByUID[m.seriesUID], path)
 
 		fileCount++
 		if progress != nil && fileCount%25 == 0 {
@@ -377,14 +427,19 @@ func showPushDialog(w fyne.Window, cfg *Settings, paths []string, description st
 }
 
 // buildLocalBrowseContent constructs the Local Browse tab.
-// Returns the tab content and a refresh func that re-renders the tree
-// (call it after applying theme/selection preferences).
-func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, openInViewer func(string)) (fyne.CanvasObject, func()) {
+// Returns the tab content, a refresh func that re-renders the tree (call it
+// after applying theme/selection preferences; it also reopens the catalog when
+// the download directory changed), and a reload func that repopulates the tree
+// from the catalog (call it after downloads or imports add files).
+func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, openInViewer func(string)) (fyne.CanvasObject, func(), func()) {
 	model := newResultsModel()
 	selectedNodes := make(map[string]bool)
 	seriesFiles := make(map[string][]string)
 
 	var doScan func()
+	var reloadFromDB func(status string)
+	var pruneMissing func(paths []string)
+	var verifyNode func(id string)
 	var tree *widget.Tree
 
 	var clearSubtree func(string)
@@ -408,6 +463,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, openInVie
 	}
 
 	onTapped := func(id string) {
+		verifyNode(id)
 		if selectedNodes[id] {
 			clearSubtree(id)
 		} else {
@@ -418,6 +474,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, openInVie
 	var scanDir string
 
 	onMenu := func(id string, pos fyne.Position) {
+		verifyNode(id)
 		// Collect the exact files for this node so Preview is scoped correctly.
 		rawPaths := filesForNode(id, model, seriesFiles)
 		capturedPaths := make([]string, len(rawPaths))
@@ -473,7 +530,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, openInVie
 		deleteItem := fyne.NewMenuItem("Delete…", func() {
 			showDeleteDialog(w, cfg, capturedPaths,
 				fmt.Sprintf("Delete %q from local storage.", capturedLabel),
-				doScan)
+				func() { pruneMissing(capturedPaths) })
 		})
 		copyUID := fyne.NewMenuItem("Copy UID", func() { w.Clipboard().SetContent(uid) })
 		copyLabel := fyne.NewMenuItem("Copy label", func() { w.Clipboard().SetContent(model.labelFor(id)) })
@@ -519,6 +576,118 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, openInVie
 	folderLabel := widget.NewLabel(cfg.DownloadDir)
 	folderLabel.Truncation = fyne.TextTruncateEllipsis
 
+	// applyData replaces the tree contents, dropping selections for nodes that
+	// no longer exist. Runs on the UI goroutine.
+	applyData := func(studies []localStudy, series []localSeries, files map[string][]string) {
+		seriesFiles = files
+		model.clear()
+		for _, s := range studies {
+			model.addStudy(s.patientName, s.patientID, s.studyUID, s.studyDate,
+				s.studyDesc, s.accession, s.modalities)
+		}
+		for _, sr := range series {
+			model.addSeries(sr.studyUID, sr.seriesUID, sr.modality,
+				sr.seriesNumber, sr.seriesDesc, sr.numInstances)
+		}
+		model.applyFilter()
+		for id := range selectedNodes {
+			if _, ok := model.nodes[id]; !ok {
+				delete(selectedNodes, id)
+			}
+		}
+		tree.Refresh()
+	}
+
+	// reloadFromDB repopulates the tree from the catalog. Safe to call from any
+	// goroutine. A non-empty status overrides the default "N studies" message.
+	reloadFromDB = func(status string) {
+		if cat == nil {
+			return
+		}
+		go func() {
+			studies, series, files, err := cat.load()
+			fyne.Do(func() {
+				if err != nil {
+					scanStatusLbl.SetText("Index error: " + err.Error())
+					return
+				}
+				scanDir = cfg.DownloadDir
+				applyData(studies, series, files)
+				msg := status
+				if msg == "" {
+					if len(studies) == 0 {
+						msg = "Click Scan to index the download folder."
+					} else {
+						noun := "studies"
+						if len(studies) == 1 {
+							noun = "study"
+						}
+						msg = fmt.Sprintf("%d %s, %d series in local index", len(studies), noun, len(series))
+					}
+				}
+				scanStatusLbl.SetText(msg)
+			})
+		}()
+	}
+
+	statMissing := func(paths []string) []string {
+		var missing []string
+		for _, p := range paths {
+			if _, err := os.Stat(p); err != nil {
+				missing = append(missing, p)
+			}
+		}
+		return missing
+	}
+
+	// pruneMissing stats paths in the background and removes those no longer on
+	// disk from the catalog and tree, keeping both consistent with the folder.
+	pruneMissing = func(paths []string) {
+		captured := make([]string, len(paths))
+		copy(captured, paths)
+		go func() {
+			if missing := statMissing(captured); len(missing) > 0 {
+				n := cat.removePaths(missing)
+				reloadFromDB(fmt.Sprintf("Removed %d file(s) no longer on disk", n))
+			}
+		}()
+	}
+
+	// verifyNode checks in the background that a touched node's files still
+	// exist, pruning entries that were removed outside the app. A per-node
+	// in-flight guard stops repeated taps from re-statting large subtrees.
+	var verifyMu sync.Mutex
+	verifying := make(map[string]bool)
+	verifyNode = func(id string) {
+		if cat == nil {
+			return
+		}
+		paths := filesForNode(id, model, seriesFiles)
+		if len(paths) == 0 {
+			return
+		}
+		verifyMu.Lock()
+		inFlight := verifying[id]
+		verifying[id] = true
+		verifyMu.Unlock()
+		if inFlight {
+			return
+		}
+		captured := make([]string, len(paths))
+		copy(captured, paths)
+		go func() {
+			defer func() {
+				verifyMu.Lock()
+				delete(verifying, id)
+				verifyMu.Unlock()
+			}()
+			if missing := statMissing(captured); len(missing) > 0 {
+				n := cat.removePaths(missing)
+				reloadFromDB(fmt.Sprintf("Removed %d file(s) no longer on disk", n))
+			}
+		}()
+	}
+
 	doScan = func() {
 		dir := cfg.DownloadDir
 		if dir == "" {
@@ -535,22 +704,17 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, openInVie
 			studies, series, files, err := scanLocalFolder(dir, func(n int) {
 				fyne.Do(func() { scanStatusLbl.SetText(fmt.Sprintf("Scanning… %d files read", n)) })
 			})
+			if err == nil {
+				if dbErr := cat.replaceAll(studies, series, files); dbErr != nil {
+					log.Printf("catalog: replace after scan: %v", dbErr)
+				}
+			}
 			fyne.Do(func() {
 				if err != nil {
 					scanStatusLbl.SetText("Scan error: " + err.Error())
 					return
 				}
-				seriesFiles = files
-				for _, s := range studies {
-					model.addStudy(s.patientName, s.patientID, s.studyUID, s.studyDate,
-						s.studyDesc, s.accession, s.modalities)
-				}
-				for _, sr := range series {
-					model.addSeries(sr.studyUID, sr.seriesUID, sr.modality,
-						sr.seriesNumber, sr.seriesDesc, sr.numInstances)
-				}
-				model.applyFilter()
-				tree.Refresh()
+				applyData(studies, series, files)
 				noun := "studies"
 				if len(studies) == 1 {
 					noun = "study"
@@ -638,7 +802,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, openInVie
 		}
 		showDeleteDialog(w, cfg, paths,
 			fmt.Sprintf("Delete %d selected file(s) from local storage.", len(paths)),
-			doScan)
+			func() { pruneMissing(paths) })
 	})
 
 	localOpenInViewerBtn := widget.NewButton("Open in Viewer", func() { openInViewer(scanDir) })
@@ -679,6 +843,10 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, openInVie
 		tree,
 	)
 
+	// Populate the tree from the persisted index at startup, so the previous
+	// session's contents appear without a disk rescan.
+	reloadFromDB("")
+
 	return content, func() {
 		folderLabel.SetText(cfg.DownloadDir)
 		if cfg.ViewerPath == "" {
@@ -686,6 +854,17 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, openInVie
 		} else {
 			localOpenInViewerBtn.Enable()
 		}
+		// The download directory changed in Preferences: switch to that
+		// directory's own index file and reload the tree from it.
+		if cat != nil && cfg.DownloadDir != "" && cat.Dir() != cfg.DownloadDir {
+			go func() {
+				if err := cat.Reopen(cfg.DownloadDir); err != nil {
+					log.Printf("catalog: reopen %s: %v", cfg.DownloadDir, err)
+					return
+				}
+				reloadFromDB("")
+			}()
+		}
 		tree.Refresh()
-	}
+	}, func() { reloadFromDB("") }
 }

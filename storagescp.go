@@ -47,10 +47,16 @@ type StorageSCP struct {
 	cancel   context.CancelFunc
 	ln       net.Listener
 
-	// uncompressedOnly, when true, causes the SCP to reject any compressed
-	// transfer syntax offered in A-ASSOCIATE-RQ, forcing the PACS to
-	// transcode pixel data before sending. Must be set before Start().
-	uncompressedOnly bool
+	// Transfer policy, guarded by tsMu. acceptedTS, when non-nil, restricts
+	// (in preference order) the transfer syntaxes accepted in A-ASSOCIATE-RQ
+	// negotiation, forcing the PACS to transcode before sending; nil accepts
+	// everything. replaceCompressed causes an incoming file to overwrite an
+	// existing on-disk copy whose transfer syntax is compressed (normally
+	// existing files are skipped). Both are re-read per incoming connection,
+	// so preference changes apply without restarting the listener.
+	tsMu              sync.RWMutex
+	acceptedTS        []string
+	replaceCompressed bool
 }
 
 // DownloadDir returns the download directory (thread-safe, Phase 1-B).
@@ -67,10 +73,22 @@ func (s *StorageSCP) SetDownloadDir(d string) {
 	s.downloadDir = d
 }
 
-// SetUncompressedOnly configures whether the SCP will reject compressed
-// transfer syntaxes during A-ASSOCIATE-RQ negotiation. Must be called
-// before Start(). Mirrors the TransferUncompressed flag on the server profile.
-func (s *StorageSCP) SetUncompressedOnly(v bool) { s.uncompressedOnly = v }
+// SetTransferPolicy configures negotiation and overwrite behaviour from a
+// server profile. Safe to call while the SCP is running — new associations
+// pick up the current values.
+func (s *StorageSCP) SetTransferPolicy(accepted []string, replaceCompressed bool) {
+	s.tsMu.Lock()
+	defer s.tsMu.Unlock()
+	s.acceptedTS = accepted
+	s.replaceCompressed = replaceCompressed
+}
+
+// transferPolicy returns the current negotiation restriction and overwrite flag.
+func (s *StorageSCP) transferPolicy() ([]string, bool) {
+	s.tsMu.RLock()
+	defer s.tsMu.RUnlock()
+	return s.acceptedTS, s.replaceCompressed
+}
 
 // SetOnFileReceived sets the callback (thread-safe, Phase 1-C).
 func (s *StorageSCP) SetOnFileReceived(fn func(path string)) {
@@ -136,10 +154,6 @@ func (s *StorageSCP) Start() error {
 			return s.handleCStore(transferSyntaxUID, sopClassUID, sopInstanceUID, dataReader)
 		},
 	}
-	if s.uncompressedOnly {
-		params.AcceptedTransferSyntaxes = uncompressedTransferSyntaxes
-	}
-
 	// Use "tcp4" to create an IPv4-only socket. net.Listen("tcp", ...) on
 	// Windows binds to [::] (IPv6), and since Windows defaults to
 	// IPV6_V6ONLY=1 that socket refuses IPv4 connections from the PACS.
@@ -184,7 +198,11 @@ func (s *StorageSCP) Start() error {
 			if err != nil {
 				return
 			}
-			go netdicom.RunProviderForConn(ctx, conn, params)
+			// Re-read the transfer policy per association so preference
+			// changes made while running apply to the next retrieve.
+			p := params
+			p.AcceptedTransferSyntaxes, _ = s.transferPolicy()
+			go netdicom.RunProviderForConn(ctx, conn, p)
 		}
 	}()
 	return nil
@@ -264,10 +282,16 @@ func (s *StorageSCP) handleCStore(
 
 	// Skip writing if the file already exists; discard the temp file and return
 	// success so the PACS doesn't retry. Do not invoke callOnFileReceived —
-	// the UI file count reflects only newly written files.
+	// the UI file count reflects only newly written files. Exception: when the
+	// profile guarantees uncompressed files on disk and the existing copy is
+	// compressed (downloaded before the guarantee was enabled), fall through
+	// and replace it with the incoming copy.
 	if _, statErr := os.Stat(dest); statErr == nil {
-		os.Remove(tmpPath)
-		return dimse.Success
+		_, replace := s.transferPolicy()
+		if !replace || isUncompressedOnDisk(fileTransferSyntaxUID(dest)) {
+			os.Remove(tmpPath)
+			return dimse.Success
+		}
 	}
 
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
@@ -445,7 +469,9 @@ func scpCopyFile(src, dst string) error {
 // is the raw DICOM dataset bytes as received from the C-GET callback (no Group
 // 2 prefix); this function prepends the proper DICOM File Meta Information
 // header before writing. Returns the path of the saved file.
-func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID string, data []byte) (string, error) {
+// replaceCompressed causes an existing on-disk copy with a compressed transfer
+// syntax to be overwritten instead of skipped (mirrors handleCStore).
+func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID string, data []byte, replaceCompressed bool) (string, error) {
 	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
 		return "", fmt.Errorf("cannot create download directory: %w", err)
 	}
@@ -481,9 +507,13 @@ func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID str
 
 	// Skip writing if the file already exists; discard the temp file.
 	// The caller does not invoke the status callback for skipped files.
+	// Exception: replace an existing compressed copy when the profile
+	// guarantees uncompressed files on disk.
 	if _, statErr := os.Stat(dest); statErr == nil {
-		os.Remove(tmpPath)
-		return dest, nil
+		if !replaceCompressed || isUncompressedOnDisk(fileTransferSyntaxUID(dest)) {
+			os.Remove(tmpPath)
+			return dest, nil
+		}
 	}
 
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {

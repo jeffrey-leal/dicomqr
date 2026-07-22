@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.7.0] — 2026-07-22
+
+### Added
+
+- **Transfer syntax preference per server profile** — the 'Request uncompressed transfer syntax only' checkbox is replaced by a dropdown: 'As stored (server decides)', 'Uncompressed — Explicit VR LE preferred', or 'Uncompressed — Implicit VR LE preferred'. The preference now drives both the C-GET proposal order and the storage SCP's pick during C-MOVE negotiation (previously the sender's ordering decided between Explicit and Implicit VR LE). Old profiles are migrated automatically
+- **Guarantee uncompressed on disk** — new per-profile option that ensures every retrieved file is stored as Implicit/Explicit VR Little Endian regardless of PACS behaviour: files that still arrive compressed are decompressed locally after the retrieve (JPEG Baseline/Extended via the Go JPEG decoder, JPEG 2000 via OpenJPEG — the same formats the built-in viewer decodes; JPEG 2000 Lossless converts bit-exactly), and files in formats without a built-in decoder are counted in the status line and logged
+- **Post-retrieve verification** — when an uncompressed syntax is requested, the retrieve status now reports how many files were decompressed locally and how many remain compressed
+- **Persistent local index (SQLite)** — the Local Browse tree is now backed by a SQLite database (`.dicomqr-index.db` inside the download folder), so the Patient → Study → Series hierarchy and the per-instance file paths survive restarts. On startup the tree is populated from the index immediately, with no disk rescan
+- **Automatic index updates** — files received via C-MOVE/C-GET and files copied in through the Import tab are parsed and added to the index when the transfer completes, and the Local Browse tree refreshes itself; a manual Scan still performs a full walk of the folder and rebuilds the index from what is actually on disk
+- **Self-healing tree** — clicking or right-clicking a patient, study, or series whose files were deleted outside the application verifies the files on disk in the background and prunes the missing entries from both the tree and the index (empty series/studies/patients are removed bottom-up). Deleting files from within the app updates the index directly instead of triggering a full rescan
+- Changing the download folder in Preferences switches to that folder's own index file — each managed folder carries its index with it
+
+### Fixed
+
+- **Stale compressed copies were never replaced** — re-retrieving a study previously skipped any file already on disk, so studies downloaded as JPEG 2000 before enabling the uncompressed option silently stayed JPEG 2000. With the on-disk guarantee enabled, both the C-MOVE SCP and the C-GET path now replace an existing compressed copy instead of skipping it
+- **Transfer syntax setting required a reconnect** — the storage SCP read the uncompressed restriction once at connect time, so a Preferences change mid-session had no effect until disconnect/reconnect. The SCP now re-reads the policy per incoming association, and saving Preferences reapplies the active profile's policy immediately
+
+### Internal
+
+- `transcode.go` (new) — `transcodeDICOMFile` decompresses a file in place to Explicit VR LE (temp file + atomic rename; original untouched on any error): J2K frames via `decodeJPEG2000` raw int32 samples, JPEG frames via the library's `GetImage`; single-frame multi-fragment codestreams are reassembled; colour output rewrites Photometric Interpretation to RGB; `fileTransferSyntaxUID` reads (0002,0010) via a meta-only parse
+- `serverprofile.go` — `TransferSyntax` (`""`/`"explicit-le"`/`"implicit-le"`) and `EnsureUncompressed` fields; `migrateProfile` maps the deprecated `TransferUncompressed` to explicit-le + guarantee on load
+- `storagescp.go` — `SetTransferPolicy` replaces `SetUncompressedOnly`; the accepted-syntax list and replace-compressed flag are mutex-guarded and re-read per association; `saveGetFile` gains a `replaceCompressed` parameter
+- `thirdparty/go-netdicom/contextmanager.go` — provider now picks the transfer syntax by the accepted list's order (local preference) rather than the sender's offer order
+- `jpeg2000_stub.go` / `jpeg2000_openjpeg.go` — `jpeg2000Available` compile-time flag; stub gains a `decodeJPEG2000` returning a clear error
+- `catalog.go` (new) — `catalog` type wrapping `modernc.org/sqlite` (pure-Go SQLite, no new CGO surface): WAL mode, single connection, nil-safe methods; `replaceAll` (full-scan rebuild), `ingestPaths` (parse + upsert), `removePaths` (delete + bottom-up prune of empty parents), `load` (returns the same shapes as `scanLocalFolder` so tree population is shared)
+- `localbrowse.go` — per-file metadata extraction factored into `parseLocalFileMeta`/`fileMeta` (shared by the folder scanner and the catalog ingester); `buildLocalBrowseContent` gains `applyData`/`reloadFromDB`/`pruneMissing`/`verifyNode` and returns a reload func; touch-verification is debounced per node with an in-flight guard
+- `importtab.go` — `importOneFile` returns the destination path; completed imports are ingested into the catalog and the Local Browse tree reloads
+- `main.go` — catalog opened at startup and closed on every termination path; retrieve completion ingests the received file paths in the background and reloads the Local Browse tree
+
 ## [1.6.0] — 2026-06-25
 
 ### Added

@@ -430,8 +430,30 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 		retrieveMethodSelect.SetSelected("C-MOVE (default)")
 	}
 
-	uncompressedCheck := widget.NewCheck("Request uncompressed transfer syntax only", nil)
-	uncompressedCheck.SetChecked(p.TransferUncompressed)
+	const (
+		tsLabelAny      = "As stored (server decides)"
+		tsLabelExplicit = "Uncompressed — Explicit VR LE preferred"
+		tsLabelImplicit = "Uncompressed — Implicit VR LE preferred"
+	)
+	ensureCheck := widget.NewCheck("Guarantee uncompressed on disk (decompress locally if needed)", nil)
+	tsSelect := widget.NewSelect([]string{tsLabelAny, tsLabelExplicit, tsLabelImplicit}, func(sel string) {
+		// The on-disk guarantee only makes sense when uncompressed is requested.
+		if sel == tsLabelAny {
+			ensureCheck.SetChecked(false)
+			ensureCheck.Disable()
+		} else {
+			ensureCheck.Enable()
+		}
+	})
+	switch p.TransferSyntax {
+	case tsPrefExplicitLE:
+		tsSelect.SetSelected(tsLabelExplicit)
+	case tsPrefImplicitLE:
+		tsSelect.SetSelected(tsLabelImplicit)
+	default:
+		tsSelect.SetSelected(tsLabelAny)
+	}
+	ensureCheck.SetChecked(p.EnsureUncompressed && p.wantsUncompressed())
 
 	form := widget.NewForm(
 		widget.NewFormItem("Profile name", nameEntry),
@@ -441,7 +463,8 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 		widget.NewFormItem("Connect timeout (s)", timeoutEntry),
 		widget.NewFormItem("Info model", modelSelect),
 		widget.NewFormItem("Retrieve method", retrieveMethodSelect),
-		widget.NewFormItem("Transfer", uncompressedCheck),
+		widget.NewFormItem("Transfer syntax", tsSelect),
+		widget.NewFormItem("", ensureCheck),
 	)
 
 	dialog.ShowCustomConfirm("Edit Server", "Save", "Cancel", form, func(save bool) {
@@ -472,15 +495,23 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 		case "Auto":
 			retrieveMethod = "AUTO"
 		}
+		transferSyntax := tsPrefAny
+		switch tsSelect.Selected {
+		case tsLabelExplicit:
+			transferSyntax = tsPrefExplicitLE
+		case tsLabelImplicit:
+			transferSyntax = tsPrefImplicitLE
+		}
 		onSave(ServerProfile{
-			Name:                 nameEntry.Text,
-			RemoteAETitle:        strings.ToUpper(strings.TrimSpace(aeEntry.Text)),
-			Host:                 strings.TrimSpace(hostEntry.Text),
-			Port:                 port,
-			ConnectTimeout:       timeout,
-			InfoModel:            modelSelect.Selected,
-			RetrieveMethod:       retrieveMethod,
-			TransferUncompressed: uncompressedCheck.Checked,
+			Name:               nameEntry.Text,
+			RemoteAETitle:      strings.ToUpper(strings.TrimSpace(aeEntry.Text)),
+			Host:               strings.TrimSpace(hostEntry.Text),
+			Port:               port,
+			ConnectTimeout:     timeout,
+			InfoModel:          modelSelect.Selected,
+			RetrieveMethod:     retrieveMethod,
+			TransferSyntax:     transferSyntax,
+			EnsureUncompressed: ensureCheck.Checked && transferSyntax != tsPrefAny,
 		})
 	}, w)
 }

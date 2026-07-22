@@ -107,6 +107,11 @@ func loadSettings() Settings {
 			s.DownloadDir = filepath.Join(home, "DICOM Downloads")
 		}
 	}
+
+	// Migrate profiles saved by versions that used the TransferUncompressed flag.
+	for i := range s.Profiles {
+		migrateProfile(&s.Profiles[i])
+	}
 	return s
 }
 

@@ -13,15 +13,19 @@ import (
 	dicom "github.com/grailbio/go-dicom"
 	"github.com/grailbio/go-dicom/dicomio"
 	"github.com/grailbio/go-dicom/dicomtag"
-	"github.com/grailbio/go-dicom/dicomuid"
 )
 
-// uncompressedTransferSyntaxes lists the two standard uncompressed syntaxes
-// offered when a server profile has TransferUncompressed enabled. A conformant
-// PACS must transcode compressed pixel data to one of these before sending.
-var uncompressedTransferSyntaxes = []string{
-	dicomuid.ExplicitVRLittleEndian,
-	dicomuid.ImplicitVRLittleEndian,
+// proposedTransferSyntaxes returns the transfer syntaxes offered in
+// A-ASSOCIATE-RQ for a C-GET association, in the profile's preference order.
+// When the profile requests uncompressed only, a conformant PACS must
+// transcode compressed pixel data before sending. The unrestricted default,
+// dicomio.StandardTransferSyntaxes, also contains no compressed syntax — the
+// preference only decides between Implicit and Explicit VR LE.
+func proposedTransferSyntaxes(p ServerProfile) []string {
+	if pref := p.preferredTransferSyntaxes(); pref != nil {
+		return pref
+	}
+	return dicomio.StandardTransferSyntaxes
 }
 
 // FindResult holds one C-FIND response item. Err is set on error items;
@@ -204,15 +208,11 @@ func (c *DicomClient) Get(ctx context.Context, level, patientID, studyUID, serie
 		return err
 	}
 
-	getTransferSyntaxes := dicomio.StandardTransferSyntaxes
-	if c.profile.TransferUncompressed {
-		getTransferSyntaxes = uncompressedTransferSyntaxes
-	}
 	su, err := netdicom.NewServiceUser(netdicom.ServiceUserParams{
 		CalledAETitle:    c.profile.RemoteAETitle,
 		CallingAETitle:   c.localAETitle,
 		SOPClasses:       sopclass.QRGetClasses,
-		TransferSyntaxes: getTransferSyntaxes,
+		TransferSyntaxes: proposedTransferSyntaxes(c.profile),
 	})
 	if err != nil {
 		return fmt.Errorf("c-get: create service user: %w", err)

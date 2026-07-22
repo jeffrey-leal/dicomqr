@@ -27,7 +27,7 @@ import (
 	sqweekdialog "github.com/sqweek/dialog"
 )
 
-const version = "1.6.0"
+const version = "1.7.0"
 
 // LED colours for connection and SCP state indicators.
 var (
@@ -79,6 +79,15 @@ func main() {
 	ensureDefaultSettings()
 	cfg := loadSettings()
 
+	// Persistent SQLite index of the download directory backing the Local
+	// Browse tree. A nil catalog (open failure) degrades gracefully — every
+	// catalog method is nil-safe and the tab falls back to in-memory scans.
+	cat, catErr := openCatalog(cfg.DownloadDir)
+	if catErr != nil {
+		log.Printf("catalog: open: %v", catErr)
+		cat = nil
+	}
+
 	// Restore the persisted window size, falling back to the default for fresh
 	// installs or implausibly small saved values (Phase 5-2B).
 	if cfg.WindowWidth > 200 && cfg.WindowHeight > 150 {
@@ -113,6 +122,11 @@ func main() {
 		// refreshLocalTree re-renders the Local Browse tab tree after preferences change.
 		// Assigned once buildLocalBrowseContent is called during layout setup.
 		refreshLocalTree = func() {}
+
+		// reloadLocalBrowse repopulates the Local Browse tree from the catalog
+		// after downloads or imports add files. Safe to call from any goroutine.
+		// Assigned once buildLocalBrowseContent is called during layout setup.
+		reloadLocalBrowse = func() {}
 
 		// refreshImportContent updates the Import tab destination label after preferences change.
 		// Assigned once buildImportContent is called during layout setup.
@@ -153,6 +167,16 @@ func main() {
 		connMu.Lock()
 		defer connMu.Unlock()
 		return activeProfile
+	}
+	// setActiveProfileTransfer updates the connected profile's transfer policy
+	// in place when Preferences change, so post-retrieve processing (local
+	// decompression, verification) follows the edited settings without a
+	// reconnect.
+	setActiveProfileTransfer := func(transferSyntax string, ensure bool) {
+		connMu.Lock()
+		defer connMu.Unlock()
+		activeProfile.TransferSyntax = transferSyntax
+		activeProfile.EnsureUncompressed = ensure
 	}
 	getConnCtx := func() context.Context {
 		connMu.Lock()
@@ -786,7 +810,7 @@ func main() {
 			}
 
 			s := NewStorageSCP(cfg.LocalAETitle, cfg.LocalSCPPort, cfg.DownloadDir)
-			s.SetUncompressedOnly(profile.TransferUncompressed)
+			s.SetTransferPolicy(profile.preferredTransferSyntaxes(), profile.EnsureUncompressed)
 			if err := s.Start(); err != nil {
 				fyne.Do(func() {
 					scpLED.FillColor = ledRed
@@ -914,7 +938,8 @@ func main() {
 			dialog.ShowInformation("Not connected", "Connect to a DICOM server first.", w)
 			return
 		}
-		method := getActiveProfile().RetrieveMethod
+		prof := getActiveProfile()
+		method := prof.RetrieveMethod
 		if method == "" {
 			method = "MOVE"
 		}
@@ -958,12 +983,23 @@ func main() {
 
 			var fileCount int64
 
+			// Received file paths are collected so the catalog (and the Local
+			// Browse tree) can be updated once the retrieve completes.
+			var recvMu sync.Mutex
+			var recvPaths []string
+			recordPath := func(path string) {
+				recvMu.Lock()
+				recvPaths = append(recvPaths, path)
+				recvMu.Unlock()
+			}
+
 			// For C-MOVE: intercept sc.OnFileReceived to count and report files.
 			var origOnFileReceived func(string)
 			if sc != nil && (method == "MOVE" || method == "AUTO") {
 				origOnFileReceived = sc.OnFileReceived()
 				sc.SetOnFileReceived(func(path string) {
 					atomic.AddInt64(&fileCount, 1)
+					recordPath(path)
 					if ctx.Err() == nil {
 						fyne.Do(func() { statusLabel.SetText("Received: " + path) })
 					}
@@ -977,12 +1013,13 @@ func main() {
 
 			// For C-GET: callback writes each received instance to the download folder.
 			getCallback := func(txUID, scUID, siUID string, data []byte) error {
-				path, saveErr := saveGetFile(cfg.DownloadDir, txUID, scUID, siUID, data)
+				path, saveErr := saveGetFile(cfg.DownloadDir, txUID, scUID, siUID, data, prof.EnsureUncompressed)
 				if saveErr != nil {
 					log.Printf("c-get: save file: %v", saveErr)
 					return saveErr
 				}
 				atomic.AddInt64(&fileCount, 1)
+				recordPath(path)
 				if ctx.Err() == nil {
 					fyne.Do(func() { statusLabel.SetText("Received: " + path) })
 				}
@@ -1051,6 +1088,49 @@ func main() {
 			}
 
 			restoreSCP()
+
+			recvMu.Lock()
+			received := recvPaths
+			recvPaths = nil
+			recvMu.Unlock()
+
+			// Post-process received files in the background so the final
+			// status message is not delayed: decompress locally when the
+			// profile guarantees uncompressed on disk, verify the on-disk
+			// syntax, then index the files and refresh the Local Browse tree.
+			if len(received) > 0 {
+				go func() {
+					var converted, stillCompressed int
+					for _, pth := range received {
+						if prof.EnsureUncompressed {
+							changed, convErr := transcodeDICOMFile(pth)
+							if convErr != nil {
+								log.Printf("transcode: %s: %v", pth, convErr)
+							} else if changed {
+								converted++
+							}
+						}
+						if prof.wantsUncompressed() && !isUncompressedOnDisk(fileTransferSyntaxUID(pth)) {
+							stillCompressed++
+						}
+					}
+					cat.ingestPaths(received)
+					reloadLocalBrowse()
+					if converted > 0 || stillCompressed > 0 {
+						fyne.Do(func() {
+							msg := fmt.Sprintf("Retrieved %d files", len(received))
+							if converted > 0 {
+								msg += fmt.Sprintf(" — %d decompressed locally", converted)
+							}
+							if stillCompressed > 0 {
+								msg += fmt.Sprintf(" — %d still compressed (see Activity Log)", stillCompressed)
+							}
+							statusLabel.SetText(msg)
+						})
+					}
+				}()
+			}
+
 			n := atomic.LoadInt64(&fileCount)
 			fyne.Do(func() {
 				progressBar.Hide()
@@ -1226,6 +1306,20 @@ func main() {
 				}
 				profileSelect.Options = profileNames()
 				profileSelect.Refresh()
+				// Re-apply the active profile's transfer policy to the running
+				// SCP so a preference change takes effect on the next retrieve
+				// without reconnecting.
+				if sc := getSCP(); sc != nil {
+					active := getActiveProfile()
+					for i := range cfg.Profiles {
+						if cfg.Profiles[i].Name == active.Name {
+							p := cfg.Profiles[i]
+							sc.SetTransferPolicy(p.preferredTransferSyntaxes(), p.EnsureUncompressed)
+							setActiveProfileTransfer(p.TransferSyntax, p.EnsureUncompressed)
+							break
+						}
+					}
+				}
 				tree.Refresh()
 				refreshLocalTree()
 				refreshImportContent()
@@ -1233,7 +1327,7 @@ func main() {
 			})
 		}),
 		fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Quit", func() { saveSettings(cfg); stopClock(); shutdownSCP(); a.Quit() }),
+		fyne.NewMenuItem("Quit", func() { saveSettings(cfg); stopClock(); shutdownSCP(); cat.Close(); a.Quit() }),
 	)
 
 	queryMenu := fyne.NewMenu("Query",
@@ -1364,10 +1458,10 @@ func main() {
 	)
 
 	var localContent fyne.CanvasObject
-	localContent, refreshLocalTree = buildLocalBrowseContent(a, w, &cfg, openInViewer)
+	localContent, refreshLocalTree, reloadLocalBrowse = buildLocalBrowseContent(a, w, &cfg, cat, openInViewer)
 
 	var importContent fyne.CanvasObject
-	importContent, refreshImportContent = buildImportContent(a, w, &cfg)
+	importContent, refreshImportContent = buildImportContent(a, w, &cfg, cat, func() { reloadLocalBrowse() })
 
 	var worklistContent fyne.CanvasObject
 	worklistContent, refreshWorklist = buildWorklistContent(w, &cfg)
@@ -1393,12 +1487,13 @@ func main() {
 		saveSettings(cfg)
 		stopClock()
 		shutdownSCP()
+		cat.Close()
 		w.Close()
 	})
 
 	// Safety net: stop the SCP if the app terminates by any route that bypasses
 	// the close intercept above (Phase 5-2F).
-	a.Lifecycle().SetOnStopped(func() { stopClock(); shutdownSCP() })
+	a.Lifecycle().SetOnStopped(func() { stopClock(); shutdownSCP(); cat.Close() })
 
 	w.ShowAndRun()
 }

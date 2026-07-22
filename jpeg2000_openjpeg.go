@@ -186,6 +186,11 @@ import (
 	"unsafe"
 )
 
+// jpeg2000Available reports at compile time whether the OpenJPEG decoder is
+// linked in. The local decompress fallback checks it before attempting to
+// transcode a JPEG 2000 file.
+const jpeg2000Available = true
+
 // decodeJPEG2000 decodes a JPEG 2000 codestream (or JP2) into planar int32
 // component samples plus geometry. samples holds numComps planes of
 // width*height values (plane 0 first).

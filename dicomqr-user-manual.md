@@ -1,8 +1,8 @@
 # dicomqr
 
-**User Manual  v1.6.0**
+**User Manual  v1.7.0**
 
-June 25, 2026
+July 22, 2026
 
 A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.
 
@@ -21,12 +21,12 @@ Key capabilities:
 - Retrieve entire studies or individual series to a local folder using C-MOVE or C-GET
 - Automatically organise downloaded files by patient, study, and series
 - Query a Modality Worklist server independently of the active PACS connection
-- Browse local DICOM files in the download folder; push them to any PACS via C-STORE or delete them
+- Browse local DICOM files in the download folder — backed by a persistent index so the tree survives restarts — and push them to any PACS via C-STORE or delete them
 - Preview DICOM images in the built-in viewer with interactive window/level, zoom and pan, modality-specific W/L presets, colour maps for PET/SPECT, DICOM annotation overlays, DICOM overlay plane compositing, and study overview grids; decodes JPEG Baseline, JPEG 2000, and uncompressed pixel data
 - View Structured Reports (SR), Key Object Selections (KO), and other non-image DICOM objects in a dedicated scrollable document viewer that renders the SR Content Sequence as formatted text
 - Import DICOM files from external folders into the organised download folder
 - Support for multiple saved server profiles with independent connection and retrieve settings
-- Optionally request uncompressed pixel data transfer per server profile, ensuring the built-in viewer can display all received images regardless of how the PACS stores them
+- Optionally request uncompressed pixel data transfer per server profile — with a preference between Explicit and Implicit VR Little Endian and an optional on-disk guarantee that decompresses received JPEG Baseline/JPEG 2000 files locally, for downstream tools that require uncompressed transfer syntaxes
 - Automatic wildcard search — trailing `*` appended to text fields so partial names match without manual wildcarding
 - Customisable appearance — selection colour, font style, external viewer path, and window size are remembered between sessions
 
@@ -93,7 +93,8 @@ A server profile stores the connection details for one PACS destination. Profile
 | Info model | The DICOM Query/Retrieve information model. `study` = Study Root (most common). `patient` = Patient Root. `patient-study-only` = legacy retired model used by some older systems; SERIES-level queries are not available with this model. |
 | Retrieve method | C-MOVE (default) instructs the PACS to push files to the local C-STORE SCP listener. C-GET requests that the PACS return files over the same association — no inbound port or PACS-side destination registration is required. Auto tries C-GET first and falls back to C-MOVE if the PACS rejects it. |
 | Connect timeout | Seconds to wait for the initial C-ECHO before reporting a failure. Default: 10 s. |
-| Transfer | When 'Request uncompressed transfer syntax only' is ticked, dicomqr restricts its A-ASSOCIATE negotiation to Explicit VR Little Endian and Implicit VR Little Endian only. A conformant PACS must transcode compressed pixel data before sending. Useful when the PACS stores data in a format the built-in viewer cannot decode (e.g. JPEG-LS). Leave unticked unless needed — some PACS systems cannot transcode and will fail the transfer. |
+| Transfer syntax | 'As stored (server decides)' accepts whatever the PACS prefers — a JPEG 2000 archive will typically send JPEG 2000. The two 'Uncompressed' options restrict A-ASSOCIATE negotiation to Explicit VR Little Endian (`1.2.840.10008.1.2.1`) and Implicit VR Little Endian (`1.2.840.10008.1.2`), in the stated preference order — a conformant PACS must transcode compressed pixel data before sending. Note: some PACS systems cannot transcode and will fail the transfer for those SOP classes. |
+| Guarantee uncompressed on disk | Available when an 'Uncompressed' option is selected. Ensures every retrieved file is stored as Implicit or Explicit VR Little Endian: files that still arrive compressed are decompressed locally after the retrieve (JPEG Baseline/Extended and JPEG 2000 — the formats the built-in viewer decodes), and re-retrieving a study replaces older compressed copies on disk instead of skipping them. JPEG 2000 Lossless converts bit-exactly; lossy sources keep their (already lossy) pixel values. Files in formats without a built-in decoder (e.g. JPEG-LS, RLE) are left compressed and counted in the status line and Activity Log. |
 
 The first profile in the list is selected by default when the application starts.
 
@@ -304,9 +305,13 @@ Retrieve cancelled
 The Local Browse tab lets you work with DICOM files already in the download folder — browse the tree, preview images, push to a remote PACS, or delete files — without running a query.
 
 
-### 8.1  Scanning the Download Folder
+### 8.1  The Persistent Index
 
-Click Scan (or the folder icon to open the folder first). dicomqr walks the download directory, parses each `.dcm` file (skipping pixel data for speed), and builds a Patient > Study > Series tree. The status label shows progress and a file count. The folder button opens the download directory in Windows Explorer.
+The Local Browse tree is backed by a persistent index — a SQLite database file (`.dicomqr-index.db`) stored inside the download folder — so the Patient > Study > Series tree from the previous session appears immediately at startup, with no rescan. The index updates automatically when a retrieve or an import adds files, and each download folder carries its own index with it.
+
+Click Scan to rebuild the index from what is actually on disk: dicomqr walks the download directory, parses each `.dcm` file (skipping pixel data for speed), and repopulates both the tree and the index. The status label shows progress and a file count. Use Scan whenever files were added to the folder outside the application. The folder button opens the download directory in Windows Explorer.
+
+If files are removed outside the application, clicking or right-clicking an affected patient, study, or series verifies its files in the background and prunes the missing entries from both the tree and the index automatically.
 
 
 ### 8.2  Filtering and Navigation
@@ -350,7 +355,7 @@ Keyboard controls (while the viewer window is focused):
 
 The Reset button resets both the view (zoom/pan) and the window to the default. Window/level changes made by dragging or by selecting a preset persist as you scroll through the series.
 
-Compressed pixel data — the built-in viewer decodes JPEG Baseline, JPEG 2000 (lossless and lossy), and uncompressed (native) pixel data. Files stored in JPEG-LS, JPEG Lossless, or RLE Lossless formats cannot be decoded and display a message suggesting Open in Viewer; to view those, either use an external viewer or enable 'Request uncompressed transfer syntax only' in the server profile before retrieving (see Section 4.1).
+Compressed pixel data — the built-in viewer decodes JPEG Baseline, JPEG 2000 (lossless and lossy), and uncompressed (native) pixel data. Files stored in JPEG-LS, JPEG Lossless, or RLE Lossless formats cannot be decoded and display a message suggesting Open in Viewer; to view those, either use an external viewer or select an 'Uncompressed' transfer syntax in the server profile before retrieving (see Section 4.1).
 
 
 #### 8.3.2  Window/Level Presets
@@ -441,7 +446,7 @@ A dialog appears with a destination selector (any configured server profile), a 
 
 ### 8.6  Deleting Local Files
 
-Right-click any node and select Delete…, or select items and click Delete Selected…, to permanently remove files from disk. A confirmation dialog shows the file count and total size. After deletion, empty directories are pruned and the tree is rescanned automatically.
+Right-click any node and select Delete…, or select items and click Delete Selected…, to permanently remove files from disk. A confirmation dialog shows the file count and total size. After deletion, empty directories are pruned and the deleted entries are removed from the tree and its index automatically — no rescan needed.
 
 Warning: Deletion is permanent. Files are not moved to the Recycle Bin.
 
@@ -612,7 +617,8 @@ Profile editor fields:
 | Info model | `study` — Study Root (default, most common). `patient` — Patient Root. `patient-study-only` — legacy retired model; SERIES-level lazy-load is suppressed automatically. |
 | Retrieve method | C-MOVE / C-GET / Auto — see Section 4.1. |
 | Connect timeout | Seconds before a connection attempt is considered failed. |
-| Transfer | When ticked, negotiates only uncompressed transfer syntaxes — see Section 4.1 for full details and caveats. |
+| Transfer syntax | 'As stored' or one of the two uncompressed preferences — see Section 4.1 for full details and caveats. |
+| Guarantee uncompressed on disk | Decompresses received files locally so everything on disk is Implicit/Explicit VR Little Endian — see Section 4.1. |
 
 
 ### 14.3  Retrieve Section
@@ -639,7 +645,7 @@ The status bar at the bottom of the window provides real-time feedback. A colour
 
 | Situation | Status bar text |
 |---|---|
-| Application started, not connected | `v1.6.0` |
+| Application started, not connected | `v1.7.0` |
 | Connecting to server | `Connecting…` |
 | Connected | `Connected: <AE>@<host>:<port>` |
 | Connection cancelled | `Connection cancelled` |
@@ -700,7 +706,9 @@ Each entry in the `profiles` array:
 | `infoModel` | `"study"`, `"patient"`, or `"patient-study-only"`. |
 | `retrieveMethod` | `"MOVE"`, `"GET"`, or `"AUTO"`. Omitting defaults to C-MOVE. |
 | `connectTimeout` | Connection timeout in seconds. 0 uses the default (10 s). |
-| `transferUncompressed` | When true, the A-ASSOCIATE negotiation for C-GET and C-MOVE offers only uncompressed transfer syntaxes. Default: false. |
+| `transferSyntax` | `""` (as stored, default), `"explicit-le"`, or `"implicit-le"`. The uncompressed options restrict C-GET/C-MOVE negotiation to Explicit + Implicit VR Little Endian in the stated preference order. |
+| `ensureUncompressed` | When true (and `transferSyntax` is set), received files that are still compressed are decompressed locally to Explicit VR Little Endian, and re-retrieves replace older compressed copies on disk. Default: false. |
+| `transferUncompressed` | Deprecated (pre-v1.7). When true it is migrated on load to `transferSyntax: "explicit-le"` + `ensureUncompressed: true`. |
 
 The Annotations and Overlays toggles are stored in the application's Fyne preferences (not in settings.json) and persist automatically between sessions.
 
@@ -720,7 +728,7 @@ Information model — If queries return no results, try changing the Info model 
 
 Worklist server — The Modality Worklist SOP class is typically served by a RIS or dedicated MWL broker, not the PACS itself. Create a separate server profile pointing to that system and select it in the Worklist tab.
 
-Compressed pixel data — the built-in viewer decodes JPEG Baseline and JPEG 2000. If the PACS stores images in JPEG-LS or another compressed format the viewer cannot decode, enable 'Request uncompressed transfer syntax only' in the server profile. The PACS will transcode on the fly if it supports transcoding. If the PACS does not support transcoding, the transfer will fail for those SOP classes; use the external viewer integration instead.
+Compressed pixel data — the built-in viewer decodes JPEG Baseline and JPEG 2000. If the PACS stores images in JPEG-LS or another compressed format the viewer cannot decode, select an 'Uncompressed' transfer syntax in the server profile. The PACS will transcode on the fly if it supports transcoding. If the PACS does not support transcoding, the transfer will fail for those SOP classes; use the external viewer integration instead. Downstream consumers that require `1.2.840.10008.1.2` / `1.2.840.10008.1.2.1` files should additionally tick 'Guarantee uncompressed on disk', which decompresses received JPEG Baseline/JPEG 2000 files locally and replaces older compressed copies on re-retrieve.
 
 IPv4 connectivity — dicomqr listens on an IPv4 socket only. Ensure the address shown in Help > Client info… is the correct IPv4 address on the same network as the PACS.
 

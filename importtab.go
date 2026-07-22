@@ -13,19 +13,19 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	sqweekdialog "github.com/sqweek/dialog"
 	sdicom "github.com/suyashkumar/dicom"
 	"github.com/suyashkumar/dicom/pkg/tag"
-	sqweekdialog "github.com/sqweek/dialog"
 )
 
 // importOneFile copies a single DICOM file from srcPath into downloadDir using
 // the same organised subfolder hierarchy as the C-STORE SCP.
-// Returns (true, nil) when the file was copied, (false, nil) when it was
-// already present, or (false, err) on failure.
-func importOneFile(srcPath, downloadDir string) (copied bool, err error) {
+// Returns (dest, true, nil) when the file was copied, (dest, false, nil) when
+// it was already present, or ("", false, err) on failure.
+func importOneFile(srcPath, downloadDir string) (dest string, copied bool, err error) {
 	ds, parseErr := sdicom.ParseFile(srcPath, nil, sdicom.SkipPixelData())
 	if parseErr != nil {
-		return false, parseErr
+		return "", false, parseErr
 	}
 
 	getString := func(t tag.Tag) string {
@@ -40,7 +40,7 @@ func importOneFile(srcPath, downloadDir string) (copied bool, err error) {
 		return strings.TrimSpace(strs[0])
 	}
 
-	dest := organizeFilePath(
+	dest = organizeFilePath(
 		downloadDir,
 		getString(tag.PatientName),
 		getString(tag.PatientID),
@@ -52,20 +52,24 @@ func importOneFile(srcPath, downloadDir string) (copied bool, err error) {
 	)
 
 	if _, statErr := os.Stat(dest); statErr == nil {
-		return false, nil // already present
+		return dest, false, nil // already present
 	}
 
 	if mkErr := os.MkdirAll(filepath.Dir(dest), 0o755); mkErr != nil {
-		return false, mkErr
+		return "", false, mkErr
 	}
 
-	return true, scpCopyFile(srcPath, dest)
+	if copyErr := scpCopyFile(srcPath, dest); copyErr != nil {
+		return "", false, copyErr
+	}
+	return dest, true, nil
 }
 
 // buildImportContent constructs the Import tab.
 // Returns (content, refreshFn) where refreshFn updates the destination-folder
-// label when Preferences change.
-func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings) (fyne.CanvasObject, func()) {
+// label when Preferences change. Imported files are added to the catalog and
+// reloadLocal is invoked so the Local Browse tree picks them up.
+func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, reloadLocal func()) (fyne.CanvasObject, func()) {
 	model := newResultsModel()
 	selectedNodes := make(map[string]bool)
 	seriesFiles := make(map[string][]string)
@@ -286,15 +290,20 @@ func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings) (fyne.CanvasOb
 
 		go func() {
 			var nImported, nSkipped, nFailed int
+			var destPaths []string
 			for i, p := range paths {
-				copied, err := importOneFile(p, destDir)
+				dest, copied, err := importOneFile(p, destDir)
 				switch {
 				case err != nil:
 					nFailed++
 				case copied:
 					nImported++
+					destPaths = append(destPaths, dest)
 				default:
+					// Already present on disk — index it anyway in case it was
+					// placed there before the catalog existed.
 					nSkipped++
+					destPaths = append(destPaths, dest)
 				}
 				done := i + 1
 				if done%10 == 0 || done == total {
@@ -302,6 +311,12 @@ func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings) (fyne.CanvasOb
 						progressBar.SetValue(float64(done) / float64(total))
 						importStatusLbl.SetText(fmt.Sprintf("Importing %d / %d…", done, total))
 					})
+				}
+			}
+			if len(destPaths) > 0 {
+				cat.ingestPaths(destPaths)
+				if reloadLocal != nil {
+					reloadLocal()
 				}
 			}
 			fyne.Do(func() {

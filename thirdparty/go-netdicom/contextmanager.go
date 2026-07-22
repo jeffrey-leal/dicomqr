@@ -52,11 +52,17 @@ type contextManager struct {
 	// rejected with PresentationContextProviderRejectionTransferSyntaxNotSupported.
 	// An empty map means accept all transfer syntaxes (default behaviour).
 	acceptedTransferSyntaxes map[string]bool
+	// acceptedTransferSyntaxOrder preserves the caller's ordering of the
+	// accepted list. When restricted, the provider picks the *earliest entry
+	// of this list* that the sender offered, so the local preference wins over
+	// the sender's ordering (dicomqr local patch).
+	acceptedTransferSyntaxOrder []string
 }
 
 // newContextManager creates an empty contextManager.
 // acceptedTSUIDs, when non-nil and non-empty, restricts which transfer syntaxes
 // the provider will accept; pass nil to accept all (service-user / client side).
+// The slice order expresses the provider's preference, most preferred first.
 func newContextManager(label string, acceptedTSUIDs []string) *contextManager {
 	accepted := make(map[string]bool, len(acceptedTSUIDs))
 	for _, uid := range acceptedTSUIDs {
@@ -69,6 +75,7 @@ func newContextManager(label string, acceptedTSUIDs []string) *contextManager {
 		peerMaxPDUSize:                   16384, // The default value used by Osirix & pynetdicom.
 		tmpRequests:                      make(map[byte]*pdu_item.PresentationContextItem),
 		acceptedTransferSyntaxes:         accepted,
+		acceptedTransferSyntaxOrder:      acceptedTSUIDs,
 	}
 	return c
 }
@@ -148,13 +155,25 @@ func (m *contextManager) onAssociateRequest(requestItems []pdu_item.SubItem) ([]
 				return nil, fmt.Errorf("dicom.onAssociateRequest: SOP or transfersyntax not found in PresentationContext: %v",
 					ri.String())
 			}
-			// Pick the first offered transfer syntax that satisfies the filter.
-			// If no filter is set (empty map), accept the first offered syntax.
+			// If no filter is set (empty map), accept the sender's first
+			// offered syntax. When a filter is set, pick by *our* preference
+			// order — the earliest entry of the accepted list that the sender
+			// offered — rather than the sender's ordering, so e.g. Explicit VR
+			// LE is chosen even when the sender lists Implicit VR LE first
+			// (dicomqr local patch).
 			var pickedTransferSyntaxUID string
-			for _, ts := range offeredSyntaxes {
-				if len(m.acceptedTransferSyntaxes) == 0 || m.acceptedTransferSyntaxes[ts] {
-					pickedTransferSyntaxUID = ts
-					break
+			if len(m.acceptedTransferSyntaxes) == 0 {
+				pickedTransferSyntaxUID = offeredSyntaxes[0]
+			} else {
+				offered := make(map[string]bool, len(offeredSyntaxes))
+				for _, ts := range offeredSyntaxes {
+					offered[ts] = true
+				}
+				for _, want := range m.acceptedTransferSyntaxOrder {
+					if offered[want] {
+						pickedTransferSyntaxUID = want
+						break
+					}
 				}
 			}
 			if pickedTransferSyntaxUID == "" {
