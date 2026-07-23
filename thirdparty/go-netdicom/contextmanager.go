@@ -178,8 +178,11 @@ func (m *contextManager) onAssociateRequest(requestItems []pdu_item.SubItem) ([]
 			}
 			if pickedTransferSyntaxUID == "" {
 				// No offered transfer syntax is in the accepted set — reject.
-				dicomlog.Vprintf(1, "dicom.onAssociateRequest(%s): rejecting %v: none of offered syntaxes %v are in accepted set",
-					m.label, sopUID, offeredSyntaxes)
+				// Logged at level 0: a rejected presentation context is the
+				// most common reason a sub-operation fails or a sender stalls,
+				// so it must always be visible in dicom.log.
+				dicomlog.Vprintf(0, "dicom.onAssociateRequest(%s): REJECTED presentation context for %v — offered transfer syntaxes %v, accepted set %v",
+					m.label, sopUID, offeredSyntaxes, m.acceptedTransferSyntaxOrder)
 				responses = append(responses, &pdu_item.PresentationContextItem{
 					Type:      pdu_item.ItemTypePresentationContextResponse,
 					ContextID: ri.ContextID,
@@ -194,8 +197,8 @@ func (m *contextManager) onAssociateRequest(requestItems []pdu_item.SubItem) ([]
 				ContextID: ri.ContextID,
 				Result:    0, // accepted
 				Items:     []pdu_item.SubItem{&pdu_item.TransferSyntaxSubItem{Name: pickedTransferSyntaxUID}}})
-			dicomlog.Vprintf(2, "dicom.onAssociateRequest(%s): Provider(%p): addmapping %v %v %v",
-				m.label, m, sopUID, pickedTransferSyntaxUID, ri.ContextID)
+			dicomlog.Vprintf(1, "dicom.onAssociateRequest(%s): accepted %v with transfer syntax %v (offered %v)",
+				m.label, sopUID, pickedTransferSyntaxUID, offeredSyntaxes)
 			addContextMapping(m, sopUID, pickedTransferSyntaxUID, ri.ContextID, pdu_item.PresentationContextAccepted)
 		case *pdu_item.UserInformationItem:
 			for _, subItem := range ri.Items {
@@ -281,6 +284,10 @@ func (m *contextManager) onAssociateResponse(responses []pdu_item.SubItem) error
 					dicomuid.UIDString(pickedTransferSyntaxUID),
 					dicomuid.UIDString(sopUID),
 					request.Items)
+			}
+			if ri.Result == pdu_item.PresentationContextAccepted {
+				dicomlog.Vprintf(1, "dicom.onAssociateResponse(%s): server accepted %v with transfer syntax %v",
+					m.label, dicomuid.UIDString(sopUID), dicomuid.UIDString(pickedTransferSyntaxUID))
 			}
 			addContextMapping(m, sopUID, pickedTransferSyntaxUID, ri.ContextID, ri.Result)
 		case *pdu_item.UserInformationItem:

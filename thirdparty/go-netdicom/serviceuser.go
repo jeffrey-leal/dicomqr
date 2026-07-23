@@ -524,8 +524,13 @@ func (su *ServiceUser) CGet(qrLevel QRLevel, filter []*dicom.Element,
 				payload = nil
 			}
 		}
+		// cs.context is the storage presentation context this sub-operation
+		// arrived on — its negotiated transfer syntax describes the payload.
+		// The enclosing C-GET context's syntax (`context`) only describes the
+		// QR identifier and may differ (e.g. Explicit VR LE for the QR context
+		// while the instance arrives as JPEG 2000).
 		status := cb(
-			context.transferSyntaxUID,
+			cs.context.transferSyntaxUID,
 			c.AffectedSOPClassUID,
 			c.AffectedSOPInstanceUID,
 			payload)
@@ -565,6 +570,15 @@ func (su *ServiceUser) CGet(qrLevel QRLevel, filter []*dicom.Element,
 		}
 		if resp.Status.Status != dimse.StatusPending {
 			if resp.Status.Status != 0 {
+				// 0xBxxx are DICOM warning statuses (e.g. 0xB000 Sub-operations
+				// Complete with Failures). The transfer finished; treat as
+				// success, mirroring the C-MOVE handling.
+				if resp.Status.Status&0xF000 == 0xB000 {
+					dicomlog.Vprintf(0, "dicom.serviceUser: C-GET completed with warning status 0x%04X (%d of %d sub-operations failed)",
+						uint16(resp.Status.Status), resp.NumberOfFailedSuboperations,
+						resp.NumberOfFailedSuboperations+resp.NumberOfCompletedSuboperations+resp.NumberOfWarningSuboperations)
+					break
+				}
 				e := fmt.Errorf("Received C-GET error: %+v", resp)
 				dicomlog.Vprintf(0, "dicom.serviceUser: C-GET: %v", e)
 				return e
@@ -638,7 +652,12 @@ func (su *ServiceUser) CMove(qrLevel QRLevel, moveDestination string, filter []*
 				// 0xBxxx are DICOM warning statuses (e.g. 0xB000 Sub-operations
 				// Complete with Failures). The transfer finished; treat as success.
 				if resp.Status.Status&0xF000 == 0xB000 {
-					dicomlog.Vprintf(0, "dicom.serviceUser: C-MOVE completed with warning status 0x%04X", resp.Status.Status)
+					// Convert to a plain integer first: StatusCode implements
+					// fmt.Stringer, and %X on a Stringer hex-dumps the String()
+					// bytes instead of printing the numeric code.
+					dicomlog.Vprintf(0, "dicom.serviceUser: C-MOVE completed with warning status 0x%04X (%d of %d sub-operations failed)",
+						uint16(resp.Status.Status), resp.NumberOfFailedSuboperations,
+						resp.NumberOfFailedSuboperations+resp.NumberOfCompletedSuboperations+resp.NumberOfWarningSuboperations)
 					return nil
 				}
 				return fmt.Errorf("dicom.serviceUser: C-MOVE failed: %v", resp.Status)
@@ -652,6 +671,27 @@ func (su *ServiceUser) CMove(qrLevel QRLevel, moveDestination string, filter []*
 // Release(), no other operation can be performed on the ServiceUser object.
 func (su *ServiceUser) Release() {
 	su.disp.downcallCh <- stateEvent{event: evt11}
+	su.mu.Lock()
+	defer su.mu.Unlock()
+	su.status = serviceUserClosed
+	su.cond.Broadcast()
+	su.disp.close()
+}
+
+// Abort tears the association down immediately with an A-ABORT PDU and closes
+// the transport connection (dicomqr local patch). Unlike Release, it does not
+// wait for the peer to acknowledge: any DIMSE operation blocked waiting for a
+// response is unblocked with a "connection closed" error. Use it to recover
+// from a peer that has stopped responding mid-operation — e.g. a PACS whose
+// C-MOVE agent stalls on non-image objects. Safe to call concurrently with,
+// or after, Release.
+func (su *ServiceUser) Abort() {
+	select {
+	case su.disp.downcallCh <- stateEvent{event: evt15}:
+	default:
+		// State machine already gone or the channel is saturated during a
+		// wedge — disp.close() below still unblocks all pending commands.
+	}
 	su.mu.Lock()
 	defer su.mu.Unlock()
 	su.status = serviceUserClosed

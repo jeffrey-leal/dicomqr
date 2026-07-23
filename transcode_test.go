@@ -2,11 +2,9 @@ package main
 
 import (
 	"os"
-	"path/filepath"
 	"testing"
 
 	sdicom "github.com/suyashkumar/dicom"
-	"github.com/suyashkumar/dicom/pkg/frame"
 	"github.com/suyashkumar/dicom/pkg/tag"
 )
 
@@ -38,50 +36,6 @@ func TestCanDecompressSyntax(t *testing.T) {
 		if got := canDecompressSyntax(uid); got != want {
 			t.Errorf("canDecompressSyntax(%q) = %v, want %v", uid, got, want)
 		}
-	}
-}
-
-func TestMigrateProfile(t *testing.T) {
-	// Old-style flag maps to Explicit VR LE preferred + on-disk guarantee.
-	p := ServerProfile{TransferUncompressed: true}
-	migrateProfile(&p)
-	if p.TransferSyntax != tsPrefExplicitLE || !p.EnsureUncompressed || p.TransferUncompressed {
-		t.Errorf("migrated profile = %+v, want explicit-le + ensure, old flag cleared", p)
-	}
-
-	// A profile that already has the new field wins over the old flag.
-	p = ServerProfile{TransferUncompressed: true, TransferSyntax: tsPrefImplicitLE}
-	migrateProfile(&p)
-	if p.TransferSyntax != tsPrefImplicitLE || p.EnsureUncompressed {
-		t.Errorf("migrate must not override explicit new-style settings: %+v", p)
-	}
-
-	// Untouched default profile stays "as stored".
-	p = ServerProfile{}
-	migrateProfile(&p)
-	if p.TransferSyntax != tsPrefAny || p.EnsureUncompressed {
-		t.Errorf("default profile changed by migration: %+v", p)
-	}
-}
-
-func TestPreferredTransferSyntaxes(t *testing.T) {
-	p := ServerProfile{TransferSyntax: tsPrefExplicitLE}
-	if got := p.preferredTransferSyntaxes(); len(got) != 2 || got[0] != tsExplicitVRLE || got[1] != tsImplicitVRLE {
-		t.Errorf("explicit-le preference = %v", got)
-	}
-	p.TransferSyntax = tsPrefImplicitLE
-	if got := p.preferredTransferSyntaxes(); len(got) != 2 || got[0] != tsImplicitVRLE || got[1] != tsExplicitVRLE {
-		t.Errorf("implicit-le preference = %v", got)
-	}
-	p.TransferSyntax = tsPrefAny
-	if got := p.preferredTransferSyntaxes(); got != nil {
-		t.Errorf("any preference = %v, want nil (accept all)", got)
-	}
-	if !(ServerProfile{TransferSyntax: tsPrefExplicitLE}).wantsUncompressed() {
-		t.Error("explicit-le must report wantsUncompressed")
-	}
-	if (ServerProfile{}).wantsUncompressed() {
-		t.Error("default profile must not report wantsUncompressed")
 	}
 }
 
@@ -117,79 +71,19 @@ func TestNewNativeFromSamples(t *testing.T) {
 	}
 }
 
-// writeTestDICOM writes a minimal native 8-bit 2×2 Explicit VR LE file and
-// returns its path.
-func writeTestDICOM(t *testing.T, dir string) string {
-	t.Helper()
-	nf := frame.NewNativeFrame[uint8](8, 2, 2, 4, 1)
-	copy(nf.RawData, []uint8{10, 20, 30, 40})
-	pd, err := sdicom.NewElement(tag.PixelData, sdicom.PixelDataInfo{
-		IsEncapsulated: false,
-		Frames:         []*frame.Frame{{Encapsulated: false, NativeData: nf}},
-	})
-	if err != nil {
-		t.Fatalf("NewElement(PixelData): %v", err)
-	}
-	ds := sdicom.Dataset{Elements: []*sdicom.Element{
-		mustTestElement(t, tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.7"}),
-		mustTestElement(t, tag.MediaStorageSOPInstanceUID, []string{"1.2.3.4.5"}),
-		mustTestElement(t, tag.TransferSyntaxUID, []string{tsExplicitVRLE}),
-		mustTestElement(t, tag.SOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.7"}),
-		mustTestElement(t, tag.SOPInstanceUID, []string{"1.2.3.4.5"}),
-		mustTestElement(t, tag.PhotometricInterpretation, []string{"MONOCHROME2"}),
-		mustTestElement(t, tag.Rows, []int{2}),
-		mustTestElement(t, tag.Columns, []int{2}),
-		mustTestElement(t, tag.BitsAllocated, []int{8}),
-		mustTestElement(t, tag.BitsStored, []int{8}),
-		mustTestElement(t, tag.HighBit, []int{7}),
-		mustTestElement(t, tag.PixelRepresentation, []int{0}),
-		mustTestElement(t, tag.SamplesPerPixel, []int{1}),
-		pd,
-	}}
-
-	path := filepath.Join(dir, "native.dcm")
-	f, err := os.Create(path)
-	if err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	defer f.Close()
-	if err := sdicom.Write(f, ds); err != nil {
-		t.Fatalf("write test DICOM: %v", err)
-	}
-	return path
-}
-
-func mustTestElement(t *testing.T, tg tag.Tag, data any) *sdicom.Element {
-	t.Helper()
-	e, err := sdicom.NewElement(tg, data)
-	if err != nil {
-		t.Fatalf("NewElement(%v): %v", tg, err)
-	}
-	return e
-}
-
-func TestFileTransferSyntaxUID(t *testing.T) {
-	path := writeTestDICOM(t, t.TempDir())
-	if got := fileTransferSyntaxUID(path); got != tsExplicitVRLE {
-		t.Errorf("fileTransferSyntaxUID = %q, want %q", got, tsExplicitVRLE)
-	}
-	if got := fileTransferSyntaxUID(filepath.Join(t.TempDir(), "missing.dcm")); got != "" {
-		t.Errorf("missing file gave %q, want empty", got)
-	}
-}
-
-func TestTranscodeNoOpOnUncompressed(t *testing.T) {
+func TestTranscodeNoOpOnTargetSyntax(t *testing.T) {
+	// writeTestDICOM produces Explicit VR LE; targeting the same syntax is a no-op.
 	path := writeTestDICOM(t, t.TempDir())
 	before, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	changed, err := transcodeDICOMFile(path)
+	changed, err := transcodeDICOMFile(path, tsExplicitVRLE)
 	if err != nil {
 		t.Fatalf("transcodeDICOMFile: %v", err)
 	}
 	if changed {
-		t.Error("uncompressed file must not be rewritten")
+		t.Error("file already in the target syntax must not be rewritten")
 	}
 	after, err := os.ReadFile(path)
 	if err != nil {
@@ -197,5 +91,104 @@ func TestTranscodeNoOpOnUncompressed(t *testing.T) {
 	}
 	if string(before) != string(after) {
 		t.Error("file content changed by a no-op transcode")
+	}
+}
+
+// dicomPixels re-parses a native (uncompressed) file and returns its first
+// frame's 8-bit sample data.
+func dicomPixels(t *testing.T, path string) []uint8 {
+	t.Helper()
+	ds, err := sdicom.ParseFile(path, nil)
+	if err != nil {
+		t.Fatalf("re-parse %s: %v", path, err)
+	}
+	pdElem, err := ds.FindElementByTag(tag.PixelData)
+	if err != nil {
+		t.Fatalf("PixelData missing: %v", err)
+	}
+	info := pdElem.Value.GetValue().(sdicom.PixelDataInfo)
+	if info.IsEncapsulated || len(info.Frames) != 1 {
+		t.Fatalf("expected 1 native frame, got encapsulated=%v frames=%d", info.IsEncapsulated, len(info.Frames))
+	}
+	nf, err := info.Frames[0].GetNativeFrame()
+	if err != nil {
+		t.Fatalf("GetNativeFrame: %v", err)
+	}
+	raw, ok := nf.RawDataSlice().([]uint8)
+	if !ok {
+		t.Fatalf("RawDataSlice type %T, want []uint8", nf.RawDataSlice())
+	}
+	return raw
+}
+
+// A file already uncompressed but in the other VR encoding must still be
+// re-encoded to the required syntax (lossless, pixels preserved) — this is
+// what the receive path relies on when a server sends the other uncompressed
+// VR instead of the required one.
+func TestTranscodeUncompressedVRConversion(t *testing.T) {
+	path := writeTestDICOM(t, t.TempDir()) // Explicit VR LE, pixels 10,20,30,40
+	wantPixels := []uint8{10, 20, 30, 40}
+
+	// Explicit VR LE -> Implicit VR LE.
+	changed, err := transcodeDICOMFile(path, tsImplicitVRLE)
+	if err != nil {
+		t.Fatalf("Explicit->Implicit: %v", err)
+	}
+	if !changed {
+		t.Fatal("Explicit->Implicit should have rewritten the file")
+	}
+	if got := fileTransferSyntaxUID(path); got != tsImplicitVRLE {
+		t.Fatalf("after Explicit->Implicit: transfer syntax = %q, want %q", got, tsImplicitVRLE)
+	}
+	if got := dicomPixels(t, path); len(got) < 4 ||
+		got[0] != wantPixels[0] || got[1] != wantPixels[1] || got[2] != wantPixels[2] || got[3] != wantPixels[3] {
+		t.Errorf("pixels after Explicit->Implicit = %v, want %v", got, wantPixels)
+	}
+
+	// Implicit VR LE -> Explicit VR LE round-trips losslessly.
+	changed, err = transcodeDICOMFile(path, tsExplicitVRLE)
+	if err != nil {
+		t.Fatalf("Implicit->Explicit: %v", err)
+	}
+	if !changed {
+		t.Fatal("Implicit->Explicit should have rewritten the file")
+	}
+	if got := fileTransferSyntaxUID(path); got != tsExplicitVRLE {
+		t.Fatalf("after Implicit->Explicit: transfer syntax = %q, want %q", got, tsExplicitVRLE)
+	}
+	if got := dicomPixels(t, path); len(got) < 4 ||
+		got[0] != wantPixels[0] || got[1] != wantPixels[1] || got[2] != wantPixels[2] || got[3] != wantPixels[3] {
+		t.Errorf("pixels after Implicit->Explicit = %v, want %v", got, wantPixels)
+	}
+}
+
+// A compressed syntax with no built-in decoder must fail with a clear error
+// and leave the original untouched — the receive path turns this into a failed
+// sub-operation.
+func TestTranscodeRejectsUndecodableSyntax(t *testing.T) {
+	path := writeTestDICOM(t, t.TempDir())
+	// Rewrite the meta TS to JPEG-LS (no decoder) without touching pixel data.
+	ds, err := sdicom.ParseFile(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := setElementValue(&ds, tag.TransferSyntaxUID, []string{"1.2.840.10008.1.2.4.80"}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeErr := sdicom.Write(f, ds, sdicom.SkipVRVerification(), sdicom.SkipValueTypeVerification())
+	f.Close()
+	if writeErr != nil {
+		// The library refuses to write native pixels under an encapsulated
+		// meta syntax — the fixture cannot be built this way; not a defect in
+		// the code under test.
+		t.Skipf("cannot build JPEG-LS-labelled fixture: %v", writeErr)
+	}
+
+	if _, err := transcodeDICOMFile(path, tsExplicitVRLE); err == nil {
+		t.Fatal("JPEG-LS source must be rejected (no built-in decoder)")
 	}
 }

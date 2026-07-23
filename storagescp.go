@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -47,16 +48,19 @@ type StorageSCP struct {
 	cancel   context.CancelFunc
 	ln       net.Listener
 
-	// Transfer policy, guarded by tsMu. acceptedTS, when non-nil, restricts
-	// (in preference order) the transfer syntaxes accepted in A-ASSOCIATE-RQ
-	// negotiation, forcing the PACS to transcode before sending; nil accepts
-	// everything. replaceCompressed causes an incoming file to overwrite an
-	// existing on-disk copy whose transfer syntax is compressed (normally
-	// existing files are skipped). Both are re-read per incoming connection,
-	// so preference changes apply without restarting the listener.
-	tsMu              sync.RWMutex
-	acceptedTS        []string
-	replaceCompressed bool
+	// Transfer policy, guarded by tsMu. requiredTS, when non-empty, is the
+	// transfer syntax every received file must be in on disk. Negotiation
+	// offers it first, plus the syntaxes the receive path can convert locally
+	// (see acceptedSyntaxesFor); anything arriving in a non-required accepted
+	// syntax is transcoded before it reaches its destination. Empty accepts
+	// everything as stored. Re-read per incoming connection, so a change
+	// applies without restarting the listener.
+	tsMu       sync.RWMutex
+	requiredTS string
+
+	// converted counts files transcoded locally since the SCP was created;
+	// the retrieve loop reads deltas to report server non-compliance.
+	converted atomic.Int64
 }
 
 // DownloadDir returns the download directory (thread-safe, Phase 1-B).
@@ -73,22 +77,26 @@ func (s *StorageSCP) SetDownloadDir(d string) {
 	s.downloadDir = d
 }
 
-// SetTransferPolicy configures negotiation and overwrite behaviour from a
-// server profile. Safe to call while the SCP is running — new associations
-// pick up the current values.
-func (s *StorageSCP) SetTransferPolicy(accepted []string, replaceCompressed bool) {
+// SetTransferPolicy sets the single transfer syntax UID required for incoming
+// files ("" accepts everything). Safe to call while the SCP is running — new
+// associations pick up the current value.
+func (s *StorageSCP) SetTransferPolicy(requiredTS string) {
 	s.tsMu.Lock()
 	defer s.tsMu.Unlock()
-	s.acceptedTS = accepted
-	s.replaceCompressed = replaceCompressed
+	s.requiredTS = requiredTS
 }
 
-// transferPolicy returns the current negotiation restriction and overwrite flag.
-func (s *StorageSCP) transferPolicy() ([]string, bool) {
+// transferPolicy returns the currently required transfer syntax UID ("" = any).
+func (s *StorageSCP) transferPolicy() string {
 	s.tsMu.RLock()
 	defer s.tsMu.RUnlock()
-	return s.acceptedTS, s.replaceCompressed
+	return s.requiredTS
 }
+
+// ConvertedCount returns the number of received files transcoded locally since
+// the SCP was created. Callers snapshot it around a retrieve to report how
+// many files the server did not deliver in the required syntax.
+func (s *StorageSCP) ConvertedCount() int64 { return s.converted.Load() }
 
 // SetOnFileReceived sets the callback (thread-safe, Phase 1-C).
 func (s *StorageSCP) SetOnFileReceived(fn func(path string)) {
@@ -198,10 +206,16 @@ func (s *StorageSCP) Start() error {
 			if err != nil {
 				return
 			}
-			// Re-read the transfer policy per association so preference
-			// changes made while running apply to the next retrieve.
+			// Re-read the transfer policy per association so a requirement
+			// change made while running applies to the next retrieve.
 			p := params
-			p.AcceptedTransferSyntaxes, _ = s.transferPolicy()
+			policy := "all transfer syntaxes"
+			if req := s.transferPolicy(); req != "" {
+				p.AcceptedTransferSyntaxes = acceptedSyntaxesFor(req)
+				policy = fmt.Sprintf("required transfer syntax %s (accepting %v for local conversion)",
+					req, p.AcceptedTransferSyntaxes[1:])
+			}
+			log.Printf("scp: association from %s (%s)", conn.RemoteAddr(), policy)
 			go netdicom.RunProviderForConn(ctx, conn, p)
 		}
 	}()
@@ -281,16 +295,35 @@ func (s *StorageSCP) handleCStore(
 	dest := organizeFilePath(s.DownloadDir(), patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber, sopInstanceUID)
 
 	// Skip writing if the file already exists; discard the temp file and return
-	// success so the PACS doesn't retry. Do not invoke callOnFileReceived —
-	// the UI file count reflects only newly written files. Exception: when the
-	// profile guarantees uncompressed files on disk and the existing copy is
-	// compressed (downloaded before the guarantee was enabled), fall through
-	// and replace it with the incoming copy.
+	// success so the PACS doesn't retry. callOnFileReceived is not invoked for
+	// a skipped file — the UI file count reflects only newly written files.
+	// Exception: when a specific transfer syntax is required and the existing
+	// copy is in a different one (downloaded before the requirement was set),
+	// fall through and replace it with the incoming copy, which the conversion
+	// step below guarantees is in the required syntax.
+	req := s.transferPolicy()
 	if _, statErr := os.Stat(dest); statErr == nil {
-		_, replace := s.transferPolicy()
-		if !replace || isUncompressedOnDisk(fileTransferSyntaxUID(dest)) {
+		if req == "" || fileTransferSyntaxUID(dest) == req {
 			os.Remove(tmpPath)
 			return dimse.Success
+		}
+	}
+
+	// Enforce the required transfer syntax BEFORE the file reaches its final
+	// destination: a file in the wrong syntax is transcoded in place while
+	// still a temp file, so the destination only ever holds conforming files.
+	// A conversion failure fails this sub-operation — the PACS reports it and
+	// the retrieve aborts — rather than leaving a non-conforming file behind.
+	if req != "" && transferSyntaxUID != req {
+		changed, convErr := transcodeDICOMFile(tmpPath, req)
+		if convErr != nil {
+			os.Remove(tmpPath)
+			log.Printf("scp: convert %s from %s to %s: %v", sopInstanceUID, transferSyntaxUID, req, convErr)
+			return dimse.Status{Status: dimse.CStoreOutOfResources,
+				ErrorComment: fmt.Sprintf("local conversion to %s failed: %v", req, convErr)}
+		}
+		if changed {
+			s.converted.Add(1)
 		}
 	}
 
@@ -468,17 +501,21 @@ func scpCopyFile(src, dst string) error {
 // the same organized subfolder hierarchy as the C-STORE SCP. The data argument
 // is the raw DICOM dataset bytes as received from the C-GET callback (no Group
 // 2 prefix); this function prepends the proper DICOM File Meta Information
-// header before writing. Returns the path of the saved file.
-// replaceCompressed causes an existing on-disk copy with a compressed transfer
-// syntax to be overwritten instead of skipped (mirrors handleCStore).
-func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID string, data []byte, replaceCompressed bool) (string, error) {
+// header before writing. Returns the path of the saved file and whether the
+// payload was transcoded locally to requiredTS.
+// requiredTS, when non-empty, is enforced exactly as in handleCStore: an
+// arriving file in a different syntax is converted before it reaches its
+// destination (a failure is returned as an error, failing the sub-operation),
+// and an existing on-disk copy in a different syntax is overwritten instead of
+// skipped.
+func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID string, data []byte, requiredTS string) (string, bool, error) {
 	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
-		return "", fmt.Errorf("cannot create download directory: %w", err)
+		return "", false, fmt.Errorf("cannot create download directory: %w", err)
 	}
 
 	tmpFile, err := os.CreateTemp(downloadDir, ".recv_*.tmp")
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	tmpPath := tmpFile.Name()
 
@@ -491,13 +528,13 @@ func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID str
 	if encErr := enc.Error(); encErr != nil {
 		tmpFile.Close()
 		os.Remove(tmpPath)
-		return "", encErr
+		return "", false, encErr
 	}
 
 	if _, err := tmpFile.Write(data); err != nil {
 		tmpFile.Close()
 		os.Remove(tmpPath)
-		return "", err
+		return "", false, err
 	}
 	tmpFile.Close()
 
@@ -507,29 +544,41 @@ func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID str
 
 	// Skip writing if the file already exists; discard the temp file.
 	// The caller does not invoke the status callback for skipped files.
-	// Exception: replace an existing compressed copy when the profile
-	// guarantees uncompressed files on disk.
+	// Exception: replace an existing copy whose transfer syntax differs from
+	// the required one (mirrors handleCStore).
 	if _, statErr := os.Stat(dest); statErr == nil {
-		if !replaceCompressed || isUncompressedOnDisk(fileTransferSyntaxUID(dest)) {
+		if requiredTS == "" || fileTransferSyntaxUID(dest) == requiredTS {
 			os.Remove(tmpPath)
-			return dest, nil
+			return dest, false, nil
 		}
+	}
+
+	// Enforce the required transfer syntax before the file reaches its final
+	// destination (mirrors handleCStore); a failure fails the sub-operation.
+	converted := false
+	if requiredTS != "" && transferSyntaxUID != requiredTS {
+		changed, convErr := transcodeDICOMFile(tmpPath, requiredTS)
+		if convErr != nil {
+			os.Remove(tmpPath)
+			return "", false, fmt.Errorf("local conversion to %s failed: %w", requiredTS, convErr)
+		}
+		converted = changed
 	}
 
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		os.Remove(tmpPath)
-		return "", err
+		return "", false, err
 	}
 
 	if err := os.Rename(tmpPath, dest); err != nil {
 		if copyErr := scpCopyFile(tmpPath, dest); copyErr != nil {
 			os.Remove(tmpPath)
-			return "", copyErr
+			return "", false, copyErr
 		}
 		os.Remove(tmpPath)
 	}
 
-	return dest, nil
+	return dest, converted, nil
 }
 
 // dirWritable verifies that dir exists (creating it if necessary) and is
@@ -552,8 +601,8 @@ func dirWritable(dir string) error {
 	return nil
 }
 
-// cleanupStaleTempFiles removes any .recv_*.tmp files left in dir by a
-// previous session that was killed mid-transfer.
+// cleanupStaleTempFiles removes any .recv_*.tmp or .transcode_*.tmp files left
+// in dir by a previous session that was killed mid-transfer or mid-conversion.
 func cleanupStaleTempFiles(dir string) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -561,7 +610,8 @@ func cleanupStaleTempFiles(dir string) {
 	}
 	for _, e := range entries {
 		n := e.Name()
-		if !e.IsDir() && strings.HasPrefix(n, ".recv_") && strings.HasSuffix(n, ".tmp") {
+		stale := strings.HasPrefix(n, ".recv_") || strings.HasPrefix(n, ".transcode_")
+		if !e.IsDir() && stale && strings.HasSuffix(n, ".tmp") {
 			os.Remove(filepath.Join(dir, n))
 		}
 	}

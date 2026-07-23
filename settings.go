@@ -3,8 +3,11 @@ package main
 import (
 	_ "embed"
 	"encoding/json"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // defaultViewerCandidates lists well-known DICOM viewer executables, checked in
@@ -52,6 +55,13 @@ type Settings struct {
 	// ViewerPath is the full path to an external DICOM viewer executable.
 	// Empty means no external viewer is configured.
 	ViewerPath string `json:"viewerPath"`
+
+	// RetrieveStallTimeoutSec aborts a retrieve when no progress response and
+	// no received file arrives for this many seconds — recovery from PACS
+	// servers whose C-MOVE agent stalls on non-image objects (SR/PR). 0 uses
+	// the default (120 s); negative disables stall detection (e.g. for slow
+	// tape archives).
+	RetrieveStallTimeoutSec int `json:"retrieveStallTimeoutSec,omitempty"`
 }
 
 func appSettingsDir() (string, error) {
@@ -115,42 +125,62 @@ func loadSettings() Settings {
 	return s
 }
 
-// saveSettings writes s to ~/.dicomqr/settings.json as indented JSON atomically
-// (write-to-temp + rename) to prevent corruption on crash mid-write.
+// saveSettings writes s via saveSettingsE and logs any failure. Call sites
+// with a window to report to (the Preferences dialog) use saveSettingsE
+// directly and surface the error to the user — a settings save must never
+// fail silently again (field evidence 2026-07-23: mid-session preference
+// changes were lost without a trace).
 func saveSettings(s Settings) {
+	if err := saveSettingsE(s); err != nil {
+		log.Printf("settings: save failed: %v", err)
+	}
+}
+
+// saveSettingsE writes s to ~/.dicomqr/settings.json as indented JSON
+// atomically (write-to-temp + rename) to prevent corruption on crash
+// mid-write. The final rename is retried briefly: antivirus and indexing
+// tools open freshly written files and can hold the destination just long
+// enough to fail a single attempt.
+func saveSettingsE(s Settings) error {
 	path, err := appSettingsPath()
 	if err != nil {
-		return
+		return fmt.Errorf("locate settings file: %w", err)
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return
+		return fmt.Errorf("create settings directory: %w", err)
 	}
 	if s.Profiles == nil {
 		s.Profiles = []ServerProfile{}
 	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
 
 	// Write to temp file first; os.Rename is atomic on NTFS.
 	tmp, err := os.CreateTemp(dir, ".settings_*.json.tmp")
 	if err != nil {
-		return
+		return fmt.Errorf("create temp settings file: %w", err)
 	}
 	tmpPath := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		os.Remove(tmpPath)
-		return
+		return err
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpPath)
-		return
+		return err
 	}
-	// os.Rename is atomic on NTFS; overwrites destination atomically.
-	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
+	var renameErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if renameErr = os.Rename(tmpPath, path); renameErr == nil {
+			log.Printf("settings: saved %s", path)
+			return nil
+		}
+		time.Sleep(150 * time.Millisecond)
 	}
+	os.Remove(tmpPath)
+	return fmt.Errorf("replace %s: %w", path, renameErr)
 }

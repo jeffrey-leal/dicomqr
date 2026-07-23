@@ -53,7 +53,8 @@ CGO_ENABLED=1 CC=/c/msys64/mingw64/bin/gcc.exe \
 | `serverprofile.go` | `ServerProfile` struct for saved server connections |
 | `preferences.go` | `appTheme`, system font scanner, preferences dialog |
 | `dicomfile.go` | `isDICOMFile` — magic-byte verification |
-| `transcode.go` | Local decompression of received files to Explicit VR LE (JPEG Baseline/Extended, JPEG 2000) for the per-profile "guarantee uncompressed on disk" option |
+| `transfersyntax.go` | Transfer syntax UID constants, labels, and `fileTransferSyntaxUID` (meta-only parse) |
+| `transcode.go` | Local conversion enforcing a profile's required syntax (Explicit/Implicit VR LE): `acceptedSyntaxesFor` builds the negotiable set (required first, then locally convertible — other LE VR, JPEG Baseline/Extended, JPEG 2000), and the receive path transcodes any non-required arrival in place before it reaches the download folder; a file that can be neither delivered nor converted aborts the retrieve |
 | `export.go` | CSV and JSON export of query results |
 
 ## Key dependencies

@@ -14,14 +14,17 @@ import (
 	"github.com/suyashkumar/dicom/pkg/tag"
 )
 
-// The two transfer syntaxes the "guarantee uncompressed" option accepts on
-// disk (PS3.5 §10.1).
+// Compressed transfer syntaxes the built-in decoders can convert to the
+// required uncompressed syntax (PS3.5 §10.1).
 const (
-	tsImplicitVRLE = "1.2.840.10008.1.2"
-	tsExplicitVRLE = "1.2.840.10008.1.2.1"
+	tsJPEGBaseline = "1.2.840.10008.1.2.4.50"
+	tsJPEGExtended = "1.2.840.10008.1.2.4.51"
+	tsJPEG2000LL   = "1.2.840.10008.1.2.4.90"
+	tsJPEG2000     = "1.2.840.10008.1.2.4.91"
 )
 
-// isUncompressedOnDisk reports whether uid satisfies the on-disk requirement.
+// isUncompressedOnDisk reports whether uid is one of the two uncompressed
+// little-endian syntaxes a profile can require.
 func isUncompressedOnDisk(uid string) bool {
 	return uid == tsImplicitVRLE || uid == tsExplicitVRLE
 }
@@ -31,58 +34,62 @@ func isUncompressedOnDisk(uid string) bool {
 // uses), JPEG 2000 via OpenJPEG when built with the openjpeg tag.
 func canDecompressSyntax(uid string) bool {
 	switch uid {
-	case "1.2.840.10008.1.2.4.50", "1.2.840.10008.1.2.4.51":
+	case tsJPEGBaseline, tsJPEGExtended:
 		return true
-	case "1.2.840.10008.1.2.4.90", "1.2.840.10008.1.2.4.91":
+	case tsJPEG2000LL, tsJPEG2000:
 		return jpeg2000Available
 	}
 	return false
 }
 
-// fileTransferSyntaxUID reads the Transfer Syntax UID (0002,0010) from a DICOM
-// file. NewParser consumes only the group 0002 meta elements up front, so the
-// dataset itself — pixel data, deep SR sequences — is never touched. Returns
-// "" when the file cannot be parsed.
-func fileTransferSyntaxUID(path string) string {
-	f, err := os.Open(path)
-	if err != nil {
-		return ""
+// acceptedSyntaxesFor returns the transfer syntaxes negotiable when requiredTS
+// is demanded on disk, in preference order: the required syntax itself first —
+// a transcoding-capable server picks it and nothing needs converting — then
+// every syntax the receive path can convert locally (the other uncompressed
+// VR is a lossless re-encode; the compressed set is decoded with the viewer's
+// decoders). A server limited to a syntax outside this list cannot deliver
+// and the retrieve fails visibly. Returns nil when requiredTS is empty
+// (as stored — accept everything).
+func acceptedSyntaxesFor(requiredTS string) []string {
+	if requiredTS == "" {
+		return nil
 	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return ""
+	accepted := []string{requiredTS}
+	if requiredTS == tsImplicitVRLE {
+		accepted = append(accepted, tsExplicitVRLE)
+	} else {
+		accepted = append(accepted, tsImplicitVRLE)
 	}
-	p, err := sdicom.NewParser(f, info.Size(), nil, sdicom.SkipPixelData())
-	if err != nil {
-		return ""
+	accepted = append(accepted, tsJPEGBaseline, tsJPEGExtended)
+	if jpeg2000Available {
+		accepted = append(accepted, tsJPEG2000LL, tsJPEG2000)
 	}
-	meta := p.GetMetadata()
-	elem, err := meta.FindElementByTag(tag.TransferSyntaxUID)
-	if err != nil {
-		return ""
-	}
-	if strs, ok := elem.Value.GetValue().([]string); ok && len(strs) > 0 {
-		return strings.TrimSpace(strs[0])
-	}
-	return ""
+	return accepted
 }
 
-// transcodeDICOMFile rewrites a compressed DICOM file in place as Explicit VR
-// Little Endian by decompressing its pixel data with the viewer's decoders.
-// Returns (false, nil) when the file is already Implicit/Explicit VR LE,
-// (true, nil) after a successful rewrite, and (false, err) when the syntax has
-// no built-in decoder or the rewrite fails — the original file is left
-// untouched on every error path.
-func transcodeDICOMFile(path string) (bool, error) {
+// transcodeDICOMFile rewrites a DICOM file in place so its transfer syntax is
+// targetTS — one of the two uncompressed on-disk syntaxes (Implicit or Explicit
+// VR LE). Encapsulated (compressed) pixel data is decompressed with the
+// viewer's decoders; a file that is already uncompressed but in the *other* VR
+// encoding is re-encoded (a lossless VR conversion, no pixel decode). The
+// receive path runs this on every incoming file before it reaches its final
+// destination, so an entire retrieve lands in a single transfer syntax.
+//
+// Returns (false, nil) when the file is already in targetTS, (true, nil) after a
+// successful rewrite, and (false, err) when a compressed syntax has no built-in
+// decoder or the rewrite fails — the original file is left untouched on every
+// error path.
+func transcodeDICOMFile(path, targetTS string) (bool, error) {
 	tsUID := fileTransferSyntaxUID(path)
 	if tsUID == "" {
 		return false, errors.New("cannot determine transfer syntax")
 	}
-	if isUncompressedOnDisk(tsUID) {
+	if tsUID == targetTS {
 		return false, nil
 	}
-	if !canDecompressSyntax(tsUID) {
+	// A rewrite is required. An uncompressed source only needs a VR re-encode;
+	// a compressed source must have a built-in decoder or we cannot proceed.
+	if !isUncompressedOnDisk(tsUID) && !canDecompressSyntax(tsUID) {
 		name := tsUID
 		if n, known := unsupportedTransferSyntaxNames[tsUID]; known {
 			name = n + " (" + tsUID + ")"
@@ -95,8 +102,9 @@ func transcodeDICOMFile(path string) (bool, error) {
 		return false, fmt.Errorf("parse: %w", err)
 	}
 
-	// Decompress pixel data when present. Objects without pixel data (e.g. SR
-	// documents that arrived over a compressed context) just get re-encoded.
+	// Decompress encapsulated pixel data. Native pixel data and objects without
+	// pixel data (e.g. SR documents) carry no encapsulated frames, so they fall
+	// straight through to the re-encode below in the target VR.
 	if pdElem, pdErr := ds.FindElementByTag(tag.PixelData); pdErr == nil {
 		info, ok := pdElem.Value.GetValue().(sdicom.PixelDataInfo)
 		if !ok {
@@ -124,7 +132,7 @@ func transcodeDICOMFile(path string) (bool, error) {
 		}
 	}
 
-	if err := setElementValue(&ds, tag.TransferSyntaxUID, []string{tsExplicitVRLE}); err != nil {
+	if err := setElementValue(&ds, tag.TransferSyntaxUID, []string{targetTS}); err != nil {
 		return false, err
 	}
 

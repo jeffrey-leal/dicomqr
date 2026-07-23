@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	netdicom "github.com/algm/go-netdicom"
 	"github.com/algm/go-netdicom/dimse"
@@ -16,14 +17,16 @@ import (
 )
 
 // proposedTransferSyntaxes returns the transfer syntaxes offered in
-// A-ASSOCIATE-RQ for a C-GET association, in the profile's preference order.
-// When the profile requests uncompressed only, a conformant PACS must
-// transcode compressed pixel data before sending. The unrestricted default,
-// dicomio.StandardTransferSyntaxes, also contains no compressed syntax — the
-// preference only decides between Implicit and Explicit VR LE.
+// A-ASSOCIATE-RQ for a C-GET association. When the profile requires a specific
+// syntax, the proposal is that syntax first plus the syntaxes the receive path
+// can convert locally (see acceptedSyntaxesFor) — a transcoding server sends
+// the required syntax, a stored-form server sends what it has and the file is
+// converted on receipt. A server limited to something outside the list fails
+// its sub-operations, which aborts the retrieve. The unrestricted default,
+// dicomio.StandardTransferSyntaxes, contains no compressed syntax.
 func proposedTransferSyntaxes(p ServerProfile) []string {
-	if pref := p.preferredTransferSyntaxes(); pref != nil {
-		return pref
+	if req := p.requiredTransferSyntax(); req != "" {
+		return acceptedSyntaxesFor(req)
 	}
 	return dicomio.StandardTransferSyntaxes
 }
@@ -193,7 +196,19 @@ func (c *DicomClient) Move(ctx context.Context, level, patientID, studyUID, seri
 	case r := <-done:
 		return r.err
 	case <-ctx.Done():
+		abortAndReap(su, done)
 		return ctx.Err()
+	}
+}
+
+// abortAndReap force-closes a wedged association with A-ABORT and waits
+// (briefly) for the blocked DIMSE goroutine to finish, so a cancelled or
+// stalled retrieve does not leak the goroutine and the TCP connection.
+func abortAndReap[T any](su *netdicom.ServiceUser, done <-chan T) {
+	su.Abort()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
 	}
 }
 
@@ -237,6 +252,7 @@ func (c *DicomClient) Get(ctx context.Context, level, patientID, studyUID, serie
 	case r := <-done:
 		return r.err
 	case <-ctx.Done():
+		abortAndReap(su, done)
 		return ctx.Err()
 	}
 }
@@ -420,6 +436,7 @@ func (c *DicomClient) StoreFiles(ctx context.Context, paths []string, onProgress
 	case r := <-resultCh:
 		return r.err
 	case <-ctx.Done():
+		abortAndReap(su, resultCh)
 		return ctx.Err()
 	}
 }

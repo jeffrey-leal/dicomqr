@@ -41,7 +41,7 @@ func writeJ2KTestDICOM(t *testing.T, dir string) string {
 	ds := sdicom.Dataset{Elements: []*sdicom.Element{
 		mustTestElement(t, tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.7"}),
 		mustTestElement(t, tag.MediaStorageSOPInstanceUID, []string{"1.2.3.4.6"}),
-		mustTestElement(t, tag.TransferSyntaxUID, []string{"1.2.840.10008.1.2.4.90"}),
+		mustTestElement(t, tag.TransferSyntaxUID, []string{tsJPEG2000LL}),
 		mustTestElement(t, tag.SOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.7"}),
 		mustTestElement(t, tag.SOPInstanceUID, []string{"1.2.3.4.6"}),
 		mustTestElement(t, tag.PhotometricInterpretation, []string{"MONOCHROME2"}),
@@ -62,68 +62,64 @@ func writeJ2KTestDICOM(t *testing.T, dir string) string {
 		t.Fatalf("create: %v", err)
 	}
 	defer f.Close()
-	if err := sdicom.Write(f, ds); err != nil {
+	if err := sdicom.Write(f, ds, sdicom.SkipVRVerification(), sdicom.SkipValueTypeVerification()); err != nil {
 		t.Fatalf("write J2K test DICOM: %v", err)
 	}
 	return path
 }
 
-func TestTranscodeJPEG2000ToExplicitLE(t *testing.T) {
-	path := writeJ2KTestDICOM(t, t.TempDir())
-
-	if got := fileTransferSyntaxUID(path); got != "1.2.840.10008.1.2.4.90" {
-		t.Fatalf("precondition: transfer syntax = %q", got)
-	}
-
-	changed, err := transcodeDICOMFile(path)
-	if err != nil {
-		t.Fatalf("transcodeDICOMFile: %v", err)
-	}
-	if !changed {
-		t.Fatal("J2K file should have been rewritten")
-	}
-
-	// Second run must be a no-op.
-	changed, err = transcodeDICOMFile(path)
-	if err != nil {
-		t.Fatalf("transcodeDICOMFile(again): %v", err)
-	}
-	if changed {
-		t.Error("second transcode must be a no-op")
-	}
-
-	if got := fileTransferSyntaxUID(path); got != tsExplicitVRLE {
-		t.Fatalf("after transcode: transfer syntax = %q, want %q", got, tsExplicitVRLE)
-	}
-
-	// The decompressed pixels must be the exact lossless ramp.
-	ds, err := sdicom.ParseFile(path, nil)
-	if err != nil {
-		t.Fatalf("re-parse: %v", err)
-	}
-	pdElem, err := ds.FindElementByTag(tag.PixelData)
-	if err != nil {
-		t.Fatalf("PixelData missing: %v", err)
-	}
-	info := pdElem.Value.GetValue().(sdicom.PixelDataInfo)
-	if info.IsEncapsulated || len(info.Frames) != 1 {
-		t.Fatalf("expected 1 native frame, got encapsulated=%v frames=%d", info.IsEncapsulated, len(info.Frames))
-	}
-	nf, err := info.Frames[0].GetNativeFrame()
-	if err != nil {
-		t.Fatalf("GetNativeFrame: %v", err)
-	}
-	if nf.Rows() != 8 || nf.Cols() != 8 {
-		t.Fatalf("frame %dx%d, want 8x8", nf.Rows(), nf.Cols())
-	}
-	raw, ok := nf.RawDataSlice().([]uint8)
-	if !ok {
-		t.Fatalf("RawDataSlice type %T, want []uint8", nf.RawDataSlice())
-	}
-	want := []uint8{0, 32, 64, 96, 128, 160, 192, 224}
-	for x := 0; x < 8; x++ {
-		if raw[x] != want[x] {
-			t.Errorf("row0[%d] = %d, want %d", x, raw[x], want[x])
+// ramp8Pixels returns the expected decoded pixels of ramp8.j2k: every row is
+// the horizontal ramp 0,32,64,…,224.
+func ramp8Pixels() []uint8 {
+	px := make([]uint8, 64)
+	for row := 0; row < 8; row++ {
+		for col := 0; col < 8; col++ {
+			px[row*8+col] = uint8(col * 32)
 		}
+	}
+	return px
+}
+
+// J2K Lossless decodes bit-exactly straight to either required uncompressed
+// target syntax.
+func TestTranscodeJ2KToTargets(t *testing.T) {
+	for _, target := range []string{tsExplicitVRLE, tsImplicitVRLE} {
+		t.Run(transferSyntaxLabel(target), func(t *testing.T) {
+			path := writeJ2KTestDICOM(t, t.TempDir())
+			if got := fileTransferSyntaxUID(path); got != tsJPEG2000LL {
+				t.Fatalf("fixture transfer syntax = %q, want %q", got, tsJPEG2000LL)
+			}
+
+			changed, err := transcodeDICOMFile(path, target)
+			if err != nil {
+				t.Fatalf("transcodeDICOMFile: %v", err)
+			}
+			if !changed {
+				t.Fatal("J2K file must be rewritten")
+			}
+			if got := fileTransferSyntaxUID(path); got != target {
+				t.Fatalf("transfer syntax after transcode = %q, want %q", got, target)
+			}
+
+			want := ramp8Pixels()
+			got := dicomPixels(t, path)
+			if len(got) != len(want) {
+				t.Fatalf("pixel count = %d, want %d", len(got), len(want))
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("pixel[%d] = %d, want %d (lossless decode must be bit-exact)", i, got[i], want[i])
+				}
+			}
+
+			// Idempotent: a second pass is a no-op.
+			changed, err = transcodeDICOMFile(path, target)
+			if err != nil {
+				t.Fatalf("transcodeDICOMFile(again): %v", err)
+			}
+			if changed {
+				t.Error("already-converted file must not be rewritten")
+			}
+		})
 	}
 }

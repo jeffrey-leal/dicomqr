@@ -362,7 +362,13 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 			SelectionItalic: selItalicCheck.Checked,
 			ViewerPath:      viewerPathEntry.Text,
 		}
-		saveSettings(updated)
+		if err := saveSettingsE(updated); err != nil {
+			// Apply for this session regardless, but make the persistence
+			// failure impossible to miss — losing a mid-session preference
+			// change silently is how misconfigurations go unnoticed.
+			dialog.ShowError(fmt.Errorf(
+				"Settings were applied for this session but could not be saved to disk:\n\n%v", err), w)
+		}
 		a.Settings().SetTheme(current)
 		onApply(updated)
 		d.Hide()
@@ -430,21 +436,15 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 		retrieveMethodSelect.SetSelected("C-MOVE (default)")
 	}
 
+	// Requiring a syntax guarantees every retrieved file is in it on disk:
+	// the server sends it directly, or the file is converted on receipt from
+	// a decodable syntax; otherwise the retrieve fails with an error.
 	const (
 		tsLabelAny      = "As stored (server decides)"
-		tsLabelExplicit = "Uncompressed — Explicit VR LE preferred"
-		tsLabelImplicit = "Uncompressed — Implicit VR LE preferred"
+		tsLabelExplicit = "Explicit VR LE (uncompressed — convert locally if needed)"
+		tsLabelImplicit = "Implicit VR LE (uncompressed — convert locally if needed)"
 	)
-	ensureCheck := widget.NewCheck("Guarantee uncompressed on disk (decompress locally if needed)", nil)
-	tsSelect := widget.NewSelect([]string{tsLabelAny, tsLabelExplicit, tsLabelImplicit}, func(sel string) {
-		// The on-disk guarantee only makes sense when uncompressed is requested.
-		if sel == tsLabelAny {
-			ensureCheck.SetChecked(false)
-			ensureCheck.Disable()
-		} else {
-			ensureCheck.Enable()
-		}
-	})
+	tsSelect := widget.NewSelect([]string{tsLabelAny, tsLabelExplicit, tsLabelImplicit}, nil)
 	switch p.TransferSyntax {
 	case tsPrefExplicitLE:
 		tsSelect.SetSelected(tsLabelExplicit)
@@ -453,7 +453,6 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 	default:
 		tsSelect.SetSelected(tsLabelAny)
 	}
-	ensureCheck.SetChecked(p.EnsureUncompressed && p.wantsUncompressed())
 
 	form := widget.NewForm(
 		widget.NewFormItem("Profile name", nameEntry),
@@ -464,7 +463,6 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 		widget.NewFormItem("Info model", modelSelect),
 		widget.NewFormItem("Retrieve method", retrieveMethodSelect),
 		widget.NewFormItem("Transfer syntax", tsSelect),
-		widget.NewFormItem("", ensureCheck),
 	)
 
 	dialog.ShowCustomConfirm("Edit Server", "Save", "Cancel", form, func(save bool) {
@@ -503,15 +501,14 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 			transferSyntax = tsPrefImplicitLE
 		}
 		onSave(ServerProfile{
-			Name:               nameEntry.Text,
-			RemoteAETitle:      strings.ToUpper(strings.TrimSpace(aeEntry.Text)),
-			Host:               strings.TrimSpace(hostEntry.Text),
-			Port:               port,
-			ConnectTimeout:     timeout,
-			InfoModel:          modelSelect.Selected,
-			RetrieveMethod:     retrieveMethod,
-			TransferSyntax:     transferSyntax,
-			EnsureUncompressed: ensureCheck.Checked && transferSyntax != tsPrefAny,
+			Name:           nameEntry.Text,
+			RemoteAETitle:  strings.ToUpper(strings.TrimSpace(aeEntry.Text)),
+			Host:           strings.TrimSpace(hostEntry.Text),
+			Port:           port,
+			ConnectTimeout: timeout,
+			InfoModel:      modelSelect.Selected,
+			RetrieveMethod: retrieveMethod,
+			TransferSyntax: transferSyntax,
 		})
 	}, w)
 }

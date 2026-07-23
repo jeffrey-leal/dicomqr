@@ -1,8 +1,8 @@
 # dicomqr
 
-**User Manual  v1.7.0**
+**User Manual  v1.8.0**
 
-July 22, 2026
+July 23, 2026
 
 A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.
 
@@ -26,7 +26,7 @@ Key capabilities:
 - View Structured Reports (SR), Key Object Selections (KO), and other non-image DICOM objects in a dedicated scrollable document viewer that renders the SR Content Sequence as formatted text
 - Import DICOM files from external folders into the organised download folder
 - Support for multiple saved server profiles with independent connection and retrieve settings
-- Optionally request uncompressed pixel data transfer per server profile — with a preference between Explicit and Implicit VR Little Endian and an optional on-disk guarantee that decompresses received JPEG Baseline/JPEG 2000 files locally, for downstream tools that require uncompressed transfer syntaxes
+- Optionally require a specific uncompressed transfer syntax per server profile — Explicit or Implicit VR Little Endian — guaranteed on disk: the server sends it directly, or files arriving in a decodable syntax (JPEG Baseline/Extended, JPEG 2000, the other uncompressed VR) are converted on receipt; the retrieve fails with a clear error only when neither is possible
 - Automatic wildcard search — trailing `*` appended to text fields so partial names match without manual wildcarding
 - Customisable appearance — selection colour, font style, external viewer path, and window size are remembered between sessions
 
@@ -93,8 +93,7 @@ A server profile stores the connection details for one PACS destination. Profile
 | Info model | The DICOM Query/Retrieve information model. `study` = Study Root (most common). `patient` = Patient Root. `patient-study-only` = legacy retired model used by some older systems; SERIES-level queries are not available with this model. |
 | Retrieve method | C-MOVE (default) instructs the PACS to push files to the local C-STORE SCP listener. C-GET requests that the PACS return files over the same association — no inbound port or PACS-side destination registration is required. Auto tries C-GET first and falls back to C-MOVE if the PACS rejects it. |
 | Connect timeout | Seconds to wait for the initial C-ECHO before reporting a failure. Default: 10 s. |
-| Transfer syntax | 'As stored (server decides)' accepts whatever the PACS prefers — a JPEG 2000 archive will typically send JPEG 2000. The two 'Uncompressed' options restrict A-ASSOCIATE negotiation to Explicit VR Little Endian (`1.2.840.10008.1.2.1`) and Implicit VR Little Endian (`1.2.840.10008.1.2`), in the stated preference order — a conformant PACS must transcode compressed pixel data before sending. Note: some PACS systems cannot transcode and will fail the transfer for those SOP classes. |
-| Guarantee uncompressed on disk | Available when an 'Uncompressed' option is selected. Ensures every retrieved file is stored as Implicit or Explicit VR Little Endian: files that still arrive compressed are decompressed locally after the retrieve (JPEG Baseline/Extended and JPEG 2000 — the formats the built-in viewer decodes), and re-retrieving a study replaces older compressed copies on disk instead of skipping them. JPEG 2000 Lossless converts bit-exactly; lossy sources keep their (already lossy) pixel values. Files in formats without a built-in decoder (e.g. JPEG-LS, RLE) are left compressed and counted in the status line and Activity Log. |
+| Transfer syntax | 'As stored (server decides)' accepts whatever the PACS prefers — a JPEG 2000 archive will typically send JPEG 2000. The two uncompressed options guarantee every retrieved file ends up in exactly the selected syntax on disk — Explicit VR Little Endian (`1.2.840.10008.1.2.1`) or Implicit VR Little Endian (`1.2.840.10008.1.2`). Negotiation offers the required syntax first, so a transcoding-capable PACS sends it directly; a PACS that only serves objects in their stored form may instead send any syntax the application can decode (the other uncompressed VR, JPEG Baseline/Extended, JPEG 2000), and each such file is converted to the required syntax on receipt, before it reaches the download folder. The status bar reports how many files needed local conversion. If an object can be delivered neither in the required syntax nor in a locally convertible one (e.g. the archive stores JPEG-LS or RLE), the retrieve is aborted with an error dialog naming the required syntax rather than leaving a partial or mixed study; switch the profile back to 'As stored' to retrieve such data in its stored form. |
 
 The first profile in the list is selected by default when the application starts.
 
@@ -288,7 +287,9 @@ If one or more targets encountered a recoverable DICOM error (for example, a war
 Retrieved N files (X/Y targets had errors — see log)
 ```
 
-In this case a dialog also appears offering to retry only the failed targets. Accepting re-runs the retrieve loop for just those items, leaving already-retrieved files in place. Details of the errors are written to `dicom.log` in `%USERPROFILE%\.dicomqr\`.
+In this case a dialog also appears offering to retry only the failed targets. Accepting re-runs the retrieve loop for just those items, leaving already-retrieved files in place. Details of the errors are written to `dicom.log` in `%USERPROFILE%\.dicomqr\`. The log records the full DICOM protocol exchange — association negotiation (each presentation context with the offered and chosen transfer syntaxes, and any rejections), every PDU, and per-file receipt — and the two previous sessions are kept as `dicom.log.1` and `dicom.log.2`, so evidence of a failed or stalled transfer survives an application restart.
+
+When the profile requires a specific transfer syntax, error handling is stricter: the first failed sub-operation or target error aborts the whole retrieve immediately and a dialog reports the required syntax, the failure details, and how many files (all in the required syntax) were received before the abort. There is no partial-retry offer — every object is either delivered in (or converted to) the required syntax, or the retrieve fails. When files arrived in a different syntax and were converted locally, the completion status appends '(N converted locally to …)'.
 
 
 ### 7.5  Cancelling a Retrieve
@@ -355,7 +356,7 @@ Keyboard controls (while the viewer window is focused):
 
 The Reset button resets both the view (zoom/pan) and the window to the default. Window/level changes made by dragging or by selecting a preset persist as you scroll through the series.
 
-Compressed pixel data — the built-in viewer decodes JPEG Baseline, JPEG 2000 (lossless and lossy), and uncompressed (native) pixel data. Files stored in JPEG-LS, JPEG Lossless, or RLE Lossless formats cannot be decoded and display a message suggesting Open in Viewer; to view those, either use an external viewer or select an 'Uncompressed' transfer syntax in the server profile before retrieving (see Section 4.1).
+Compressed pixel data — the built-in viewer decodes JPEG Baseline, JPEG 2000 (lossless and lossy), and uncompressed (native) pixel data. Files stored in JPEG-LS, JPEG Lossless, or RLE Lossless formats cannot be decoded and display a message suggesting Open in Viewer; to view those, either use an external viewer or require an uncompressed transfer syntax in the server profile before retrieving (see Section 4.1).
 
 
 #### 8.3.2  Window/Level Presets
@@ -617,8 +618,7 @@ Profile editor fields:
 | Info model | `study` — Study Root (default, most common). `patient` — Patient Root. `patient-study-only` — legacy retired model; SERIES-level lazy-load is suppressed automatically. |
 | Retrieve method | C-MOVE / C-GET / Auto — see Section 4.1. |
 | Connect timeout | Seconds before a connection attempt is considered failed. |
-| Transfer syntax | 'As stored' or one of the two uncompressed preferences — see Section 4.1 for full details and caveats. |
-| Guarantee uncompressed on disk | Decompresses received files locally so everything on disk is Implicit/Explicit VR Little Endian — see Section 4.1. |
+| Transfer syntax | 'As stored' or one of the two guaranteed uncompressed syntaxes (converted locally on receipt when the server does not send it) — see Section 4.1 for full details and caveats. |
 
 
 ### 14.3  Retrieve Section
@@ -645,7 +645,7 @@ The status bar at the bottom of the window provides real-time feedback. A colour
 
 | Situation | Status bar text |
 |---|---|
-| Application started, not connected | `v1.7.0` |
+| Application started, not connected | `v1.8.0` |
 | Connecting to server | `Connecting…` |
 | Connected | `Connected: <AE>@<host>:<port>` |
 | Connection cancelled | `Connection cancelled` |
@@ -693,6 +693,7 @@ Application settings are persisted to `%USERPROFILE%\.dicomqr\settings.json`. Th
 | `selectionItalic` | `false` | Whether selected rows are drawn in italic. |
 | `windowWidth` | `0` | Saved window width in pixels. 0 uses the default; updated automatically on close. |
 | `windowHeight` | `0` | Saved window height in pixels. |
+| `retrieveStallTimeoutSec` | `0` | Abort a retrieve when no progress response and no received file arrives for this many seconds. 0 uses the default (120 s); -1 disables stall detection. Recovers from PACS servers whose C-MOVE agent hangs on non-image objects (SR/PR). |
 | `profiles` | `[]` | Array of saved server profile objects (see below). |
 
 Each entry in the `profiles` array:
@@ -706,9 +707,9 @@ Each entry in the `profiles` array:
 | `infoModel` | `"study"`, `"patient"`, or `"patient-study-only"`. |
 | `retrieveMethod` | `"MOVE"`, `"GET"`, or `"AUTO"`. Omitting defaults to C-MOVE. |
 | `connectTimeout` | Connection timeout in seconds. 0 uses the default (10 s). |
-| `transferSyntax` | `""` (as stored, default), `"explicit-le"`, or `"implicit-le"`. The uncompressed options restrict C-GET/C-MOVE negotiation to Explicit + Implicit VR Little Endian in the stated preference order. |
-| `ensureUncompressed` | When true (and `transferSyntax` is set), received files that are still compressed are decompressed locally to Explicit VR Little Endian, and re-retrieves replace older compressed copies on disk. Default: false. |
-| `transferUncompressed` | Deprecated (pre-v1.7). When true it is migrated on load to `transferSyntax: "explicit-le"` + `ensureUncompressed: true`. |
+| `transferSyntax` | `""` (as stored, default), `"explicit-le"`, or `"implicit-le"`. The non-empty values guarantee every retrieved file is stored in that syntax: negotiation offers it first plus the locally decodable syntaxes, files arriving in any other accepted syntax are converted on receipt, and the retrieve aborts with an error when an object can be neither delivered nor converted. Re-retrieves replace existing on-disk copies whose transfer syntax differs from the required one. |
+| `ensureUncompressed` | Obsolete (v1.7.0 only) and ignored: the local-decompression guarantee was replaced by strict single-syntax negotiation via `transferSyntax`. |
+| `transferUncompressed` | Deprecated (pre-v1.7). When true it is migrated on load to `transferSyntax: "explicit-le"`. |
 
 The Annotations and Overlays toggles are stored in the application's Fyne preferences (not in settings.json) and persist automatically between sessions.
 
@@ -728,9 +729,11 @@ Information model — If queries return no results, try changing the Info model 
 
 Worklist server — The Modality Worklist SOP class is typically served by a RIS or dedicated MWL broker, not the PACS itself. Create a separate server profile pointing to that system and select it in the Worklist tab.
 
-Compressed pixel data — the built-in viewer decodes JPEG Baseline and JPEG 2000. If the PACS stores images in JPEG-LS or another compressed format the viewer cannot decode, select an 'Uncompressed' transfer syntax in the server profile. The PACS will transcode on the fly if it supports transcoding. If the PACS does not support transcoding, the transfer will fail for those SOP classes; use the external viewer integration instead. Downstream consumers that require `1.2.840.10008.1.2` / `1.2.840.10008.1.2.1` files should additionally tick 'Guarantee uncompressed on disk', which decompresses received JPEG Baseline/JPEG 2000 files locally and replaces older compressed copies on re-retrieve.
+Compressed pixel data — the built-in viewer decodes JPEG Baseline and JPEG 2000. Downstream consumers that require `1.2.840.10008.1.2` / `1.2.840.10008.1.2.1` files should require an uncompressed transfer syntax in the server profile: every file on disk is then guaranteed to be in the selected syntax — sent that way by the PACS, or converted on receipt from JPEG Baseline/Extended, JPEG 2000, or the other uncompressed VR — and re-retrieves replace older copies stored in a different syntax. Only when the PACS stores data in a format the application cannot decode either (e.g. JPEG-LS, RLE) does the retrieve abort with an error naming the required syntax; switch back to 'As stored' and use the external viewer integration for such data.
 
 IPv4 connectivity — dicomqr listens on an IPv4 socket only. Ensure the address shown in Help > Client info… is the correct IPv4 address on the same network as the PACS.
+
+Retrieve stalls on non-image series — some PACS servers' C-MOVE agents fail while sending objects without pixel data (Structured Reports, Presentation States, encapsulated PDFs): the association stays open but no further data ever arrives. dicomqr detects this — if no progress response and no received file arrives for 120 seconds (configurable via `retrieveStallTimeoutSec` in settings.json), the retrieve is aborted with an explanatory message rather than hanging forever. If a server does this repeatedly, set the profile's Retrieve method to C-GET or Auto — the same servers usually deliver non-image objects correctly over C-GET. For genuinely slow servers (e.g. tape archives), raise the timeout, or set it to -1 to disable stall detection.
 
 
 ---

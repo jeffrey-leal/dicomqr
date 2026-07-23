@@ -27,7 +27,7 @@ import (
 	sqweekdialog "github.com/sqweek/dialog"
 )
 
-const version = "1.7.0"
+const version = "1.8.0"
 
 // LED colours for connection and SCP state indicators.
 var (
@@ -78,6 +78,10 @@ func main() {
 
 	ensureDefaultSettings()
 	cfg := loadSettings()
+	// Record the session's starting configuration so a log file alone can
+	// answer "what was the app actually configured to do" after the fact.
+	log.Printf("settings: %d profile(s), download dir %s, local AE %s, SCP port %d",
+		len(cfg.Profiles), cfg.DownloadDir, cfg.LocalAETitle, cfg.LocalSCPPort)
 
 	// Persistent SQLite index of the download directory backing the Local
 	// Browse tree. A nil catalog (open failure) degrades gracefully — every
@@ -168,15 +172,13 @@ func main() {
 		defer connMu.Unlock()
 		return activeProfile
 	}
-	// setActiveProfileTransfer updates the connected profile's transfer policy
-	// in place when Preferences change, so post-retrieve processing (local
-	// decompression, verification) follows the edited settings without a
-	// reconnect.
-	setActiveProfileTransfer := func(transferSyntax string, ensure bool) {
+	// setActiveProfileTransfer updates the connected profile's transfer syntax
+	// requirement in place when Preferences change, so the next retrieve
+	// follows the edited settings without a reconnect.
+	setActiveProfileTransfer := func(transferSyntax string) {
 		connMu.Lock()
 		defer connMu.Unlock()
 		activeProfile.TransferSyntax = transferSyntax
-		activeProfile.EnsureUncompressed = ensure
 	}
 	getConnCtx := func() context.Context {
 		connMu.Lock()
@@ -810,7 +812,7 @@ func main() {
 			}
 
 			s := NewStorageSCP(cfg.LocalAETitle, cfg.LocalSCPPort, cfg.DownloadDir)
-			s.SetTransferPolicy(profile.preferredTransferSyntaxes(), profile.EnsureUncompressed)
+			s.SetTransferPolicy(profile.requiredTransferSyntax())
 			if err := s.Start(); err != nil {
 				fyne.Do(func() {
 					scpLED.FillColor = ledRed
@@ -959,7 +961,8 @@ func main() {
 		}
 
 		count := len(targets)
-		log.Printf("retrieve: %d targets, destAE=%s port=%d", count, cfg.LocalAETitle, cfg.LocalSCPPort)
+		log.Printf("retrieve: %d targets, destAE=%s port=%d method=%s requiredTS=%q",
+			count, cfg.LocalAETitle, cfg.LocalSCPPort, method, prof.requiredTransferSyntax())
 		for i, t := range targets {
 			log.Printf("  target[%d]: level=%s patientID=%s studyUID=%s seriesUID=%s", i, t.level, t.patientID, t.studyUID, t.seriesUID)
 		}
@@ -993,6 +996,65 @@ func main() {
 				recvMu.Unlock()
 			}
 
+			// Stall watchdog: some PACS servers' C-MOVE agents hang while
+			// sending non-image objects (SR, PR, encapsulated PDF) — the
+			// association stays open but no further data or progress response
+			// ever arrives, leaving the retrieve stuck forever. Track the last
+			// activity (progress responses and received files) and abort the
+			// retrieve when the configured window passes in silence.
+			stallTimeout := 120 * time.Second
+			if cfg.RetrieveStallTimeoutSec > 0 {
+				stallTimeout = time.Duration(cfg.RetrieveStallTimeoutSec) * time.Second
+			}
+			stallDetection := cfg.RetrieveStallTimeoutSec >= 0
+			var lastActivity atomic.Int64
+			lastActivity.Store(time.Now().UnixNano())
+			touch := func() { lastActivity.Store(time.Now().UnixNano()) }
+			var stalled atomic.Bool
+
+			// When the profile requires a specific transfer syntax, any failed
+			// sub-operation means the server cannot deliver in that syntax or
+			// any locally convertible fallback (or a local conversion failed) —
+			// abort immediately and report, rather than leaving a partial
+			// study behind (Failed counts arrive in C-MOVE progress responses;
+			// C-GET failures surface in the final status error).
+			requiredTS := prof.requiredTransferSyntax()
+			var getConverted atomic.Int64
+			scpConvBase := int64(0)
+			if sc != nil {
+				scpConvBase = sc.ConvertedCount()
+			}
+			var tsRejected atomic.Bool
+			checkMoveFailures := func(p MoveProgress) {
+				if requiredTS != "" && p.Failed > 0 && tsRejected.CompareAndSwap(false, true) {
+					log.Printf("retrieve: %d sub-operation(s) failed with required transfer syntax %s — aborting",
+						p.Failed, requiredTS)
+					cancel()
+				}
+			}
+			watchdogDone := make(chan struct{})
+			defer close(watchdogDone)
+			if stallDetection {
+				go func() {
+					ticker := time.NewTicker(5 * time.Second)
+					defer ticker.Stop()
+					for {
+						select {
+						case <-watchdogDone:
+							return
+						case <-ticker.C:
+							idle := time.Duration(time.Now().UnixNano() - lastActivity.Load())
+							if idle > stallTimeout {
+								stalled.Store(true)
+								log.Printf("retrieve: no server activity for %v — aborting stalled retrieve", stallTimeout)
+								cancel()
+								return
+							}
+						}
+					}
+				}()
+			}
+
 			// For C-MOVE: intercept sc.OnFileReceived to count and report files.
 			var origOnFileReceived func(string)
 			if sc != nil && (method == "MOVE" || method == "AUTO") {
@@ -1000,6 +1062,7 @@ func main() {
 				sc.SetOnFileReceived(func(path string) {
 					atomic.AddInt64(&fileCount, 1)
 					recordPath(path)
+					touch()
 					if ctx.Err() == nil {
 						fyne.Do(func() { statusLabel.SetText("Received: " + path) })
 					}
@@ -1013,13 +1076,17 @@ func main() {
 
 			// For C-GET: callback writes each received instance to the download folder.
 			getCallback := func(txUID, scUID, siUID string, data []byte) error {
-				path, saveErr := saveGetFile(cfg.DownloadDir, txUID, scUID, siUID, data, prof.EnsureUncompressed)
+				path, converted, saveErr := saveGetFile(cfg.DownloadDir, txUID, scUID, siUID, data, requiredTS)
 				if saveErr != nil {
 					log.Printf("c-get: save file: %v", saveErr)
 					return saveErr
 				}
+				if converted {
+					getConverted.Add(1)
+				}
 				atomic.AddInt64(&fileCount, 1)
 				recordPath(path)
+				touch()
 				if ctx.Err() == nil {
 					fyne.Do(func() { statusLabel.SetText("Received: " + path) })
 				}
@@ -1028,6 +1095,7 @@ func main() {
 
 			var cancelled bool
 			var errCount int
+			var tsAbortErr error
 			var failed []retrieveTarget
 			for i, tgt := range targets {
 				if ctx.Err() != nil {
@@ -1039,6 +1107,7 @@ func main() {
 				if tgt.level == "SERIES" {
 					label = "series"
 				}
+				touch() // each target gets a fresh stall window
 				fyne.Do(func() {
 					statusLabel.SetText(fmt.Sprintf("Retrieving %s %d/%d…", label, idx, count))
 				})
@@ -1052,6 +1121,8 @@ func main() {
 					if err != nil && ctx.Err() == nil {
 						log.Printf("retrieve: c-get failed (%v), falling back to c-move", err)
 						err = cl.Move(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, cfg.LocalAETitle, func(p MoveProgress) {
+							touch()
+							checkMoveFailures(p)
 							sub := p.Remaining + p.Completed + p.Failed + p.Warning
 							if sub > 0 {
 								frac := (float64(i) + float64(p.Completed)/float64(sub)) / float64(count)
@@ -1061,6 +1132,8 @@ func main() {
 					}
 				default: // "MOVE"
 					err = cl.Move(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, cfg.LocalAETitle, func(p MoveProgress) {
+						touch()
+						checkMoveFailures(p)
 						sub := p.Remaining + p.Completed + p.Failed + p.Warning
 						if sub > 0 {
 							frac := (float64(i) + float64(p.Completed)/float64(sub)) / float64(count)
@@ -1072,6 +1145,15 @@ func main() {
 				if err != nil {
 					if ctx.Err() != nil {
 						cancelled = true
+						break
+					}
+					// With a required transfer syntax any error is fatal: the
+					// most likely cause is the server refusing to deliver in
+					// that syntax, and continuing would leave a partial study.
+					if requiredTS != "" {
+						tsAbortErr = err
+						log.Printf("retrieve: %s %d/%d failed with required transfer syntax %s — aborting: %v",
+							label, idx, count, requiredTS, err)
 						break
 					}
 					log.Printf("retrieve: %s %d/%d error (continuing): %v", label, idx, count, err)
@@ -1094,47 +1176,67 @@ func main() {
 			recvPaths = nil
 			recvMu.Unlock()
 
-			// Post-process received files in the background so the final
-			// status message is not delayed: decompress locally when the
-			// profile guarantees uncompressed on disk, verify the on-disk
-			// syntax, then index the files and refresh the Local Browse tree.
+			// Index received files and refresh the Local Browse tree in the
+			// background so the final status message is not delayed. No batch
+			// post-processing is needed: when a transfer syntax is required,
+			// the receive path has already converted every file to it before
+			// it reached its destination.
 			if len(received) > 0 {
 				go func() {
-					var converted, stillCompressed int
-					for _, pth := range received {
-						if prof.EnsureUncompressed {
-							changed, convErr := transcodeDICOMFile(pth)
-							if convErr != nil {
-								log.Printf("transcode: %s: %v", pth, convErr)
-							} else if changed {
-								converted++
-							}
-						}
-						if prof.wantsUncompressed() && !isUncompressedOnDisk(fileTransferSyntaxUID(pth)) {
-							stillCompressed++
-						}
-					}
 					cat.ingestPaths(received)
 					reloadLocalBrowse()
-					if converted > 0 || stillCompressed > 0 {
-						fyne.Do(func() {
-							msg := fmt.Sprintf("Retrieved %d files", len(received))
-							if converted > 0 {
-								msg += fmt.Sprintf(" — %d decompressed locally", converted)
-							}
-							if stillCompressed > 0 {
-								msg += fmt.Sprintf(" — %d still compressed (see Activity Log)", stillCompressed)
-							}
-							statusLabel.SetText(msg)
-						})
-					}
 				}()
 			}
 
 			n := atomic.LoadInt64(&fileCount)
+			convertedTotal := getConverted.Load()
+			if sc != nil {
+				convertedTotal += sc.ConvertedCount() - scpConvBase
+			}
+			if convertedTotal > 0 {
+				log.Printf("retrieve: %d of %d file(s) arrived in a non-required syntax and were converted locally to %s",
+					convertedTotal, n, requiredTS)
+			}
 			fyne.Do(func() {
 				progressBar.Hide()
 				switch {
+				case tsRejected.Load() || tsAbortErr != nil:
+					// The server could not deliver in the required transfer
+					// syntax or any locally convertible fallback (or a local
+					// conversion failed), so the retrieve was aborted.
+					tsName := transferSyntaxLabel(requiredTS)
+					detail := "the server reported failed sub-operations"
+					if tsAbortErr != nil {
+						detail = tsAbortErr.Error()
+					}
+					statusLabel.SetText(fmt.Sprintf(
+						"Retrieve aborted — could not obtain every file in %s; %d file(s) received", tsName, n))
+					dialog.ShowError(fmt.Errorf(
+						"The retrieve was aborted because not every object could be obtained "+
+							"in the required transfer syntax.\n\n"+
+							"Required: %s (%s)\n"+
+							"Details: %s\n\n"+
+							"%d file(s) were received before the abort; all of them are in the required syntax.\n\n"+
+							"The server could not send the data in the required syntax or in any format "+
+							"this application can convert locally (JPEG Baseline/Extended, JPEG 2000) — "+
+							"it may store the data in a format without a built-in decoder (e.g. JPEG-LS, RLE), "+
+							"or a local conversion failed (see the Activity Log). To retrieve this data anyway, "+
+							"set the profile's Transfer syntax to \"As stored (server decides)\" in Preferences.",
+						tsName, requiredTS, detail, n), w)
+				case cancelled && stalled.Load():
+					statusLabel.SetText(fmt.Sprintf(
+						"Retrieve stalled — no data from the server for %.0f s; %d file(s) received before the stall",
+						stallTimeout.Seconds(), n))
+					dialog.ShowInformation("Retrieve stalled",
+						fmt.Sprintf("The server stopped sending data for %.0f seconds, so the retrieve was aborted.\n\n"+
+							"%d file(s) were received before the stall.\n\n"+
+							"Some PACS servers fail to deliver non-image objects (SR, Presentation State, "+
+							"encapsulated PDF) via C-MOVE — their sender never finishes the transfer. "+
+							"If this keeps happening on such series, set the profile's Retrieve method "+
+							"to C-GET or Auto in Preferences.\n\n"+
+							"If this server is simply slow (e.g. a tape archive), raise "+
+							"retrieveStallTimeoutSec in settings.json.",
+							stallTimeout.Seconds(), n), w)
 				case cancelled:
 					statusLabel.SetText("Retrieve cancelled")
 				case errCount > 0:
@@ -1148,7 +1250,14 @@ func main() {
 							}
 						}, w)
 				default:
-					statusLabel.SetText(fmt.Sprintf("Retrieved %d files successfully", n))
+					msg := fmt.Sprintf("Retrieved %d files successfully", n)
+					if convertedTotal > 0 {
+						// The server did not honour the required syntax for
+						// these files; the receive path converted them.
+						msg += fmt.Sprintf(" (%d converted locally to %s)",
+							convertedTotal, transferSyntaxLabel(requiredTS))
+					}
+					statusLabel.SetText(msg)
 				}
 			})
 		}()
@@ -1306,16 +1415,16 @@ func main() {
 				}
 				profileSelect.Options = profileNames()
 				profileSelect.Refresh()
-				// Re-apply the active profile's transfer policy to the running
-				// SCP so a preference change takes effect on the next retrieve
-				// without reconnecting.
+				// Re-apply the active profile's transfer syntax requirement to
+				// the running SCP so a preference change takes effect on the
+				// next retrieve without reconnecting.
 				if sc := getSCP(); sc != nil {
 					active := getActiveProfile()
 					for i := range cfg.Profiles {
 						if cfg.Profiles[i].Name == active.Name {
 							p := cfg.Profiles[i]
-							sc.SetTransferPolicy(p.preferredTransferSyntaxes(), p.EnsureUncompressed)
-							setActiveProfileTransfer(p.TransferSyntax, p.EnsureUncompressed)
+							sc.SetTransferPolicy(p.requiredTransferSyntax())
+							setActiveProfileTransfer(p.TransferSyntax)
 							break
 						}
 					}
@@ -1498,24 +1607,75 @@ func main() {
 	w.ShowAndRun()
 }
 
-// setupLogFile redirects the standard log package output to both stderr and
-// ~/.dicomqr/dicom.log so that DICOM protocol messages (from the grailbio
-// dicomlog package) are captured even in windowsgui builds.
+// setupLogFile redirects the standard log package output to the in-app
+// Activity Log ring, stderr, and ~/.dicomqr/dicom.log so that DICOM protocol
+// messages (from the grailbio dicomlog package) are captured even in
+// windowsgui builds.
+// failsafeWriter wraps a log sink so a write error is swallowed instead of
+// propagating. io.MultiWriter stops at the first writer that errors — and in
+// release builds (-s -w -H windowsgui, launched from Explorer) os.Stderr is an
+// invalid handle whose every write fails, which would silently discard ALL
+// log output before it reached the other sinks.
+type failsafeWriter struct{ w io.Writer }
+
+func (s failsafeWriter) Write(p []byte) (int, error) {
+	s.w.Write(p)
+	return len(p), nil
+}
+
+// fileLogSink appends every write to the log file by path, opening and closing
+// the file per write. Field evidence (2026-07-23): sessions holding one long-
+// lived handle produced log files containing only the session-start header —
+// every later write vanished without an error surfacing. Reopening per write
+// makes the sink stateless, so nothing that happens to a previous handle
+// (rotation by a second app instance, antivirus interference, a recreated
+// directory) can silently kill logging for the rest of the session: each line
+// either lands or fails alone, and the first failure is reported to the
+// Activity Log ring.
+type fileLogSink struct {
+	path     string
+	failures atomic.Int64
+}
+
+func (s *fileLogSink) Write(p []byte) (int, error) {
+	f, err := os.OpenFile(s.path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	if err == nil {
+		_, err = f.Write(p)
+		if closeErr := f.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	if err != nil && s.failures.Add(1) == 1 {
+		// Report straight to the ring — routing through the log package here
+		// would recurse into this sink.
+		appLog.Write([]byte("dicom.log unwritable: " + err.Error()))
+	}
+	return len(p), nil
+}
+
 func setupLogFile() {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return
-	}
-	dir := filepath.Join(home, ".dicomqr")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return
-	}
-	logPath := filepath.Join(dir, "dicom.log")
-	os.Rename(logPath, filepath.Join(dir, "dicom.log.1")) // rotate previous session; ignore error
-	f, err := os.Create(logPath)
-	if err != nil {
-		return
-	}
-	log.SetOutput(io.MultiWriter(os.Stderr, f, appLog))
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
+	// The ring and stderr sinks are wired unconditionally: a home-directory
+	// problem must never cost the Activity Log its output (previously the
+	// whole redirect was skipped, leaving windowsgui builds with no logging
+	// at all).
+	sinks := []io.Writer{failsafeWriter{appLog}, failsafeWriter{os.Stderr}}
+	logPath := "(unavailable)"
+	if home, err := os.UserHomeDir(); err == nil {
+		dir := filepath.Join(home, ".dicomqr")
+		if err := os.MkdirAll(dir, 0o755); err == nil {
+			// Keep the two previous sessions so diagnosing a hang survives a
+			// couple of app restarts: dicom.log.1 → dicom.log.2,
+			// dicom.log → dicom.log.1.
+			logPath = filepath.Join(dir, "dicom.log")
+			os.Remove(filepath.Join(dir, "dicom.log.2"))
+			os.Rename(filepath.Join(dir, "dicom.log.1"), filepath.Join(dir, "dicom.log.2"))
+			os.Rename(logPath, filepath.Join(dir, "dicom.log.1"))
+			// The file sink comes first so protocol evidence lands on disk
+			// before anything else can interfere.
+			sinks = append([]io.Writer{&fileLogSink{path: logPath}}, sinks...)
+		}
+	}
+	log.SetOutput(io.MultiWriter(sinks...))
+	log.Printf("dicomqr v%s (build %s) session start — log: %s", version, buildDate, logPath)
 }
