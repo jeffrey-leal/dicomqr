@@ -54,7 +54,7 @@ CGO_ENABLED=1 CC=/c/msys64/mingw64/bin/gcc.exe \
 | `preferences.go` | `appTheme`, system font scanner, preferences dialog |
 | `dicomfile.go` | `isDICOMFile` — magic-byte verification |
 | `transfersyntax.go` | Transfer syntax UID constants, labels, and `fileTransferSyntaxUID` (meta-only parse) |
-| `transcode.go` | Local conversion enforcing a profile's required syntax (Explicit/Implicit VR LE): `acceptedSyntaxesFor` builds the negotiable set (required first, then locally convertible — other LE VR, JPEG Baseline/Extended, JPEG 2000), and the receive path transcodes any non-required arrival in place before it reaches the download folder; a file that can be neither delivered nor converted aborts the retrieve |
+| `transcode.go` | Local conversion enforcing a profile's required syntax (Explicit/Implicit VR LE): `acceptedSyntaxesFor` builds the negotiable set (required first, then locally convertible — other LE VR, JPEG Baseline/Extended, JPEG 2000), and the receive path transcodes any non-required arrival in place before it reaches the download folder; objects that cannot be obtained in the required syntax — whether the server cannot deliver them in a negotiable syntax (failed sub-operations) or a delivered object fails local conversion (e.g. a screenshot with undecodable pixel data) — are skipped and reported (Activity Log + retrieve summary) while the rest of the retrieve continues; only a retrieve where the server delivers nothing at all raises an error dialog |
 | `export.go` | CSV and JSON export of query results |
 
 ## Key dependencies

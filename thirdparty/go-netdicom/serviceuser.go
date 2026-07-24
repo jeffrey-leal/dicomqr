@@ -500,6 +500,15 @@ func (su *ServiceUser) CFind(qrLevel QRLevel, filter []*dicom.Element) chan CFin
 // TODO(saito) We should parse the data into DataSet before passing to "cb".
 func (su *ServiceUser) CGet(qrLevel QRLevel, filter []*dicom.Element,
 	cb func(transferSyntaxUID, sopClassUID, sopInstanceUID string, data []byte) dimse.Status) error {
+	return su.CGetWithProgress(qrLevel, filter, nil, cb)
+}
+
+// CGetWithProgress is CGet with an onProgress callback reporting the
+// sub-operation counts carried in every C-GET-RSP, pending and final,
+// mirroring CMove's onProgress (dicomqr local patch). onProgress may be nil.
+func (su *ServiceUser) CGetWithProgress(qrLevel QRLevel, filter []*dicom.Element,
+	onProgress func(CMoveProgress),
+	cb func(transferSyntaxUID, sopClassUID, sopInstanceUID string, data []byte) dimse.Status) error {
 	err := su.waitUntilReady()
 	if err != nil {
 		return err
@@ -567,6 +576,14 @@ func (su *ServiceUser) CGet(qrLevel QRLevel, filter []*dicom.Element,
 		resp, ok := event.command.(*dimse.CGetRsp)
 		if !ok {
 			return fmt.Errorf("Found wrong response for C-GET: %v", event.command)
+		}
+		if onProgress != nil {
+			onProgress(CMoveProgress{
+				Remaining: int(resp.NumberOfRemainingSuboperations),
+				Completed: int(resp.NumberOfCompletedSuboperations),
+				Failed:    int(resp.NumberOfFailedSuboperations),
+				Warning:   int(resp.NumberOfWarningSuboperations),
+			})
 		}
 		if resp.Status.Status != dimse.StatusPending {
 			if resp.Status.Status != 0 {

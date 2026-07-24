@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	netdicom "github.com/algm/go-netdicom"
+	"github.com/algm/go-netdicom/dimse"
 	"github.com/algm/go-netdicom/sopclass"
 	dicom "github.com/grailbio/go-dicom"
 )
@@ -257,4 +259,60 @@ func TestMoveAbortsOnSilentServer(t *testing.T) {
 		t.Fatalf("Move took %v to give up — abort did not unstick the association", elapsed)
 	}
 	t.Logf("Move returned after %v with: %v", elapsed, err)
+}
+
+// An object that arrives in an accepted syntax but cannot be converted locally
+// (e.g. a screenshot or vendor graphic whose pixel data the built-in decoders
+// reject) must be skipped: Success returned so the PACS keeps sending the rest
+// of the retrieve, nothing saved, and the skip counted for the summary — not a
+// failed sub-operation, which would abort the whole retrieve.
+func TestCStoreSkipsUnconvertibleObject(t *testing.T) {
+	dir := t.TempDir()
+	scp := NewStorageSCP("TESTSCP", 11184, dir)
+	scp.SetTransferPolicy(tsExplicitVRLE)
+	scp.SetOnFileReceived(func(p string) { t.Errorf("onFileReceived fired for skipped object: %s", p) })
+
+	// Claims JPEG Baseline on the association, but the payload is garbage the
+	// parser rejects — the conversion attempt must fail and the object skip.
+	payload := bytes.Repeat([]byte{0xDE, 0xAD, 0xBE, 0xEF}, 64)
+	st := scp.handleCStore(tsJPEGBaseline, "1.2.840.10008.5.1.4.1.1.7", "1.2.3.4.5.6.7", bytes.NewReader(payload))
+	if st.Status != dimse.Success.Status {
+		t.Fatalf("status = %+v, want Success (a skip must not fail the sub-operation)", st)
+	}
+	if got := scp.SkippedCount(); got != 1 {
+		t.Errorf("SkippedCount = %d, want 1", got)
+	}
+	if got := scp.ConvertedCount(); got != 0 {
+		t.Errorf("ConvertedCount = %d, want 0", got)
+	}
+	if n := countDCM(t, dir); n != 0 {
+		t.Errorf("%d .dcm file(s) written, want 0", n)
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(dir, ".recv_*.tmp")); len(leftovers) != 0 {
+		t.Errorf("temp files left behind: %v", leftovers)
+	}
+}
+
+// The C-GET save path must skip unconvertible objects the same way: no error
+// (an error would fail the sub-operation and abort the retrieve), skipped
+// reported true, nothing written.
+func TestSaveGetFileSkipsUnconvertible(t *testing.T) {
+	dir := t.TempDir()
+	payload := bytes.Repeat([]byte{0xDE, 0xAD, 0xBE, 0xEF}, 64)
+	path, converted, skipped, err := saveGetFile(dir, tsJPEGBaseline, "1.2.840.10008.5.1.4.1.1.7", "1.2.3.4.5.6.8", payload, tsExplicitVRLE)
+	if err != nil {
+		t.Fatalf("saveGetFile error = %v, want nil (skip, not failure)", err)
+	}
+	if !skipped {
+		t.Error("skipped = false, want true")
+	}
+	if converted || path != "" {
+		t.Errorf("path = %q, converted = %v — want empty and false for a skipped object", path, converted)
+	}
+	if n := countDCM(t, dir); n != 0 {
+		t.Errorf("%d .dcm file(s) written, want 0", n)
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(dir, ".recv_*.tmp")); len(leftovers) != 0 {
+		t.Errorf("temp files left behind: %v", leftovers)
+	}
 }

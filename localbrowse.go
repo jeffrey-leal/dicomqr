@@ -495,11 +495,14 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 		previewItem := fyne.NewMenuItem("Preview Images", func() {
 			if seriesUID != "" {
 				// Series node: open the regular linear viewer.
-				go showDicomViewerPaths(a, previewTitle, capturedPaths)
+				go showDicomViewerPaths(a, w, previewTitle, capturedPaths)
 				return
 			}
 			// Study node: show the middle slice from each series in a grid.
-			// Collect per-series data from the model (all series are pre-loaded during scan).
+			// Only cheap model lookups happen here on the UI goroutine; the
+			// expensive work — sorting parses an InstanceNumber out of every
+			// file in the study — runs inside showStudyOverviewWindow behind
+			// its busy dialog.
 			var thumbs []seriesThumb
 			for _, childID := range model.childUIDs(id) {
 				ps := filesForNode(childID, model, seriesFiles)
@@ -508,10 +511,10 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 				}
 				thumbs = append(thumbs, seriesThumb{
 					label: model.labelFor(childID),
-					paths: sortDicomByInstance(ps),
+					paths: ps,
 				})
 			}
-			go showStudyOverviewWindow(a, previewTitle, thumbs)
+			go showStudyOverviewWindow(a, w, previewTitle, thumbs)
 		})
 		previewItem.Disabled = studyUID == "" // patient-level: too broad to preview
 
@@ -549,11 +552,10 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 	tree = widget.NewTree(
 		model.childUIDs,
 		model.isBranch,
-		func(_ bool) fyne.CanvasObject { return newQueryRow(w.Canvas(), onTapped, onMenu) },
+		func(_ bool) fyne.CanvasObject { return newQueryRow(onTapped, onMenu) },
 		func(id widget.TreeNodeID, _ bool, node fyne.CanvasObject) {
 			row := node.(*queryRow)
 			row.nodeID = id
-			row.tooltipText = model.tooltipFor(id)
 			row.ct.Text = model.labelFor(id)
 			row.ct.TextSize = theme.TextSize()
 			if selectedNodes[id] {
@@ -817,7 +819,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 				if scanDir == "" {
 					return
 				}
-				go showDicomViewer(a, scanDir)
+				go showDicomViewer(a, w, scanDir)
 			}),
 			localOpenInViewerBtn,
 			pushSelectedBtn,

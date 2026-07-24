@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,7 +28,7 @@ import (
 	sqweekdialog "github.com/sqweek/dialog"
 )
 
-const version = "1.8.0"
+const version = "1.9.0"
 
 // LED colours for connection and SCP state indicators.
 var (
@@ -243,6 +244,23 @@ func main() {
 	var clockOnce sync.Once
 	stopClock := func() { clockOnce.Do(func() { close(clockDone) }) }
 
+	// Crash safety net: a panic on the main goroutine (all Fyne event handlers
+	// run here) unwinds past ShowAndRun without reaching the OnStopped hook, so
+	// none of the normal shutdown paths would run. Record the panic in the log
+	// file first — in -H windowsgui release builds stderr is an invalid handle
+	// and an unlogged panic vanishes without a trace — then release the SCP
+	// port, close the catalog, and re-raise. Settings are deliberately not
+	// saved here: state mid-panic is not trustworthy.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("FATAL: panic on main goroutine: %v\n%s", r, debug.Stack())
+			stopClock()
+			shutdownSCP()
+			cat.Close()
+			panic(r)
+		}
+	}()
+
 	go func() {
 		tick := time.NewTicker(time.Second)
 		defer tick.Stop()
@@ -400,11 +418,10 @@ func main() {
 	tree = widget.NewTree(
 		model.childUIDs,
 		model.isBranch,
-		func(_ bool) fyne.CanvasObject { return newQueryRow(w.Canvas(), onTapped, onMenu) },
+		func(_ bool) fyne.CanvasObject { return newQueryRow(onTapped, onMenu) },
 		func(id widget.TreeNodeID, _ bool, node fyne.CanvasObject) {
 			row := node.(*queryRow)
 			row.nodeID = id
-			row.tooltipText = model.tooltipFor(id)
 			row.ct.Text = model.labelFor(id)
 			row.ct.TextSize = theme.TextSize()
 			if selectedNodes[id] {
@@ -1012,24 +1029,30 @@ func main() {
 			touch := func() { lastActivity.Store(time.Now().UnixNano()) }
 			var stalled atomic.Bool
 
-			// When the profile requires a specific transfer syntax, any failed
-			// sub-operation means the server cannot deliver in that syntax or
-			// any locally convertible fallback (or a local conversion failed) —
-			// abort immediately and report, rather than leaving a partial
-			// study behind (Failed counts arrive in C-MOVE progress responses;
-			// C-GET failures surface in the final status error).
+			// The required transfer syntax is enforced without aborting the
+			// retrieve. Objects that arrive but fail local conversion are
+			// skipped by the receive path (Success status, logged, counted);
+			// objects the server cannot deliver in any negotiated syntax show
+			// up as failed sub-operation counts in the C-MOVE/C-GET progress
+			// responses and are tracked here, reported at the end. Only hard
+			// target errors (refused association, protocol failure) take the
+			// per-target error path with its retry offer.
 			requiredTS := prof.requiredTransferSyntax()
-			var getConverted atomic.Int64
-			scpConvBase := int64(0)
+			var getConverted, getSkipped atomic.Int64
+			scpConvBase, scpSkipBase := int64(0), int64(0)
 			if sc != nil {
 				scpConvBase = sc.ConvertedCount()
+				scpSkipBase = sc.SkippedCount()
 			}
-			var tsRejected atomic.Bool
-			checkMoveFailures := func(p MoveProgress) {
-				if requiredTS != "" && p.Failed > 0 && tsRejected.CompareAndSwap(false, true) {
-					log.Printf("retrieve: %d sub-operation(s) failed with required transfer syntax %s — aborting",
-						p.Failed, requiredTS)
-					cancel()
+			// srvFailedCur holds the in-flight target's latest failed-sub-op
+			// count (counts are cumulative within one target); the loop folds
+			// it into srvFailedTotal when the target finishes. Written from the
+			// progress callbacks on the association goroutine, hence atomic.
+			var srvFailedTotal int64
+			var srvFailedCur atomic.Int64
+			trackSubOpFailures := func(p MoveProgress) {
+				if p.Failed > 0 {
+					srvFailedCur.Store(int64(p.Failed))
 				}
 			}
 			watchdogDone := make(chan struct{})
@@ -1076,10 +1099,16 @@ func main() {
 
 			// For C-GET: callback writes each received instance to the download folder.
 			getCallback := func(txUID, scUID, siUID string, data []byte) error {
-				path, converted, saveErr := saveGetFile(cfg.DownloadDir, txUID, scUID, siUID, data, requiredTS)
+				path, converted, skippedFile, saveErr := saveGetFile(cfg.DownloadDir, txUID, scUID, siUID, data, requiredTS)
 				if saveErr != nil {
 					log.Printf("c-get: save file: %v", saveErr)
 					return saveErr
+				}
+				if skippedFile {
+					// Unconvertible object — logged by saveGetFile. Report
+					// success for the sub-operation so the retrieve continues.
+					getSkipped.Add(1)
+					return nil
 				}
 				if converted {
 					getConverted.Add(1)
@@ -1095,7 +1124,6 @@ func main() {
 
 			var cancelled bool
 			var errCount int
-			var tsAbortErr error
 			var failed []retrieveTarget
 			for i, tgt := range targets {
 				if ctx.Err() != nil {
@@ -1112,34 +1140,43 @@ func main() {
 					statusLabel.SetText(fmt.Sprintf("Retrieving %s %d/%d…", label, idx, count))
 				})
 
+				// One progress callback per target: feeds the stall watchdog,
+				// the failed-sub-op tracker, and the fine-grained progress bar
+				// (C-GET reports counts too via CGetWithProgress).
+				onProg := func(p MoveProgress) {
+					touch()
+					trackSubOpFailures(p)
+					sub := p.Remaining + p.Completed + p.Failed + p.Warning
+					if sub > 0 {
+						frac := (float64(i) + float64(p.Completed)/float64(sub)) / float64(count)
+						fyne.Do(func() { progressBar.SetValue(frac) })
+					}
+				}
+
 				var err error
 				switch method {
 				case "GET":
-					err = cl.Get(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, getCallback)
+					err = cl.Get(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, getCallback, onProg)
 				case "AUTO":
-					err = cl.Get(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, getCallback)
+					err = cl.Get(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, getCallback, onProg)
 					if err != nil && ctx.Err() == nil {
 						log.Printf("retrieve: c-get failed (%v), falling back to c-move", err)
-						err = cl.Move(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, cfg.LocalAETitle, func(p MoveProgress) {
-							touch()
-							checkMoveFailures(p)
-							sub := p.Remaining + p.Completed + p.Failed + p.Warning
-							if sub > 0 {
-								frac := (float64(i) + float64(p.Completed)/float64(sub)) / float64(count)
-								fyne.Do(func() { progressBar.SetValue(frac) })
-							}
-						})
+						// The C-MOVE retry re-delivers the whole target; counts
+						// from the failed C-GET attempt are superseded.
+						srvFailedCur.Store(0)
+						err = cl.Move(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, cfg.LocalAETitle, onProg)
 					}
 				default: // "MOVE"
-					err = cl.Move(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, cfg.LocalAETitle, func(p MoveProgress) {
-						touch()
-						checkMoveFailures(p)
-						sub := p.Remaining + p.Completed + p.Failed + p.Warning
-						if sub > 0 {
-							frac := (float64(i) + float64(p.Completed)/float64(sub)) / float64(count)
-							fyne.Do(func() { progressBar.SetValue(frac) })
-						}
-					})
+					err = cl.Move(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, cfg.LocalAETitle, onProg)
+				}
+
+				// Fold the finished target's failed-sub-op count into the
+				// running total; counts are cumulative within a target, so the
+				// latest value is its final one.
+				if f := srvFailedCur.Swap(0); f > 0 {
+					srvFailedTotal += f
+					log.Printf("retrieve: server could not deliver %d object(s) for %s %d/%d — continuing",
+						f, label, idx, count)
 				}
 
 				if err != nil {
@@ -1147,24 +1184,15 @@ func main() {
 						cancelled = true
 						break
 					}
-					// With a required transfer syntax any error is fatal: the
-					// most likely cause is the server refusing to deliver in
-					// that syntax, and continuing would leave a partial study.
-					if requiredTS != "" {
-						tsAbortErr = err
-						log.Printf("retrieve: %s %d/%d failed with required transfer syntax %s — aborting: %v",
-							label, idx, count, requiredTS, err)
-						break
-					}
 					log.Printf("retrieve: %s %d/%d error (continuing): %v", label, idx, count, err)
 					errCount++
 					failed = append(failed, tgt)
 				}
 
-				// Advance the bar per completed target. C-MOVE also updates it
-				// finely via its progress callback above; this guarantees C-GET
-				// (which carries no sub-operation count) still shows progress and
-				// the bar reaches 100% on the final target (Phase 5-2A).
+				// Advance the bar per completed target. The progress callback
+				// above also updates it finely for both C-MOVE and C-GET; this
+				// guarantees the bar reaches 100% on the final target even when
+				// a server sends no sub-operation counts (Phase 5-2A).
 				frac := float64(idx) / float64(count)
 				fyne.Do(func() { progressBar.SetValue(frac) })
 			}
@@ -1197,32 +1225,25 @@ func main() {
 				log.Printf("retrieve: %d of %d file(s) arrived in a non-required syntax and were converted locally to %s",
 					convertedTotal, n, requiredTS)
 			}
+			skippedTotal := getSkipped.Load()
+			if sc != nil {
+				skippedTotal += sc.SkippedCount() - scpSkipBase
+			}
+			if skippedTotal > 0 {
+				log.Printf("retrieve: %d object(s) could not be converted to %s and were skipped (not saved) — see the SKIPPED entries above for details",
+					skippedTotal, requiredTS)
+			}
+			if srvFailedTotal > 0 {
+				if requiredTS != "" {
+					log.Printf("retrieve: the server could not deliver %d object(s) in %s or any locally convertible syntax — not received (likely stored in a format without a built-in decoder, e.g. JPEG-LS, RLE, JPEG Lossless)",
+						srvFailedTotal, requiredTS)
+				} else {
+					log.Printf("retrieve: the server reported %d failed sub-operation(s)", srvFailedTotal)
+				}
+			}
 			fyne.Do(func() {
 				progressBar.Hide()
 				switch {
-				case tsRejected.Load() || tsAbortErr != nil:
-					// The server could not deliver in the required transfer
-					// syntax or any locally convertible fallback (or a local
-					// conversion failed), so the retrieve was aborted.
-					tsName := transferSyntaxLabel(requiredTS)
-					detail := "the server reported failed sub-operations"
-					if tsAbortErr != nil {
-						detail = tsAbortErr.Error()
-					}
-					statusLabel.SetText(fmt.Sprintf(
-						"Retrieve aborted — could not obtain every file in %s; %d file(s) received", tsName, n))
-					dialog.ShowError(fmt.Errorf(
-						"The retrieve was aborted because not every object could be obtained "+
-							"in the required transfer syntax.\n\n"+
-							"Required: %s (%s)\n"+
-							"Details: %s\n\n"+
-							"%d file(s) were received before the abort; all of them are in the required syntax.\n\n"+
-							"The server could not send the data in the required syntax or in any format "+
-							"this application can convert locally (JPEG Baseline/Extended, JPEG 2000) — "+
-							"it may store the data in a format without a built-in decoder (e.g. JPEG-LS, RLE), "+
-							"or a local conversion failed (see the Activity Log). To retrieve this data anyway, "+
-							"set the profile's Transfer syntax to \"As stored (server decides)\" in Preferences.",
-						tsName, requiredTS, detail, n), w)
 				case cancelled && stalled.Load():
 					statusLabel.SetText(fmt.Sprintf(
 						"Retrieve stalled — no data from the server for %.0f s; %d file(s) received before the stall",
@@ -1249,6 +1270,24 @@ func main() {
 								startRetrieveTargets(failed)
 							}
 						}, w)
+				case n == 0 && srvFailedTotal > 0 && requiredTS != "":
+					// Nothing arrived and every sub-operation failed server-side:
+					// the server cannot deliver ANY object in the required syntax
+					// or a convertible fallback. Continuing silently would look
+					// like an empty study, so this one case stays loud.
+					tsName := transferSyntaxLabel(requiredTS)
+					statusLabel.SetText(fmt.Sprintf(
+						"Retrieve failed — the server could not deliver any of %d object(s) in %s", srvFailedTotal, tsName))
+					dialog.ShowError(fmt.Errorf(
+						"The server could not deliver any object in the required transfer syntax.\n\n"+
+							"Required: %s (%s)\n"+
+							"Failed sub-operations: %d\n\n"+
+							"The server could not send the data in the required syntax or in any format "+
+							"this application can convert locally (JPEG Baseline/Extended, JPEG 2000) — "+
+							"it may store the data in a format without a built-in decoder (e.g. JPEG-LS, RLE) "+
+							"and be unable to transcode. To retrieve this data anyway, "+
+							"set the profile's Transfer syntax to \"As stored (server decides)\" in Preferences.",
+						tsName, requiredTS, srvFailedTotal), w)
 				default:
 					msg := fmt.Sprintf("Retrieved %d files successfully", n)
 					if convertedTotal > 0 {
@@ -1256,6 +1295,12 @@ func main() {
 						// these files; the receive path converted them.
 						msg += fmt.Sprintf(" (%d converted locally to %s)",
 							convertedTotal, transferSyntaxLabel(requiredTS))
+					}
+					if skippedTotal > 0 {
+						msg += fmt.Sprintf(" — %d unconvertible object(s) skipped, see Activity Log", skippedTotal)
+					}
+					if srvFailedTotal > 0 {
+						msg += fmt.Sprintf(" — %d not delivered by the server, see Activity Log", srvFailedTotal)
 					}
 					statusLabel.SetText(msg)
 				}
@@ -1576,10 +1621,10 @@ func main() {
 	worklistContent, refreshWorklist = buildWorklistContent(w, &cfg)
 
 	tabs := container.NewAppTabs(
-		container.NewTabItem("PACS Query", pacsContent),
-		container.NewTabItem("Worklist", worklistContent),
 		container.NewTabItem("Local Browse", localContent),
+		container.NewTabItem("PACS Query", pacsContent),
 		container.NewTabItem("Import", importContent),
+		container.NewTabItem("Worklist", worklistContent),
 	)
 
 	w.SetContent(container.NewBorder(nil, statusBar, nil, nil, tabs))

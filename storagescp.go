@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,6 +62,12 @@ type StorageSCP struct {
 	// converted counts files transcoded locally since the SCP was created;
 	// the retrieve loop reads deltas to report server non-compliance.
 	converted atomic.Int64
+
+	// skipped counts objects discarded because local conversion to the
+	// required syntax failed (typically screenshots/graphics stored under an
+	// image SOP class that the built-in decoders cannot handle); the retrieve
+	// loop reads deltas to report them at the end of a retrieve.
+	skipped atomic.Int64
 }
 
 // DownloadDir returns the download directory (thread-safe, Phase 1-B).
@@ -97,6 +104,11 @@ func (s *StorageSCP) transferPolicy() string {
 // the SCP was created. Callers snapshot it around a retrieve to report how
 // many files the server did not deliver in the required syntax.
 func (s *StorageSCP) ConvertedCount() int64 { return s.converted.Load() }
+
+// SkippedCount returns the number of received objects discarded because they
+// could not be converted to the required transfer syntax. Callers snapshot it
+// around a retrieve to report the skips in the final summary.
+func (s *StorageSCP) SkippedCount() int64 { return s.skipped.Load() }
 
 // SetOnFileReceived sets the callback (thread-safe, Phase 1-C).
 func (s *StorageSCP) SetOnFileReceived(fn func(path string)) {
@@ -256,7 +268,22 @@ func (s *StorageSCP) IsRunning() bool { return s.running.Load() }
 func (s *StorageSCP) handleCStore(
 	transferSyntaxUID, sopClassUID, sopInstanceUID string,
 	dataReader io.Reader,
-) dimse.Status {
+) (st dimse.Status) {
+	// The dispatcher runs this handler on its own goroutine, where an escaped
+	// panic would kill the entire process (and with it the listener and every
+	// other association). Malformed input can genuinely panic here: the header
+	// encode uses MustNewElement and the transcode path parses with a library
+	// that panics on corrupt datasets. Convert a panic into a C-STORE failure
+	// response so the PACS sees the error and the app keeps running; any
+	// orphaned .recv_*.tmp file is removed by cleanupStaleTempFiles on the
+	// next Start.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("scp: PANIC receiving %s: %v\n%s", sopInstanceUID, r, debug.Stack())
+			st = dimse.Status{Status: dimse.CStoreOutOfResources,
+				ErrorComment: fmt.Sprintf("receiver internal error: %v", r)}
+		}
+	}()
 	// Create the temp file inside downloadDir so the later rename stays on the
 	// same filesystem and avoids cross-device rename failures.
 	tmpFile, err := os.CreateTemp(s.DownloadDir(), ".recv_*.tmp")
@@ -312,15 +339,20 @@ func (s *StorageSCP) handleCStore(
 	// Enforce the required transfer syntax BEFORE the file reaches its final
 	// destination: a file in the wrong syntax is transcoded in place while
 	// still a temp file, so the destination only ever holds conforming files.
-	// A conversion failure fails this sub-operation — the PACS reports it and
-	// the retrieve aborts — rather than leaving a non-conforming file behind.
+	// An object that cannot be converted — typically a screenshot or vendor
+	// graphic stored under an image SOP class whose pixel data the built-in
+	// decoders cannot handle — is skipped: nothing lands in the download
+	// folder, the skip is reported in the Activity Log and counted for the
+	// end-of-retrieve summary, and Success is returned so the PACS keeps
+	// sending the rest of the retrieve.
 	if req != "" && transferSyntaxUID != req {
 		changed, convErr := transcodeDICOMFile(tmpPath, req)
 		if convErr != nil {
+			s.skipped.Add(1)
+			log.Printf("scp: SKIPPED %s — cannot convert to %s: %v (series %q, SOP class %s); object not saved, retrieve continues",
+				sopInstanceUID, transferSyntaxLabel(req), convErr, seriesDesc, sopClassUID)
 			os.Remove(tmpPath)
-			log.Printf("scp: convert %s from %s to %s: %v", sopInstanceUID, transferSyntaxUID, req, convErr)
-			return dimse.Status{Status: dimse.CStoreOutOfResources,
-				ErrorComment: fmt.Sprintf("local conversion to %s failed: %v", req, convErr)}
+			return dimse.Success
 		}
 		if changed {
 			s.converted.Add(1)
@@ -501,21 +533,22 @@ func scpCopyFile(src, dst string) error {
 // the same organized subfolder hierarchy as the C-STORE SCP. The data argument
 // is the raw DICOM dataset bytes as received from the C-GET callback (no Group
 // 2 prefix); this function prepends the proper DICOM File Meta Information
-// header before writing. Returns the path of the saved file and whether the
-// payload was transcoded locally to requiredTS.
+// header before writing. Returns the path of the saved file, whether the
+// payload was transcoded locally to requiredTS, and whether the object was
+// skipped because conversion failed.
 // requiredTS, when non-empty, is enforced exactly as in handleCStore: an
 // arriving file in a different syntax is converted before it reaches its
-// destination (a failure is returned as an error, failing the sub-operation),
-// and an existing on-disk copy in a different syntax is overwritten instead of
-// skipped.
-func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID string, data []byte, requiredTS string) (string, bool, error) {
+// destination (an unconvertible object is skipped — logged, counted by the
+// caller, nothing saved — so the retrieve continues), and an existing on-disk
+// copy in a different syntax is overwritten instead of skipped.
+func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID string, data []byte, requiredTS string) (path string, converted, skipped bool, err error) {
 	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
-		return "", false, fmt.Errorf("cannot create download directory: %w", err)
+		return "", false, false, fmt.Errorf("cannot create download directory: %w", err)
 	}
 
 	tmpFile, err := os.CreateTemp(downloadDir, ".recv_*.tmp")
 	if err != nil {
-		return "", false, err
+		return "", false, false, err
 	}
 	tmpPath := tmpFile.Name()
 
@@ -528,13 +561,13 @@ func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID str
 	if encErr := enc.Error(); encErr != nil {
 		tmpFile.Close()
 		os.Remove(tmpPath)
-		return "", false, encErr
+		return "", false, false, encErr
 	}
 
 	if _, err := tmpFile.Write(data); err != nil {
 		tmpFile.Close()
 		os.Remove(tmpPath)
-		return "", false, err
+		return "", false, false, err
 	}
 	tmpFile.Close()
 
@@ -549,36 +582,39 @@ func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID str
 	if _, statErr := os.Stat(dest); statErr == nil {
 		if requiredTS == "" || fileTransferSyntaxUID(dest) == requiredTS {
 			os.Remove(tmpPath)
-			return dest, false, nil
+			return dest, false, false, nil
 		}
 	}
 
 	// Enforce the required transfer syntax before the file reaches its final
-	// destination (mirrors handleCStore); a failure fails the sub-operation.
-	converted := false
+	// destination (mirrors handleCStore): an unconvertible object is skipped —
+	// logged here, counted by the caller, nothing saved — so the retrieve
+	// continues instead of aborting.
 	if requiredTS != "" && transferSyntaxUID != requiredTS {
 		changed, convErr := transcodeDICOMFile(tmpPath, requiredTS)
 		if convErr != nil {
+			log.Printf("c-get: SKIPPED %s — cannot convert to %s: %v (series %q, SOP class %s); object not saved, retrieve continues",
+				sopInstanceUID, transferSyntaxLabel(requiredTS), convErr, seriesDesc, sopClassUID)
 			os.Remove(tmpPath)
-			return "", false, fmt.Errorf("local conversion to %s failed: %w", requiredTS, convErr)
+			return "", false, true, nil
 		}
 		converted = changed
 	}
 
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		os.Remove(tmpPath)
-		return "", false, err
+		return "", false, false, err
 	}
 
 	if err := os.Rename(tmpPath, dest); err != nil {
 		if copyErr := scpCopyFile(tmpPath, dest); copyErr != nil {
 			os.Remove(tmpPath)
-			return "", false, copyErr
+			return "", false, false, copyErr
 		}
 		os.Remove(tmpPath)
 	}
 
-	return dest, converted, nil
+	return dest, converted, false, nil
 }
 
 // dirWritable verifies that dir exists (creating it if necessary) and is

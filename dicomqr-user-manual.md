@@ -1,8 +1,8 @@
 # dicomqr
 
-**User Manual  v1.8.0**
+**User Manual  v1.9.0**
 
-July 23, 2026
+July 24, 2026
 
 A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.
 
@@ -26,7 +26,7 @@ Key capabilities:
 - View Structured Reports (SR), Key Object Selections (KO), and other non-image DICOM objects in a dedicated scrollable document viewer that renders the SR Content Sequence as formatted text
 - Import DICOM files from external folders into the organised download folder
 - Support for multiple saved server profiles with independent connection and retrieve settings
-- Optionally require a specific uncompressed transfer syntax per server profile — Explicit or Implicit VR Little Endian — guaranteed on disk: the server sends it directly, or files arriving in a decodable syntax (JPEG Baseline/Extended, JPEG 2000, the other uncompressed VR) are converted on receipt; the retrieve fails with a clear error only when neither is possible
+- Optionally require a specific uncompressed transfer syntax per server profile — Explicit or Implicit VR Little Endian — guaranteed on disk: the server sends it directly, or files arriving in a decodable syntax (JPEG Baseline/Extended, JPEG 2000, the other uncompressed VR) are converted on receipt; objects that can be neither delivered nor converted are skipped and reported while the rest of the study is retrieved
 - Automatic wildcard search — trailing `*` appended to text fields so partial names match without manual wildcarding
 - Customisable appearance — selection colour, font style, external viewer path, and window size are remembered between sessions
 
@@ -56,7 +56,7 @@ For C-MOVE file retrieval to work, the PACS must be able to initiate an outbound
 
 ### 2.3  Starting the Application
 
-Double-click `dicomqr.exe` to launch the application. The main window opens with an empty results tree and the status bar showing the application version. The window is restored to the size it had when last closed.
+Double-click `dicomqr.exe` to launch the application. The main window opens on the Local Browse tab, showing the indexed contents of the download folder; the status bar shows the application version. The window is restored to the size it had when last closed.
 
 
 ## 3  The Main Window
@@ -65,14 +65,16 @@ The main window is divided into a connection panel at the top, a tab area in the
 
 Connection panel — the topmost area, visible from all tabs. Left side: server profile selector, Filters button, Search button. Right side: Connect, Disconnect, and Test (C-ECHO) buttons. A second row shows the SCP status indicator.
 
-Tab area — four tabs:
+Tab area — four tabs, in this order:
 
 | Tab | Purpose |
 |---|---|
-| PACS Query | Search a remote PACS and retrieve studies. |
-| Worklist | Query a Modality Worklist server for scheduled procedures. |
 | Local Browse | Browse, preview, push, and delete files in the download folder. |
+| PACS Query | Search a remote PACS and retrieve studies. |
 | Import | Copy DICOM files from an external folder into the download folder. |
+| Worklist | Query a Modality Worklist server for scheduled procedures. |
+
+The Local Browse tab is active when the application starts.
 
 Status bar — the bottom strip. A coloured LED indicator precedes the status text. A clock shows the current date and time. A progress bar appears during queries and retrieves.
 
@@ -93,7 +95,7 @@ A server profile stores the connection details for one PACS destination. Profile
 | Info model | The DICOM Query/Retrieve information model. `study` = Study Root (most common). `patient` = Patient Root. `patient-study-only` = legacy retired model used by some older systems; SERIES-level queries are not available with this model. |
 | Retrieve method | C-MOVE (default) instructs the PACS to push files to the local C-STORE SCP listener. C-GET requests that the PACS return files over the same association — no inbound port or PACS-side destination registration is required. Auto tries C-GET first and falls back to C-MOVE if the PACS rejects it. |
 | Connect timeout | Seconds to wait for the initial C-ECHO before reporting a failure. Default: 10 s. |
-| Transfer syntax | 'As stored (server decides)' accepts whatever the PACS prefers — a JPEG 2000 archive will typically send JPEG 2000. The two uncompressed options guarantee every retrieved file ends up in exactly the selected syntax on disk — Explicit VR Little Endian (`1.2.840.10008.1.2.1`) or Implicit VR Little Endian (`1.2.840.10008.1.2`). Negotiation offers the required syntax first, so a transcoding-capable PACS sends it directly; a PACS that only serves objects in their stored form may instead send any syntax the application can decode (the other uncompressed VR, JPEG Baseline/Extended, JPEG 2000), and each such file is converted to the required syntax on receipt, before it reaches the download folder. The status bar reports how many files needed local conversion. If an object can be delivered neither in the required syntax nor in a locally convertible one (e.g. the archive stores JPEG-LS or RLE), the retrieve is aborted with an error dialog naming the required syntax rather than leaving a partial or mixed study; switch the profile back to 'As stored' to retrieve such data in its stored form. |
+| Transfer syntax | 'As stored (server decides)' accepts whatever the PACS prefers — a JPEG 2000 archive will typically send JPEG 2000. The two uncompressed options guarantee every retrieved file ends up in exactly the selected syntax on disk — Explicit VR Little Endian (`1.2.840.10008.1.2.1`) or Implicit VR Little Endian (`1.2.840.10008.1.2`). Negotiation offers the required syntax first, so a transcoding-capable PACS sends it directly; a PACS that only serves objects in their stored form may instead send any syntax the application can decode (the other uncompressed VR, JPEG Baseline/Extended, JPEG 2000), and each such file is converted to the required syntax on receipt, before it reaches the download folder. The status bar reports how many files needed local conversion. Objects that cannot be obtained in the required syntax do not stop the retrieve: an object the server cannot deliver in any negotiable syntax (e.g. the archive stores JPEG-LS or RLE and does not transcode), or one that arrives but fails local conversion (e.g. a screenshot with undecodable pixel data), is skipped — reported in the Activity Log and counted in the completion status — while every deliverable object is retrieved and stored in the required syntax. Only when the server can deliver nothing at all in a negotiable syntax does an error dialog appear, naming the required syntax; switch the profile back to 'As stored' to retrieve such data in its stored form. |
 
 The first profile in the list is selected by default when the application starts.
 
@@ -227,11 +229,6 @@ Right-clicking any row in the results tree opens a context menu:
 | Copy label | Copies the full display label of the row to the clipboard. |
 
 
-### 6.5  Tooltips
-
-Hovering the mouse cursor over a study or series row for approximately 0.6 seconds displays a tooltip showing the Study Instance UID and Accession Number (for study rows) or the Series Instance UID and Modality (for series rows). Moving the cursor off the row dismisses the tooltip immediately.
-
-
 ## 7  Retrieving Files
 
 
@@ -270,7 +267,7 @@ Selecting a study retrieves all of its series in one request; selecting individu
 
 ### 7.3  Progress
 
-The progress bar tracks completion across all selected studies and series, advancing as each study or series finishes. For C-MOVE the bar also advances within a study as individual files arrive; for C-GET it advances once per completed target. As each file arrives, the status bar briefly shows the path of the received file.
+The progress bar tracks completion across all selected studies and series, advancing as each study or series finishes. For both C-MOVE and C-GET the bar also advances within a study as the server reports sub-operation progress. As each file arrives, the status bar briefly shows the path of the received file.
 
 
 ### 7.4  Completion
@@ -289,7 +286,7 @@ Retrieved N files (X/Y targets had errors — see log)
 
 In this case a dialog also appears offering to retry only the failed targets. Accepting re-runs the retrieve loop for just those items, leaving already-retrieved files in place. Details of the errors are written to `dicom.log` in `%USERPROFILE%\.dicomqr\`. The log records the full DICOM protocol exchange — association negotiation (each presentation context with the offered and chosen transfer syntaxes, and any rejections), every PDU, and per-file receipt — and the two previous sessions are kept as `dicom.log.1` and `dicom.log.2`, so evidence of a failed or stalled transfer survives an application restart.
 
-When the profile requires a specific transfer syntax, error handling is stricter: the first failed sub-operation or target error aborts the whole retrieve immediately and a dialog reports the required syntax, the failure details, and how many files (all in the required syntax) were received before the abort. There is no partial-retry offer — every object is either delivered in (or converted to) the required syntax, or the retrieve fails. When files arrived in a different syntax and were converted locally, the completion status appends '(N converted locally to …)'.
+When the profile requires a specific transfer syntax, the completion status also accounts for objects that could not be obtained in it — the retrieve continues past them rather than aborting. Files that arrived in a different syntax and were converted locally are counted as '(N converted locally to …)'. An object that arrives but cannot be converted (for example a screenshot or vendor graphic whose pixel data has no built-in decoder) is skipped — it never reaches the download folder — and the status appends '— N unconvertible object(s) skipped, see Activity Log'. An object the server could not deliver in any negotiable syntax appends '— N not delivered by the server, see Activity Log'. Each skipped or undelivered object is logged with its SOP Instance UID and series so it can be identified afterwards, and every file that does reach the download folder is guaranteed to be in the required syntax. Only when the server delivers nothing at all in a negotiable syntax (zero files received) does an error dialog appear, naming the required syntax and recommending the 'As stored' setting for that server.
 
 
 ### 7.5  Cancelling a Retrieve
@@ -391,7 +388,9 @@ Colour maps apply only to grayscale (monochrome) images; for images already stor
 
 #### 8.3.4  Study Overview Grid
 
-The overview window shows one thumbnail per series — the middle slice of each series rendered in parallel. Thumbnails are arranged in a three-column grid. Double-click any thumbnail to open that series in the full series viewer.
+The overview window shows one thumbnail per series — the middle slice of each series rendered in parallel. Thumbnails flow from the top-left, wrapping into as many columns as fit the window, and reflow when the window is resized. Double-click any thumbnail to open that series in the full series viewer.
+
+While the overview is generated, a progress dialog counts the series as they load — studies with thousands of images can take several seconds. Series previews and the folder Preview button show the same dialog while large image sets are scanned and sorted; the application remains responsive throughout.
 
 
 #### 8.3.5  DICOM Annotation Overlay
@@ -645,7 +644,7 @@ The status bar at the bottom of the window provides real-time feedback. A colour
 
 | Situation | Status bar text |
 |---|---|
-| Application started, not connected | `v1.8.0` |
+| Application started, not connected | `v1.9.0` |
 | Connecting to server | `Connecting…` |
 | Connected | `Connected: <AE>@<host>:<port>` |
 | Connection cancelled | `Connection cancelled` |
@@ -659,6 +658,9 @@ The status bar at the bottom of the window provides real-time feedback. A colour
 | Retrieve in progress | `Retrieving study <N>/<total>…` |
 | File received | `Received: <file path>` |
 | Retrieve complete | `Retrieved <N> files successfully` |
+| Retrieve complete, objects skipped (required syntax) | `Retrieved <N> files successfully — <M> unconvertible object(s) skipped, see Activity Log` |
+| Retrieve complete, objects undeliverable (required syntax) | `Retrieved <N> files successfully — <M> not delivered by the server, see Activity Log` |
+| Retrieve failed — nothing deliverable in the required syntax | `Retrieve failed — the server could not deliver any of <M> object(s) in <syntax>` |
 | Retrieve complete with warnings | `Retrieved <N> files (<X>/<total> targets had errors — see log)` |
 | Retrieve cancelled | `Retrieve cancelled` |
 | C-ECHO test passed | `C-ECHO success` |
@@ -707,7 +709,7 @@ Each entry in the `profiles` array:
 | `infoModel` | `"study"`, `"patient"`, or `"patient-study-only"`. |
 | `retrieveMethod` | `"MOVE"`, `"GET"`, or `"AUTO"`. Omitting defaults to C-MOVE. |
 | `connectTimeout` | Connection timeout in seconds. 0 uses the default (10 s). |
-| `transferSyntax` | `""` (as stored, default), `"explicit-le"`, or `"implicit-le"`. The non-empty values guarantee every retrieved file is stored in that syntax: negotiation offers it first plus the locally decodable syntaxes, files arriving in any other accepted syntax are converted on receipt, and the retrieve aborts with an error when an object can be neither delivered nor converted. Re-retrieves replace existing on-disk copies whose transfer syntax differs from the required one. |
+| `transferSyntax` | `""` (as stored, default), `"explicit-le"`, or `"implicit-le"`. The non-empty values guarantee every retrieved file is stored in that syntax: negotiation offers it first plus the locally decodable syntaxes, files arriving in any other accepted syntax are converted on receipt, and objects that can be neither delivered nor converted are skipped and reported while the retrieve continues. Re-retrieves replace existing on-disk copies whose transfer syntax differs from the required one. |
 | `ensureUncompressed` | Obsolete (v1.7.0 only) and ignored: the local-decompression guarantee was replaced by strict single-syntax negotiation via `transferSyntax`. |
 | `transferUncompressed` | Deprecated (pre-v1.7). When true it is migrated on load to `transferSyntax: "explicit-le"`. |
 
@@ -729,7 +731,7 @@ Information model — If queries return no results, try changing the Info model 
 
 Worklist server — The Modality Worklist SOP class is typically served by a RIS or dedicated MWL broker, not the PACS itself. Create a separate server profile pointing to that system and select it in the Worklist tab.
 
-Compressed pixel data — the built-in viewer decodes JPEG Baseline and JPEG 2000. Downstream consumers that require `1.2.840.10008.1.2` / `1.2.840.10008.1.2.1` files should require an uncompressed transfer syntax in the server profile: every file on disk is then guaranteed to be in the selected syntax — sent that way by the PACS, or converted on receipt from JPEG Baseline/Extended, JPEG 2000, or the other uncompressed VR — and re-retrieves replace older copies stored in a different syntax. Only when the PACS stores data in a format the application cannot decode either (e.g. JPEG-LS, RLE) does the retrieve abort with an error naming the required syntax; switch back to 'As stored' and use the external viewer integration for such data.
+Compressed pixel data — the built-in viewer decodes JPEG Baseline and JPEG 2000. Downstream consumers that require `1.2.840.10008.1.2` / `1.2.840.10008.1.2.1` files should require an uncompressed transfer syntax in the server profile: every file on disk is then guaranteed to be in the selected syntax — sent that way by the PACS, or converted on receipt from JPEG Baseline/Extended, JPEG 2000, or the other uncompressed VR — and re-retrieves replace older copies stored in a different syntax. Objects stored in a format the application cannot decode either (e.g. JPEG-LS, RLE) are skipped and reported in the Activity Log while the rest of the study is retrieved; if nothing at all can be delivered in a negotiable syntax, an error dialog names the required syntax — switch back to 'As stored' and use the external viewer integration for such data.
 
 IPv4 connectivity — dicomqr listens on an IPv4 socket only. Ensure the address shown in Help > Client info… is the correct IPv4 address on the same network as the PACS.
 

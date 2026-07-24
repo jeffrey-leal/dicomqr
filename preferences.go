@@ -465,7 +465,7 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 		widget.NewFormItem("Transfer syntax", tsSelect),
 	)
 
-	dialog.ShowCustomConfirm("Edit Server", "Save", "Cancel", form, func(save bool) {
+	d := dialog.NewCustomConfirm("Edit Server", "Save", "Cancel", form, func(save bool) {
 		if !save {
 			return
 		}
@@ -511,4 +511,13 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 			TransferSyntax: transferSyntax,
 		})
 	}, w)
+	// Widen beyond the form's natural minimum so the transfer syntax options
+	// ("Explicit VR LE (uncompressed — convert locally if needed)") are fully
+	// readable in the select and its dropdown.
+	sz := d.MinSize()
+	if sz.Width < 640 {
+		sz.Width = 640
+	}
+	d.Resize(sz)
+	d.Show()
 }

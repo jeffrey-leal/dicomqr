@@ -22,7 +22,6 @@ type resultNode struct {
 	id       string
 	kind     string
 	label    string
-	tooltip  string
 	children []string
 	sortKey  string // patient: lower-case name; study: YYYYMMDD date; series: zero-padded number
 
@@ -103,9 +102,8 @@ func (m *resultsModel) addStudy(patientName, patientID, studyUID, studyDate, stu
 		if modalities != "" {
 			label += fmt.Sprintf("  [%s]", modalities)
 		}
-		tooltip := fmt.Sprintf("Study Instance UID: %s\nAccession: %s", studyUID, accession)
 		m.nodes[sID] = &resultNode{
-			id: sID, kind: kindStudy, label: label, tooltip: tooltip,
+			id: sID, kind: kindStudy, label: label,
 			patientID: patientID, studyInstanceUID: studyUID,
 			sortKey:    studyDate,
 			parentID:   patID,
@@ -131,14 +129,13 @@ func (m *resultsModel) addSeries(studyUID, seriesUID, modality, seriesNumber, se
 		if numInstances > 0 {
 			label += fmt.Sprintf("  [%d images]", numInstances)
 		}
-		tooltip := fmt.Sprintf("Series Instance UID: %s\nModality: %s", seriesUID, modality)
 		study, ok := m.nodes[sID]
 		if !ok {
 			return
 		}
 		n, _ := strconv.Atoi(strings.TrimSpace(seriesNumber))
 		m.nodes[rID] = &resultNode{
-			id: rID, kind: kindSeries, label: label, tooltip: tooltip,
+			id: rID, kind: kindSeries, label: label,
 			patientID:         study.patientID, // propagate so retrieve can build C-MOVE filters
 			studyInstanceUID:  studyUID,
 			seriesInstanceUID: seriesUID,
@@ -249,13 +246,6 @@ func (m *resultsModel) labelFor(id string) string {
 		return n.label
 	}
 	return id
-}
-
-func (m *resultsModel) tooltipFor(id string) string {
-	if n, ok := m.nodes[id]; ok {
-		return n.tooltip
-	}
-	return ""
 }
 
 // uidsForNode returns the DICOM UIDs for a given tree node ID.

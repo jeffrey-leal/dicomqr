@@ -111,7 +111,7 @@ func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, 
 		previewTitle := "DICOM Preview — " + model.labelFor(id)
 
 		previewItem := fyne.NewMenuItem("Preview Images", func() {
-			go showDicomViewerPaths(a, previewTitle, capturedPaths)
+			go showDicomViewerPaths(a, w, previewTitle, capturedPaths)
 		})
 		_, studyUID, seriesUID, _ := model.uidsForNode(id)
 		uid := seriesUID
@@ -131,11 +131,10 @@ func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, 
 	tree = widget.NewTree(
 		model.childUIDs,
 		model.isBranch,
-		func(_ bool) fyne.CanvasObject { return newQueryRow(w.Canvas(), onTapped, onMenu) },
+		func(_ bool) fyne.CanvasObject { return newQueryRow(onTapped, onMenu) },
 		func(id widget.TreeNodeID, _ bool, node fyne.CanvasObject) {
 			row := node.(*queryRow)
 			row.nodeID = id
-			row.tooltipText = model.tooltipFor(id)
 			row.ct.Text = model.labelFor(id)
 			row.ct.TextSize = theme.TextSize()
 			if selectedNodes[id] {

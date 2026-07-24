@@ -215,10 +215,13 @@ func abortAndReap[T any](su *netdicom.ServiceUser, done <-chan T) {
 // Get sends a C-GET-RQ (PS3.4 C.4.3) for the given UIDs, causing the PACS to
 // return DICOM instances over the same association. onStore is called once per
 // received instance; returning a non-nil error sends CStoreOutOfResources and
-// aborts the retrieve. C-GET does not require a separate inbound C-STORE SCP.
+// aborts the retrieve. onProgress (may be nil) is called for each C-GET-RSP
+// with sub-operation counts, exactly as in Move. C-GET does not require a
+// separate inbound C-STORE SCP.
 // Returns nil when the final response carries StatusSuccess (0000H).
 func (c *DicomClient) Get(ctx context.Context, level, patientID, studyUID, seriesUID string,
-	onStore func(transferSyntaxUID, sopClassUID, sopInstanceUID string, data []byte) error) error {
+	onStore func(transferSyntaxUID, sopClassUID, sopInstanceUID string, data []byte) error,
+	onProgress func(MoveProgress)) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -239,7 +242,19 @@ func (c *DicomClient) Get(ctx context.Context, level, patientID, studyUID, serie
 	go func() {
 		defer su.Release()
 		su.Connect(fmt.Sprintf("%s:%d", c.profile.Host, c.profile.Port))
-		done <- result{su.CGet(levelToQRLevel(level), buildMoveFilter(level, patientID, studyUID, seriesUID),
+
+		progressFn := func(p netdicom.CMoveProgress) {
+			if onProgress != nil {
+				onProgress(MoveProgress{
+					Remaining: p.Remaining,
+					Completed: p.Completed,
+					Failed:    p.Failed,
+					Warning:   p.Warning,
+				})
+			}
+		}
+		done <- result{su.CGetWithProgress(levelToQRLevel(level), buildMoveFilter(level, patientID, studyUID, seriesUID),
+			progressFn,
 			func(txUID, scUID, siUID string, data []byte) dimse.Status {
 				if storeErr := onStore(txUID, scUID, siUID, data); storeErr != nil {
 					return dimse.Status{Status: dimse.CStoreOutOfResources, ErrorComment: storeErr.Error()}

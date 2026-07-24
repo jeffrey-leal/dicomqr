@@ -2,6 +2,7 @@ package netdicom
 
 import (
 	"fmt"
+	"runtime/debug"
 	"sync"
 
 	"github.com/algm/go-netdicom/dimse"
@@ -243,10 +244,20 @@ func (disp *serviceDispatcher) handleEvent(event upcallEvent) {
 		return
 	}
 	go func() {
+		// A panicking callback must not crash the whole process (dicomqr local
+		// patch): recover, log, and drop the command. The peer sees the
+		// operation abort or time out instead of the application vanishing.
+		// deleteCommand runs in the defer so cleanup happens on both paths.
+		defer func() {
+			if r := recover(); r != nil {
+				dicomlog.Vprintf(0, "dicom.serviceDispatcher(%s): callback panic for message %v: %v\n%s",
+					disp.label, messageID, r, debug.Stack())
+			}
+			disp.deleteCommand(dc)
+		}()
 		// Attach streaming reader to command state for handlers needing io.Reader
 		dc.streamingReader = event.data
 		cb(event.command, event.data, dc)
-		disp.deleteCommand(dc)
 	}()
 }
 

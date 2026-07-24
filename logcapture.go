@@ -61,13 +61,44 @@ func (l *logCapture) Clear() {
 	l.mu.Unlock()
 }
 
+// readOnlyEntry is a multi-line Entry that stays enabled (so text renders in
+// the normal foreground colour rather than the faded disabled shade) but
+// swallows every editing input. Mouse selection, caret navigation, Select All
+// and Copy still work.
+type readOnlyEntry struct {
+	widget.Entry
+}
+
+func newReadOnlyEntry() *readOnlyEntry {
+	e := &readOnlyEntry{}
+	e.MultiLine = true
+	e.Wrapping = fyne.TextWrapOff
+	e.ExtendBaseWidget(e)
+	return e
+}
+
+func (e *readOnlyEntry) TypedRune(_ rune) {}
+
+func (e *readOnlyEntry) TypedKey(ev *fyne.KeyEvent) {
+	switch ev.Name {
+	case fyne.KeyBackspace, fyne.KeyDelete, fyne.KeyReturn, fyne.KeyEnter, fyne.KeyTab:
+		return
+	}
+	e.Entry.TypedKey(ev)
+}
+
+func (e *readOnlyEntry) TypedShortcut(s fyne.Shortcut) {
+	switch s.(type) {
+	case *fyne.ShortcutCopy, *fyne.ShortcutSelectAll:
+		e.Entry.TypedShortcut(s)
+	}
+}
+
 // showLogDialog opens a resizable dialog that displays and auto-refreshes the
 // in-memory activity log. A 1-second ticker updates the view while it is open;
 // the goroutine exits when the Close button is pressed.
 func showLogDialog(w fyne.Window) {
-	entry := widget.NewMultiLineEntry()
-	entry.Disable()
-	entry.Wrapping = fyne.TextWrapOff
+	entry := newReadOnlyEntry()
 
 	scroll := container.NewVScroll(entry)
 	scroll.SetMinSize(fyne.NewSize(820, 440))

@@ -13,10 +13,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/widget"
 
@@ -85,9 +87,20 @@ func collectDicomFiles(dir string) ([]string, error) {
 
 // sortDicomByInstance returns paths sorted by DICOM InstanceNumber.
 func sortDicomByInstance(rawPaths []string) []string {
+	return sortDicomByInstanceProgress(rawPaths, nil)
+}
+
+// sortDicomByInstanceProgress is sortDicomByInstance with an optional progress
+// callback, invoked after each file's InstanceNumber parse with the count
+// completed so far. Parsing every file takes seconds for large series, so
+// callers driving a busy indicator use this form.
+func sortDicomByInstanceProgress(rawPaths []string, progress func(done int)) []string {
 	instances := make([]dicomInstance, len(rawPaths))
 	for i, p := range rawPaths {
 		instances[i] = dicomInstance{path: p, instanceNumber: dicomInstanceNumber(p)}
+		if progress != nil {
+			progress(i + 1)
+		}
 	}
 	sort.SliceStable(instances, func(i, j int) bool {
 		if instances[i].instanceNumber != instances[j].instanceNumber {
@@ -1267,11 +1280,45 @@ func (c *thumbnailCell) CreateRenderer() fyne.WidgetRenderer {
 	)
 }
 
+// busyDialog is a modal "working…" indicator: a status line above an infinite
+// progress bar, shown over a parent window while a preview is generated.
+type busyDialog struct {
+	status *widget.Label
+	dlg    *dialog.CustomDialog
+}
+
+// showBusyDialog creates and shows a busyDialog. Must be called from a non-UI
+// goroutine: creation is queued to the UI thread, and because the queue is
+// FIFO it is guaranteed to run before a later hide() from the same goroutine.
+func showBusyDialog(parent fyne.Window, title, initialStatus string) *busyDialog {
+	b := &busyDialog{status: widget.NewLabel(initialStatus)}
+	b.status.Alignment = fyne.TextAlignCenter
+	fyne.Do(func() {
+		b.dlg = dialog.NewCustomWithoutButtons(title,
+			container.NewVBox(b.status, widget.NewProgressBarInfinite()), parent)
+		b.dlg.Show()
+	})
+	return b
+}
+
+// setStatus updates the status line. Safe to call from any goroutine.
+func (b *busyDialog) setStatus(msg string) {
+	fyne.Do(func() { b.status.SetText(msg) })
+}
+
+// hide dismisses the dialog. Safe to call from any non-UI goroutine.
+func (b *busyDialog) hide() {
+	fyne.Do(func() { b.dlg.Hide() })
+}
+
 // showStudyOverviewWindow opens a grid window showing the middle slice of each
-// series for a study. Thumbnails are loaded in parallel. Double-clicking any
-// thumbnail opens the full series viewer for that series.
+// series for a study. Each series' paths are sorted by InstanceNumber here —
+// sorting parses every file in the study, so the caller must NOT pre-sort on
+// the UI goroutine — and thumbnails are loaded in parallel while a modal busy
+// dialog over parent reports progress. Double-clicking any thumbnail opens the
+// full series viewer for that series.
 // Must be called from a non-UI goroutine.
-func showStudyOverviewWindow(a fyne.App, title string, series []seriesThumb) {
+func showStudyOverviewWindow(a fyne.App, parent fyne.Window, title string, series []seriesThumb) {
 	if len(series) == 0 {
 		fyne.Do(func() {
 			win := a.NewWindow(title)
@@ -1282,24 +1329,33 @@ func showStudyOverviewWindow(a fyne.App, title string, series []seriesThumb) {
 		return
 	}
 
-	// Load the middle slice of every series in parallel.
+	// Busy dialog: large studies take seconds to sort and thumbnail, and
+	// without feedback the app looks hung.
+	busy := showBusyDialog(parent, "Generating study preview",
+		fmt.Sprintf("Loading series previews (0/%d)…", len(series)))
+
+	// Sort and load the middle slice of every series in parallel.
 	thumbs := make([]viewerState, len(series))
+	var loaded atomic.Int32
 	var wg sync.WaitGroup
 	for i, s := range series {
 		wg.Add(1)
 		i, s := i, s
 		go func() {
 			defer wg.Done()
-			if len(s.paths) == 0 {
-				return
+			if len(s.paths) > 0 {
+				sorted := sortDicomByInstance(s.paths)
+				series[i].paths = sorted
+				vs, err := loadDicomImage(sorted[len(sorted)/2])
+				if err == nil {
+					thumbs[i] = vs
+				}
 			}
-			vs, err := loadDicomImage(s.paths[len(s.paths)/2])
-			if err == nil {
-				thumbs[i] = vs
-			}
+			busy.setStatus(fmt.Sprintf("Loading series previews (%d/%d)…", loaded.Add(1), len(series)))
 		}()
 	}
 	wg.Wait()
+	busy.hide()
 
 	fyne.Do(func() {
 		win := a.NewWindow(title)
@@ -1313,34 +1369,46 @@ func showStudyOverviewWindow(a fyne.App, title string, series []seriesThumb) {
 			cells[i] = newThumbnailCell(img, s.label, "DICOM Preview — "+s.label, s.paths, a)
 		}
 
-		cols := 3
-		if len(cells) < cols {
-			cols = len(cells)
+		// GridWrap reflows cells top-left to bottom-right as the window is
+		// resized. It lays every cell out at one fixed size, so use the
+		// largest minimum among the cells to fit them all.
+		cellSize := fyne.NewSize(200, 230)
+		for _, c := range cells {
+			cellSize = cellSize.Max(c.MinSize())
 		}
-		grid := container.NewGridWithColumns(cols, cells...)
+		grid := container.NewGridWrap(cellSize, cells...)
 
 		hint := widget.NewLabelWithStyle(
 			"Double-click a thumbnail to open the full series viewer.",
 			fyne.TextAlignCenter, fyne.TextStyle{Italic: true},
 		)
 
-		win.SetContent(container.NewBorder(hint, nil, nil, nil, container.NewScroll(grid)))
-		win.Resize(fyne.NewSize(float32(cols)*200+40, 560))
+		cols := 3
+		if len(cells) < cols {
+			cols = len(cells)
+		}
+		win.SetContent(container.NewBorder(hint, nil, nil, nil, container.NewVScroll(grid)))
+		win.Resize(fyne.NewSize(float32(cols)*(cellSize.Width+4)+40, 560))
 		win.Show()
 	})
 }
 
 // showDicomViewer opens the DICOM preview window for all images in folder.
+// Collection magic-byte-checks every file in the tree, which can take a while
+// for a large download folder, so a modal busy dialog over parent covers it.
 // Must be called from a non-UI goroutine.
-func showDicomViewer(a fyne.App, folder string) {
+func showDicomViewer(a fyne.App, parent fyne.Window, folder string) {
+	busy := showBusyDialog(parent, "Generating preview", "Scanning folder for DICOM files…")
 	paths, collectErr := collectDicomFiles(folder)
+	busy.hide()
 	openViewerWindow(a, "DICOM Preview — "+filepath.Base(folder), paths, collectErr)
 }
 
 // showDicomViewerPaths opens the DICOM preview window for a specific set of files.
-// Paths are sorted by InstanceNumber before display.
+// Paths are sorted by InstanceNumber first — a header parse of every file, which
+// takes seconds for large series — behind a modal busy dialog over parent.
 // Must be called from a non-UI goroutine.
-func showDicomViewerPaths(a fyne.App, title string, rawPaths []string) {
+func showDicomViewerPaths(a fyne.App, parent fyne.Window, title string, rawPaths []string) {
 	if len(rawPaths) == 0 {
 		fyne.Do(func() {
 			win := a.NewWindow(title)
@@ -1350,7 +1418,18 @@ func showDicomViewerPaths(a fyne.App, title string, rawPaths []string) {
 		})
 		return
 	}
-	openViewerWindow(a, title, sortDicomByInstance(rawPaths), nil)
+	total := len(rawPaths)
+	busy := showBusyDialog(parent, "Generating series preview",
+		fmt.Sprintf("Sorting images (0/%d)…", total))
+	sorted := sortDicomByInstanceProgress(rawPaths, func(done int) {
+		// Throttle updates: one per 50 files is smooth enough and avoids
+		// flooding the UI event queue on multi-thousand-image series.
+		if done%50 == 0 || done == total {
+			busy.setStatus(fmt.Sprintf("Sorting images (%d/%d)…", done, total))
+		}
+	})
+	busy.hide()
+	openViewerWindow(a, title, sorted, nil)
 }
 
 // presetNames returns the ordered preset names of a list for the dropdown.

@@ -1,5 +1,35 @@
 # Changelog
 
+## [1.9.0] — 2026-07-24
+
+### Changed
+
+- **Unobtainable objects no longer abort a transfer-syntax-restricted retrieve** — with a required transfer syntax, v1.8.0 aborted the entire retrieve on the first object that could not be obtained in it. Both failure modes now skip the object and continue. (1) An object that *arrives* but fails local conversion — typically a screenshot or vendor graphic stored under an image SOP class whose pixel data the built-in decoders reject — is discarded before it reaches the download folder, logged in the Activity Log as `SKIPPED <SOP Instance UID>` with the series description, SOP class, and decode error, and the sub-operation reports success so the PACS keeps sending the rest of the study. (2) An object the *server* cannot deliver in any negotiable syntax (e.g. stored as JPEG-LS or RLE on a non-transcoding archive) is counted from the C-MOVE/C-GET progress responses and reported the same way. The completion status appends '— N unconvertible object(s) skipped' and/or '— N not delivered by the server, see Activity Log'; every file that does land on disk is still guaranteed to be in the required syntax. The abort dialog remains only for the one case that deserves it: the server delivered nothing at all in a negotiable syntax (zero files), where it names the required syntax and recommends 'As stored' for that server
+- **Main tabs reordered** — Local Browse, PACS Query, Import, Worklist (was PACS Query, Worklist, Local Browse, Import). The application now opens on Local Browse, showing the indexed download folder immediately
+- **Study overview grid reflows with the window** — thumbnails flow from the top-left and wrap into as many columns as fit, reflowing on resize (previously a fixed three-column grid). The initial window still opens three columns wide
+- **Preview generation shows a progress dialog** — opening a study overview, a series preview, or the folder Preview now displays a modal busy dialog with an infinite progress indicator and a live count ("Loading series previews (12/40)…", "Sorting images (450/3000)…") instead of appearing unresponsive on studies with thousands of images
+- **Activity Log text is full-contrast and selectable** — the log was displayed in a disabled text widget, which Fyne renders in the faded 'disabled' colour. It now uses a read-only entry that stays enabled: normal text colour, mouse/keyboard text selection, and Ctrl+A/Ctrl+C work directly, while editing remains blocked
+- **Edit Server dialog widened** — the dialog now opens 640 px wide so the Transfer syntax options ("Explicit VR LE (uncompressed — convert locally if needed)") are fully readable in the dropdown
+- **UID hover tooltips removed from the results trees** — the Study/Series UID tooltip that appeared after hovering a row could swallow the next click and interfere with selecting rows for retrieve or preview. Removed from all three trees (PACS Query, Local Browse, Import); UIDs remain available via right-click Copy UID and in CSV/JSON exports
+
+### Fixed
+
+- **Study-level Preview Images froze the whole application** — the menu handler sorted every series on the UI thread, and sorting parses an InstanceNumber out of every file in the study; with thousands of images the window stopped repainting for seconds. Collection now happens off the UI thread with each series sorted in parallel, behind the progress dialog — the UI stays responsive and large overviews open faster
+- **C-GET retrieves now drive the progress bar within a study** — the C-GET response loop previously discarded the sub-operation counts the server sends, so the bar only jumped at target boundaries; it now advances file-by-file exactly as C-MOVE does
+- **The embedded C-STORE SCP is shut down on every exit path, including crashes** — a panic on the main goroutine (where all UI event handlers run) previously bypassed both the close intercept and the lifecycle hook, and in `-H windowsgui` release builds the panic text went to an invalid stderr handle, so the app died silently without releasing the SCP port or closing the catalog. A crash safety net now records the panic and stack trace to `dicom.log`, stops the SCP, closes the catalog index, and re-raises. A panic inside the C-STORE receive path (malformed incoming object) previously killed the entire process — it now returns a C-STORE failure response for that object and the application keeps running
+
+### Internal
+
+- `storagescp.go` — conversion failure in `handleCStore` returns `dimse.Success` after logging and deleting the temp file (an error status would land in the C-MOVE Failed count and read as a server-side failure); `skipped` counter + `SkippedCount()`; `saveGetFile` returns `(path, converted, skipped, err)`; `handleCStore` recovers its own panics into a C-STORE error status
+- `main.go` — `checkMoveFailures`/`tsRejected`/`tsAbortErr` (abort-on-failure) replaced by `trackSubOpFailures` + per-target fold into `srvFailedTotal`; hard target errors under a required syntax now use the normal per-target error path with the retry-failed-targets offer; the AUTO fallback resets the in-flight count before the C-MOVE retry; completion reporting extended (skipped / not-delivered counts, zero-delivery dialog); crash-recovery `defer` in `main()` (logs panic + stack, `stopClock`/`shutdownSCP`/`cat.Close`, re-panic)
+- `thirdparty/go-netdicom/serviceuser.go` — `CGetWithProgress` (dicomqr local patch): reports sub-operation counts from every C-GET-RSP, mirroring `CMove`; `CGet` is now a thin wrapper
+- `thirdparty/go-netdicom/servicedispatcher.go` — DIMSE callback goroutines recover panics (log + drop the command) instead of crashing the process (dicomqr local patch)
+- `dicomnet.go` — `Get` gains an `onProgress func(MoveProgress)` parameter wired to `CGetWithProgress`
+- `viewer.go` — `busyDialog` widget (`showBusyDialog`/`setStatus`/`hide`); study overview uses `container.NewGridWrap` sized to the largest cell minimum; per-series sorting moved into `showStudyOverviewWindow` workers; `sortDicomByInstanceProgress` (progress-callback variant, updates throttled to one per 50 files); `showDicomViewerPaths`/`showDicomViewer` take a parent window for the busy dialog
+- `queryrow.go` — hover/tooltip machinery removed (`Hoverable` no longer implemented); `resultsModel` drops the `tooltip` field and `tooltipFor`
+- `logcapture.go` — `readOnlyEntry` (enabled multi-line entry that swallows editing input; copy/select-all shortcuts pass through) replaces the disabled entry in the Activity Log dialog
+- `srtransfer_repro_test.go` — `TestCStoreSkipsUnconvertibleObject` / `TestSaveGetFileSkipsUnconvertible`: garbage payloads claiming JPEG Baseline must be skipped with Success status, counted, nothing written, no temp files leaked
+
 ## [1.8.0] — 2026-07-23
 
 ### Changed
