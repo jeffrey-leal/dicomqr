@@ -1,18 +1,29 @@
 # Credits
 
-## Developer
+## Attribution
+
+dicomqr is a human–AI collaboration. Credit is given by role, reflecting
+how the work was actually divided.
+
+### Architecture & Direction
 
 **Jeffrey Leal**
 Email: jeffrey.leal@gmail.com
 GitHub: https://github.com/jeffrey-leal
 
-## AI Assistance
+Program concept and architecture, feature design and requirements, field
+testing against clinical PACS systems, and release decisions. The
+application is built, tested, and published by Jeffrey Leal, who remains
+responsible for the software.
 
-This application was designed and developed with the assistance of
-**Claude Sonnet 4.6** by [Anthropic](https://www.anthropic.com).
+### Implementation
 
-Architecture planning, code generation, DICOM standard research, and
-documentation were produced in collaboration with Claude Code.
+**Claude** by [Anthropic](https://www.anthropic.com)
+
+All application code, tests, and documentation were written by Claude
+through [Claude Code](https://claude.ai/code), working to Jeffrey Leal's
+architecture and direction — code generation, DICOM standard research,
+debugging against field evidence, and the user manual and credits text.
 
 ## UI Template
 

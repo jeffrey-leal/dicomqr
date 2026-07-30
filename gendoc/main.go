@@ -499,7 +499,7 @@ const stylesXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 
 func buildContent(d Formatter) {
 
-	d.Cover("dicomqr", "User Manual  v1.9.0",
+	d.Cover("dicomqr", "User Manual  v1.10.0",
 		time.Now().Format("January 2, 2006"),
 		"A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.")
 
@@ -514,7 +514,7 @@ func buildContent(d Formatter) {
 	d.Bullet("Automatically organise downloaded files by patient, study, and series")
 	d.Bullet("Query a Modality Worklist server independently of the active PACS connection")
 	d.Bullet("Browse local DICOM files in the download folder — backed by a persistent index so the tree survives restarts — and push them to any PACS via C-STORE or delete them")
-	d.Bullet("Preview DICOM images in the built-in viewer with interactive window/level, zoom and pan, modality-specific W/L presets, colour maps for PET/SPECT, DICOM annotation overlays, DICOM overlay plane compositing, and study overview grids; decodes JPEG Baseline, JPEG 2000, and uncompressed pixel data")
+	d.Bullet("Preview DICOM images in the built-in viewer with interactive window/level, zoom and pan, modality-specific W/L presets, colour maps for PET/SPECT, DICOM annotation overlays, DICOM overlay plane compositing, and study overview grids; decodes JPEG Baseline, JPEG Lossless, JPEG 2000, and uncompressed pixel data")
 	d.Bullet("View Structured Reports (SR), Key Object Selections (KO), and other non-image DICOM objects in a dedicated scrollable document viewer that renders the SR Content Sequence as formatted text")
 	d.Bullet("Import DICOM files from external folders into the organised download folder")
 	d.Bullet("Support for multiple saved server profiles with independent connection and retrieve settings")
@@ -538,7 +538,7 @@ func buildContent(d Formatter) {
 		{"Local SCP port", "11112", "The TCP port on which dicomqr listens for incoming file transfers."},
 		{"Local IP", "Detected automatically", "The IP address of this workstation as seen by the PACS."},
 	})
-	d.P("The AE Title and port can be changed in File > Preferences… > Retrieve.")
+	d.P("The AE Title and port can be changed in File > Preferences… > SCP & Network.")
 	d.P("For C-MOVE file retrieval to work, the PACS must be able to initiate an outbound TCP connection from its own network address to the Local IP and Local SCP port shown in Client info. Ensure that any firewall on this workstation permits inbound connections on that port.")
 
 	d.H2("2.3  Starting the Application")
@@ -563,7 +563,7 @@ func buildContent(d Formatter) {
 	d.H1("4  Connecting to a PACS Server")
 
 	d.H2("4.1  Server Profiles")
-	d.P("A server profile stores the connection details for one PACS destination. Profiles are managed in File > Preferences… > Connections. Each profile records:")
+	d.P("A server profile stores the connection details for one PACS destination. Profiles are managed in File > Preferences… > SCP & Network. Each profile records:")
 	d.Table([]Row{
 		{"Field", "Description"},
 		{"Profile name", "A label used to identify the server in the dropdown."},
@@ -647,7 +647,7 @@ func buildContent(d Formatter) {
 	d.P("The filter acts on the already-loaded results and does not send a new query to the PACS.")
 
 	d.H2("6.3  Selecting Items for Retrieval")
-	d.P("Click any row in the results tree to select it. Selected rows are highlighted using the colour and font style configured in Preferences > UI (by default, bold in the theme's primary accent colour — see Section 11.1). Click the same row again to deselect it. Multiple rows at any level (patient, study, or series) may be selected simultaneously.")
+	d.P("Click any row in the results tree to select it. Selected rows are highlighted using the colour and font style configured in Preferences > User Interface (by default, bold in the theme's primary accent colour — see Section 11.1). Click the same row again to deselect it. Multiple rows at any level (patient, study, or series) may be selected simultaneously.")
 	d.P("The Select All button (in the retrieve panel) selects every currently visible row and its loaded descendants; Clear Selection clears the entire selection. Pressing Esc also clears the current selection.")
 	d.P("Series nodes are only visible after a study has been expanded. Expand a study first, then select individual series for retrieval.")
 	d.P("Selection behaviour during retrieval:")
@@ -747,7 +747,7 @@ func buildContent(d Formatter) {
 		{"R", "Reset the window to the default (clears any preset or manual adjustment)."},
 	})
 	d.P("The Reset button resets both the view (zoom/pan) and the window to the default. Window/level changes made by dragging or by selecting a preset persist as you scroll through the series.")
-	d.P("Compressed pixel data — the built-in viewer decodes JPEG Baseline, JPEG 2000 (lossless and lossy), and uncompressed (native) pixel data. Files stored in JPEG-LS, JPEG Lossless, or RLE Lossless formats cannot be decoded and display a message suggesting Open in Viewer; to view those, either use an external viewer or require an uncompressed transfer syntax in the server profile before retrieving (see Section 4.1).")
+	d.P("Compressed pixel data — the built-in viewer decodes JPEG Baseline, JPEG Lossless (Process 14 / SV1, common on ultrasound still captures), JPEG 2000 (lossless and lossy), and uncompressed (native) pixel data. Files stored in JPEG-LS or RLE Lossless formats cannot be decoded and display a message suggesting Open in Viewer; to view those, either use an external viewer or require an uncompressed transfer syntax in the server profile before retrieving (see Section 4.1). Note that JPEG Lossless support is view-only: a retrieve that requires an uncompressed transfer syntax still skips JPEG Lossless objects the server cannot convert (see Section 4.1).")
 
 	d.H3("8.3.2  Window/Level Presets")
 	d.P("The Window dropdown in the viewer bottom bar offers preset windows tailored to the image's modality. Selecting a preset applies it to the current slice and to subsequent slices until you adjust the window manually. Default restores the image's own window (from the DICOM Window tags, or an automatic 1st–99th percentile window when absent); Full range maps the entire pixel value range.")
@@ -823,6 +823,11 @@ func buildContent(d Formatter) {
 		{"Delete Selected…", "Deletes all selected files after confirmation."},
 	})
 
+	d.H2("8.8  Tag Review and Export (View Tags)")
+	d.P("Right-click any node and select View Tags to open the tag review window over exactly that node's files. The window presents the Patient → Study → Series → Instance hierarchy with every DICOM element of each instance, sequences nested item by item. Hovering a row shows the tag's DICOM dictionary entry (tag, name, keyword, VR, VM); private tags, malformed VRs, and Tag Profile colours are styled as configured in Preferences (Section 14.2). The search bar filters the tree, Expand All / Collapse All control the branches, right-click offers Copy row and Copy value, and Ctrl+C copies the selected row.")
+	d.P("Right-click an instance row and choose Export Tags… to write that image's complete element list to a CSV or JSON file — this is the application's only export function, deliberately scoped to a single image instance. The export always contains the instance's full tag set: an active search changes what the tree displays, never what is exported. Tags are written as [GGGG,EEEE], each field 4 hexadecimal digits left-filled with 0. CSV produces one row per element with columns Tag, VR, Name, Value; elements nested inside sequences show their path in the Tag column, e.g. [0040,0275] > Item 1 > [0040,0007]. JSON is an array of elements with sequence items nested inside their element. The native save dialog opens directly — the format is chosen with its file-type selector (Save as type). The Default export format preference (Section 14.3) decides which type is listed first and is used when the typed filename has no extension.")
+	d.P("Exported tags use square brackets rather than DICOM's conventional parentheses deliberately: Excel silently parses a parenthesized tag like (0020,0001) as the negative number -20,001 (parentheses read as a negative sign, the comma as a thousands separator), while [0020,0001] is imported as plain text in every locale. The file therefore opens correctly in spreadsheets and stays free of formula artifacts in text editors; the on-screen tag tree keeps the standard (GGGG,EEEE) notation.")
+
 	// 9. Import Tab
 	d.H1("9  Import Tab")
 	d.P("The Import tab copies DICOM files from any folder into the organised download folder, applying the same Patient / Study / Series subfolder structure used by retrieval.")
@@ -888,7 +893,6 @@ func buildContent(d Formatter) {
 		{"Item", "Description"},
 		{"Search", "Runs the current search."},
 		{"Clear results", "Resets all search fields and removes all results from the tree."},
-		{"Export…", "Saves the current results tree to CSV or JSON."},
 		{"Retrieve Selected", "Starts retrieval of all currently selected tree nodes."},
 		{"Cancel retrieve", "Cancels an in-progress retrieval."},
 	})
@@ -914,19 +918,19 @@ func buildContent(d Formatter) {
 
 	// 14. Preferences
 	d.H1("14  Preferences")
-	d.P("Open the Preferences dialog from File > Preferences…. Changes take effect when Apply is clicked and are written immediately to disk.")
+	d.P("Open the Preferences dialog from File > Preferences…. The dialog is organized into three tabs — SCP & Network, User Interface, and Modification & Export. Changes take effect when Apply is clicked and are written immediately to disk.")
 
-	d.H2("14.1  UI Section")
+	d.H2("14.1  SCP & Network Tab")
+	d.P("Everything DICOM-network related: the identity this workstation presents, where received files go, and the saved server profiles.")
 	d.Table([]Row{
 		{"Setting", "Description"},
-		{"Theme", "Selects the application colour theme: Light or Dark."},
-		{"Tree font", "Selects the font used for results tree rows. Select (default) to use the application's built-in font."},
-		{"Selection colour", "The colour applied to selected rows. Click Choose colour… to open a colour picker. If unset, selected rows follow the theme's primary accent colour."},
-		{"Selection style", "The font style applied to selected rows: Bold and/or Italic."},
+		{"Local AE Title", "The AE Title this workstation presents during DICOM associations. Default: DICOMQR."},
+		{"Local SCP port", "The TCP port on which the embedded C-STORE listener accepts incoming connections. Default: 11112."},
+		{"Download folder", "The root folder where retrieved and imported DICOM files are written."},
+		{"Retrieve stall timeout (s)", "Abort a retrieve when no progress response and no received file arrives for this many seconds. Blank uses the default (120 s); a negative value disables stall detection (e.g. for slow tape archives). See Appendix B."},
 	})
-
-	d.H2("14.2  Connections Section")
-	d.P("Lists all saved server profiles. Click Edit to modify, Delete to remove, or Add server… to create a new profile. The Up/Down buttons reorder the list; the first profile is the default selection when the application starts.")
+	d.P("Changes to AE Title or SCP port take effect the next time a connection is established.")
+	d.P("Server Profiles — lists all saved server profiles. Click Edit to modify, Delete to remove, or Add server… to create a new profile. The Up/Down buttons reorder the list; the first profile is the default selection when the application starts.")
 	d.P("Profile editor fields:")
 	d.Table([]Row{
 		{"Field", "Description"},
@@ -940,27 +944,63 @@ func buildContent(d Formatter) {
 		{"Transfer syntax", "'As stored' or one of the two guaranteed uncompressed syntaxes (converted locally on receipt when the server does not send it) — see Section 4.1 for full details and caveats."},
 	})
 
-	d.H2("14.3  Retrieve Section")
+	d.H2("14.2  User Interface Tab")
+	d.P("Appearance:")
 	d.Table([]Row{
 		{"Setting", "Description"},
-		{"Local AE Title", "The AE Title this workstation presents during DICOM associations. Default: DICOMQR."},
-		{"Local SCP port", "The TCP port on which the embedded C-STORE listener accepts incoming connections. Default: 11112."},
-		{"Download folder", "The root folder where retrieved and imported DICOM files are written."},
+		{"Theme", "Selects the application colour theme: Light or Dark."},
+		{"Tree font", "Selects the font used for results tree rows. Select (default) to use the application's built-in font."},
+		{"Selection colour", "The colour applied to selected rows. Click Choose colour… to open a colour picker. If unset, selected rows follow the theme's primary accent colour."},
+		{"Selection style", "The font style applied to selected rows: Bold and/or Italic."},
 	})
-	d.P("Changes to AE Title or SCP port take effect the next time a connection is established.")
-
-	d.H2("14.4  Image Viewer Section")
+	d.P("Image Viewer:")
 	d.Table([]Row{
 		{"Setting", "Description"},
 		{"External viewer", "Full path to an external DICOM viewer executable. Click Browse… to locate it, or Auto-detect to search for MicroDicom or RadiAnt DICOM Viewer in the standard installation locations. When left empty, the Open in Viewer buttons and menu items are disabled."},
 	})
+	d.P("Tag Highlights — styling rules applied in the tag review window (Local Browse right-click > View Tags):")
+	d.Table([]Row{
+		{"Setting", "Description"},
+		{"Private tags", "When Italicize is checked, private (odd-group) tags are rendered in italic."},
+		{"Malformed tag", "The colour applied to tags whose value representation violates the DICOM standard. Default: red."},
+	})
+	d.P("Tag Profiles — named tag sets coloured in the View Tags window. Each profile has a name, a colour, an enabled checkbox, and a tag list (one GGGG,EEEE per line in the editor). The first enabled profile containing a tag determines its colour; the malformed-tag highlight always takes precedence. The default PHI profile colours protected-health-information tags orange. The JSON wire format matches the dicomhdr application, so profile blocks can be copied between the two tools' settings files.")
+
+	d.H2("14.3  Modification & Export Tab")
+	d.P("Modification Profiles — the de-identification recipes applied from the Local Browse right-click Modification submenu. Profiles are stored in `%USERPROFILE%\\.dicomqr\\profiles.json` in the same format as the dicomtool CLI, so profile files can be copied between the two tools. The list shows each profile with its set/remove counts and base profile; Edit and Add profile… open the profile editor. Changes are committed to profiles.json only when Apply is clicked, and only when something actually changed — a hand-edited file is never rewritten gratuitously. If profiles.json cannot be parsed, the list is replaced by an explanatory message and Apply leaves the file untouched.")
+	d.P("Deleting a profile that other profiles use as their base prompts for confirmation; renaming a profile automatically updates the base reference in profiles that inherit from it.")
+	d.P("Profile editor fields:")
+	d.Table([]Row{
+		{"Field", "Description"},
+		{"Profile name", "The name shown in the Modification submenu and used as the base reference by inheriting profiles."},
+		{"Base profile", "Another profile whose settings this one inherits and overrides: override wins for scalar values, removals are a union, and this profile's Keep entries subtract from the merged removal list."},
+		{"Set values", "One TAG=VALUE per line. TAG is a GGGG,EEEE tag or a tags.json alias (e.g. patient name)."},
+		{"Remove tags", "Tags deleted from every file — one tag or alias per line."},
+		{"Keep tags", "Tags retained even when the base profile removes them."},
+		{"Birth date mask", "8-character positional pattern applied to Patient Birth Date: digit positions replace, any other character preserves the original digit (e.g. YYYY0101 keeps the year and sets January 1st). Empty = no masking."},
+		{"UID suffix", "Digits 1-9 appended to site-generated UIDs. Empty = none. Cannot be combined with Remap UIDs."},
+		{"Remap UIDs", "Replace every site-generated UID with a fresh consistent value — the same source UID always maps to the same replacement within a run, keeping cross-references intact. Standard and structural UIDs are never touched."},
+		{"Remove private tags", "Delete all private (odd-group) tags."},
+		{"Keep private tags", "Retain private tags even when a base profile removes them."},
+		{"Mask top pixel rows", "Blank out this many rows at the top of the pixel data (burned-in annotations)."},
+		{"Fix VR", "Handling of value-representation violations: (off), correct, skip, or passthrough."},
+	})
+	d.P("Profiles may additionally define per-modality overrides, ignoretype / ignoremodality filters, and the dicomdir and verbose flags. These have no dialog controls — the editor lists them in an italic note and preserves them unchanged, so hand-authored (or dicomtool-authored) settings survive a round-trip through the editor.")
+	d.P("Defaults:")
+	d.Table([]Row{
+		{"Setting", "Description"},
+		{"Default output folder", "Where modification exports are written. When set, the Modification dialog uses it directly — no folder picker appears; the dialog's Change… button overrides it for a single run. When empty, the dialog asks on the first run and saves that choice here. Must be outside the download folder — modified files are never mixed into the local index."},
+		{"Default export format", "The file type listed first in the View Tags Export Tags… save dialog, and the format used when the typed filename has no extension (Section 8.8)."},
+	})
+	d.P("Running a modification (Local Browse right-click > Modification > profile) writes the export to <output folder>\\<export folder name>. The export folder name is entered in the confirmation dialog — a profile-name-plus-timestamp suggestion is pre-filled, and typing a value into the dialog's Patient Name set field auto-fills the Patient ID set field and the export folder name with the same value, since all three usually carry the new anonymized identity; a field stops following the moment it is edited directly, so the auto-filled values can simply be overtyped. The original patient and study folder names are never reused, because they often contain PHI (patient name, MRN, study description, dates). Inside the export folder a study-level run keeps only the series subfolders, and a patient-level run replaces each study folder with a generic study-01, study-02, … in sorted order.")
+	d.P("Checking Zip export in the dialog writes the run into a single compressed <output folder>\\<export folder name>.zip instead of a folder, with the same PHI-safe layout inside the archive. The archive is assembled as a hidden temporary file and renamed into place when the run finishes, so a cancelled run keeps the files completed before the cancel, while a run that writes nothing — or fails while finalizing the archive — leaves no zip behind. An existing zip of the same name is replaced after confirmation.")
 
 	// 15. Status Bar
 	d.H1("15  Status Bar")
 	d.P("The status bar at the bottom of the window provides real-time feedback. A coloured LED indicator (gray / amber / green) precedes the status text.")
 	d.Table([]Row{
 		{"Situation", "Status bar text"},
-		{"Application started, not connected", "`v1.9.0`"},
+		{"Application started, not connected", "`v1.10.0`"},
 		{"Connecting to server", "`Connecting…`"},
 		{"Connected", "`Connected: <AE>@<host>:<port>`"},
 		{"Connection cancelled", "`Connection cancelled`"},
@@ -1001,13 +1041,18 @@ func buildContent(d Formatter) {
 		{"`localAETitle`", "`\"DICOMQR\"`", "The AE Title presented during DICOM associations."},
 		{"`localSCPPort`", "`11112`", "TCP port for the embedded C-STORE listener."},
 		{"`downloadDir`", "`\"\"`", "Absolute path of the download folder. Defaults to ~/DICOM Downloads."},
+		{"`modifyOutputDir`", "`\"\"`", "Default output folder for modification exports, used directly by the Modification dialog. Must be outside the download folder. Empty = the dialog asks once and saves the choice here."},
+		{"`exportFormat`", "`\"csv\"`", "File type listed first in the View Tags Export Tags… save dialog (\"csv\" or \"json\"); also the format applied when the typed filename has no extension."},
 		{"`viewerPath`", "`\"\"`", "Full path to an external DICOM viewer executable. Empty disables the Open in Viewer controls."},
 		{"`selectionColor`", "`\"\"`", "Colour applied to selected tree rows (RRGGBBAA hex). Empty follows the theme primary colour."},
 		{"`selectionBold`", "`true`", "Whether selected rows are drawn in bold."},
 		{"`selectionItalic`", "`false`", "Whether selected rows are drawn in italic."},
 		{"`windowWidth`", "`0`", "Saved window width in pixels. 0 uses the default; updated automatically on close."},
 		{"`windowHeight`", "`0`", "Saved window height in pixels."},
-		{"`retrieveStallTimeoutSec`", "`0`", "Abort a retrieve when no progress response and no received file arrives for this many seconds. 0 uses the default (120 s); -1 disables stall detection. Recovers from PACS servers whose C-MOVE agent hangs on non-image objects (SR/PR)."},
+		{"`retrieveStallTimeoutSec`", "`0`", "Abort a retrieve when no progress response and no received file arrives for this many seconds. 0 uses the default (120 s); -1 disables stall detection. Recovers from PACS servers whose C-MOVE agent hangs on non-image objects (SR/PR). Editable in Preferences > SCP & Network."},
+		{"`italicPrivate`", "`true`", "Render private tags in italic in the View Tags window."},
+		{"`malformedColor`", "`\"E54545FF\"`", "RRGGBBAA colour for tags whose value representation violates the standard."},
+		{"`tagProfiles`", "PHI profile", "Array of tag-highlight profiles (name, colour, enabled, tag list) — see Section 14.2. Wire format matches dicomhdr."},
 		{"`profiles`", "`[]`", "Array of saved server profile objects (see below)."},
 	})
 	d.P("Each entry in the `profiles` array:")
@@ -1034,21 +1079,23 @@ func buildContent(d Formatter) {
 	d.P("Windows Firewall — An inbound rule permitting TCP connections on the SCP port (default 11112) is required.")
 	d.P("Information model — If queries return no results, try changing the Info model in the server profile. Some PACS require Study Root, others Patient Root. A small number of legacy systems require the Patient/Study Only model (patient-study-only).")
 	d.P("Worklist server — The Modality Worklist SOP class is typically served by a RIS or dedicated MWL broker, not the PACS itself. Create a separate server profile pointing to that system and select it in the Worklist tab.")
-	d.P("Compressed pixel data — the built-in viewer decodes JPEG Baseline and JPEG 2000. Downstream consumers that require `1.2.840.10008.1.2` / `1.2.840.10008.1.2.1` files should require an uncompressed transfer syntax in the server profile: every file on disk is then guaranteed to be in the selected syntax — sent that way by the PACS, or converted on receipt from JPEG Baseline/Extended, JPEG 2000, or the other uncompressed VR — and re-retrieves replace older copies stored in a different syntax. Objects stored in a format the application cannot decode either (e.g. JPEG-LS, RLE) are skipped and reported in the Activity Log while the rest of the study is retrieved; if nothing at all can be delivered in a negotiable syntax, an error dialog names the required syntax — switch back to 'As stored' and use the external viewer integration for such data.")
+	d.P("Compressed pixel data — the built-in viewer decodes JPEG Baseline, JPEG Lossless, and JPEG 2000. Downstream consumers that require `1.2.840.10008.1.2` / `1.2.840.10008.1.2.1` files should require an uncompressed transfer syntax in the server profile: every file on disk is then guaranteed to be in the selected syntax — sent that way by the PACS, or converted on receipt from JPEG Baseline/Extended, JPEG 2000, or the other uncompressed VR — and re-retrieves replace older copies stored in a different syntax. Objects stored in a format the receive path cannot convert (e.g. JPEG-LS, JPEG Lossless, RLE) are skipped and reported in the Activity Log while the rest of the study is retrieved; if nothing at all can be delivered in a negotiable syntax, an error dialog names the required syntax — switch back to 'As stored' and use the external viewer integration for such data.")
 	d.P("IPv4 connectivity — dicomqr listens on an IPv4 socket only. Ensure the address shown in Help > Client info… is the correct IPv4 address on the same network as the PACS.")
-	d.P("Retrieve stalls on non-image series — some PACS servers' C-MOVE agents fail while sending objects without pixel data (Structured Reports, Presentation States, encapsulated PDFs): the association stays open but no further data ever arrives. dicomqr detects this — if no progress response and no received file arrives for 120 seconds (configurable via `retrieveStallTimeoutSec` in settings.json), the retrieve is aborted with an explanatory message rather than hanging forever. If a server does this repeatedly, set the profile's Retrieve method to C-GET or Auto — the same servers usually deliver non-image objects correctly over C-GET. For genuinely slow servers (e.g. tape archives), raise the timeout, or set it to -1 to disable stall detection.")
+	d.P("Retrieve stalls on non-image series — some PACS servers' C-MOVE agents fail while sending objects without pixel data (Structured Reports, Presentation States, encapsulated PDFs): the association stays open but no further data ever arrives. dicomqr detects this — if no progress response and no received file arrives for 120 seconds (configurable via the Retrieve stall timeout in Preferences > SCP & Network), the retrieve is aborted with an explanatory message rather than hanging forever. If a server does this repeatedly, set the profile's Retrieve method to C-GET or Auto — the same servers usually deliver non-image objects correctly over C-GET. For genuinely slow servers (e.g. tape archives), raise the timeout, or set it negative to disable stall detection.")
 
 	// Appendix C
 	d.PageBreak()
 	d.H1("Appendix C  Credits and Acknowledgements")
 
-	d.H2("Developer")
-	d.P("Jeffrey Leal")
+	d.P("dicomqr is a human–AI collaboration. Credit is given by role, reflecting how the work was actually divided.")
+
+	d.H2("Architecture and Direction — Jeffrey Leal")
 	d.P("Email: jeffrey.leal@gmail.com")
 	d.P("GitHub: https://github.com/jeffrey-leal")
+	d.P("Program concept and architecture, feature design and requirements, field testing against clinical PACS systems, and release decisions. The application is built, tested, and published by Jeffrey Leal, who remains responsible for the software.")
 
-	d.H2("AI Assistance")
-	d.P("This application was designed and developed with the assistance of Claude Sonnet 4.6 by Anthropic, accessed through Claude Code (https://claude.ai/code). Architecture planning, code generation, DICOM standard research, and documentation were produced in collaboration with Claude Code.")
+	d.H2("Implementation — Claude by Anthropic")
+	d.P("All application code, tests, and documentation were written by Claude (https://www.anthropic.com) through Claude Code (https://claude.ai/code), working to Jeffrey Leal's architecture and direction — code generation, DICOM standard research, debugging against field evidence, and this manual.")
 
 	d.H2("DICOM Standard Reference")
 	d.P("Protocol implementation follows the DICOM Standard published by NEMA:")

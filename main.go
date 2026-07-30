@@ -25,10 +25,9 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/grailbio/go-dicom/dicomlog"
-	sqweekdialog "github.com/sqweek/dialog"
 )
 
-const version = "1.9.0"
+const version = "1.10.0"
 
 // LED colours for connection and SCP state indicators.
 var (
@@ -70,6 +69,48 @@ func (rowLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
 	return fyne.NewSize(s.Width, s.Height+pad*2)
 }
 
+// treeCollapseFix works around a virtualization bug in Fyne's widget.Tree
+// (present in v2.7.3): the tree culls rows against its own private copy of the
+// scroll offset, synced only by the scroller's OnScrolled callback — but when
+// closing a branch shrinks the content, the scroller clamps or resets its
+// offset through paths that never fire OnScrolled. The tree then culls rows
+// that are actually inside the viewport, leaving the top of the tree blank
+// until an unrelated event happens to resync it. A Refresh queued on the next
+// main-loop turn (after the close cascade has settled and recomputed the
+// content min size) re-clamps the offset through the notifying path and
+// redraws the visible rows. Shared by every tree in the application.
+func treeCollapseFix(tree *widget.Tree) {
+	tree.OnBranchClosed = func(widget.TreeNodeID) {
+		fyne.Do(tree.Refresh)
+	}
+}
+
+// collapseAllTree collapses every branch, resetting the scroll offset first:
+// CloseAllBranches bypasses OnBranchClosed (so treeCollapseFix never runs) and
+// does not clamp the offset, so a viewport scrolled past the new (shorter)
+// content would be left blank.
+func collapseAllTree(tree *widget.Tree) {
+	tree.ScrollToTop()
+	tree.CloseAllBranches()
+}
+
+// armExitWatchdog guarantees the process terminates once shutdown has been
+// requested. Fyne 2.7's quit path has a race: the run loop drains its function
+// queue and only afterwards sets the "drained" flag, so a function posted with
+// wait semantics in that gap is stranded — nothing ever runs it or signals its
+// poster. The lifecycle event goroutine posts the OnStopped hook at exactly
+// that moment; when it loses the race it blocks forever, WaitForEvents never
+// completes, ShowAndRun never returns, and a windowless dicomqr.exe lingers in
+// Task Manager holding the SCP port. The watchdog is armed only after
+// settings, catalog, and SCP cleanup have finished, so the forced exit loses
+// nothing; on a normal shutdown the process is gone before the timer fires.
+func armExitWatchdog() {
+	time.AfterFunc(3*time.Second, func() {
+		log.Printf("exit watchdog: shutdown wedged 3s after close — forcing process exit")
+		os.Exit(0)
+	})
+}
+
 func main() {
 	dicomlog.SetLevel(2)
 	setupLogFile()
@@ -78,6 +119,7 @@ func main() {
 	w := a.NewWindow("dicomqr")
 
 	ensureDefaultSettings()
+	ensureDefaultModifyConfigs()
 	cfg := loadSettings()
 	// Record the session's starting configuration so a log file alone can
 	// answer "what was the app actually configured to do" after the fact.
@@ -440,6 +482,7 @@ func main() {
 			row.Refresh()
 		},
 	)
+	treeCollapseFix(tree)
 
 	tree.OnBranchOpened = func(id string) {
 		if !strings.HasPrefix(id, "S:") || model.isSeriesLoaded(id) {
@@ -1255,8 +1298,8 @@ func main() {
 							"encapsulated PDF) via C-MOVE — their sender never finishes the transfer. "+
 							"If this keeps happening on such series, set the profile's Retrieve method "+
 							"to C-GET or Auto in Preferences.\n\n"+
-							"If this server is simply slow (e.g. a tape archive), raise "+
-							"retrieveStallTimeoutSec in settings.json.",
+							"If this server is simply slow (e.g. a tape archive), raise the "+
+							"Retrieve stall timeout in File > Preferences… > SCP & Network.",
 							stallTimeout.Seconds(), n), w)
 				case cancelled:
 					statusLabel.SetText("Retrieve cancelled")
@@ -1413,7 +1456,7 @@ func main() {
 	filterBar := container.NewBorder(nil, nil, nil,
 		container.NewHBox(
 			widget.NewButton("Expand All", func() { tree.OpenAllBranches() }),
-			widget.NewButton("Collapse All", func() { tree.CloseAllBranches() }),
+			widget.NewButton("Collapse All", func() { collapseAllTree(tree) }),
 			widget.NewButton("Clear", func() {
 				filterEntry.SetText("")
 				model.setFilter("")
@@ -1481,54 +1524,12 @@ func main() {
 			})
 		}),
 		fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Quit", func() { saveSettings(cfg); stopClock(); shutdownSCP(); cat.Close(); a.Quit() }),
+		fyne.NewMenuItem("Quit", func() { saveSettings(cfg); stopClock(); shutdownSCP(); cat.Close(); armExitWatchdog(); a.Quit() }),
 	)
 
 	queryMenu := fyne.NewMenu("Query",
 		fyne.NewMenuItem("Search", doSearch),
 		fyne.NewMenuItem("Clear results", doClearQuery),
-		fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Export…", func() {
-			if len(model.roots) == 0 {
-				dialog.ShowInformation("No results", "Run a query first, then export.", w)
-				return
-			}
-			formatSelect := widget.NewSelect([]string{"CSV", "JSON"}, nil)
-			formatSelect.SetSelected("CSV")
-			d := dialog.NewCustomConfirm("Export results", "Export", "Cancel",
-				container.NewVBox(widget.NewLabel("Export format:"), formatSelect),
-				func(ok bool) {
-					if !ok {
-						return
-					}
-					go func() {
-						ext := strings.ToLower(formatSelect.Selected)
-						path, err := sqweekdialog.File().Filter("Export file", ext).Save()
-						if err != nil {
-							return
-						}
-						if !strings.HasSuffix(strings.ToLower(path), "."+ext) {
-							path += "." + ext
-						}
-						rows := model.exportRows()
-						var writeErr error
-						if formatSelect.Selected == "CSV" {
-							writeErr = exportToCSV(path, rows)
-						} else {
-							writeErr = exportToJSON(path, rows)
-						}
-						fyne.Do(func() {
-							if writeErr != nil {
-								dialog.ShowError(writeErr, w)
-							} else {
-								dialog.ShowInformation("Export complete",
-									fmt.Sprintf("Exported %d rows to:\n%s", len(rows), path), w)
-							}
-						})
-					}()
-				}, w)
-			d.Show()
-		}),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Retrieve Selected", func() { retrieveBtn.OnTapped() }),
 		fyne.NewMenuItem("Cancel retrieve", func() {
@@ -1555,12 +1556,14 @@ func main() {
 				"dicomqr  v%s  (built %s)\n"+
 					"DICOM Query/Retrieve client — query and retrieve studies from a PACS server.\n"+
 					"Implements DICOM PS3.4/PS3.7: C-ECHO, C-FIND, C-MOVE, C-STORE SCP.\n\n"+
-					"Developer\n"+
+					"Architecture & Direction\n"+
 					"  Jeffrey Leal  <jeffrey.leal@gmail.com>\n"+
-					"  https://github.com/jeffrey-leal\n\n"+
-					"AI Assistance\n"+
-					"  Claude Sonnet 4.6 by Anthropic  (https://anthropic.com)\n"+
-					"  Architecture, code generation, and DICOM standard research.\n\n"+
+					"  https://github.com/jeffrey-leal\n"+
+					"  Program architecture, feature design, field testing, release decisions.\n\n"+
+					"Implementation\n"+
+					"  Claude by Anthropic  (https://anthropic.com)\n"+
+					"  All application code and documentation, written via Claude Code\n"+
+					"  to Jeffrey Leal's architecture and direction.\n\n"+
 					"DICOM Standard Reference\n"+
 					"  DICOM PS3 (2024b) — https://dicom.nema.org/medical/dicom/current",
 				version, bd))
@@ -1642,12 +1645,15 @@ func main() {
 		stopClock()
 		shutdownSCP()
 		cat.Close()
+		armExitWatchdog()
 		w.Close()
 	})
 
 	// Safety net: stop the SCP if the app terminates by any route that bypasses
-	// the close intercept above (Phase 5-2F).
-	a.Lifecycle().SetOnStopped(func() { stopClock(); shutdownSCP(); cat.Close() })
+	// the close intercept above (Phase 5-2F). Note this hook is queued during
+	// the racy quit window described on armExitWatchdog and is not guaranteed
+	// to run — it must only repeat cleanup already done elsewhere.
+	a.Lifecycle().SetOnStopped(func() { stopClock(); shutdownSCP(); cat.Close(); armExitWatchdog() })
 
 	w.ShowAndRun()
 }

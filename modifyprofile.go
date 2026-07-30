@@ -1,0 +1,342 @@
+package main
+
+// Modification profiles — named de-identification recipes ported from the
+// dicomtool CLI. dicomqr keeps its own copies of the profile store
+// (~/.dicomqr/profiles.json) and the tag alias map (~/.dicomqr/tags.json),
+// seeded from embedded defaults on first run and never overwritten, so
+// hand-edits survive upgrades. The JSON format and merge semantics match
+// dicomtool exactly, letting profiles be copied between the two tools.
+
+import (
+	_ "embed"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/suyashkumar/dicom/pkg/tag"
+)
+
+//go:embed defaults/profiles.json
+var defaultModProfilesJSON []byte
+
+//go:embed defaults/tags.json
+var defaultModTagsJSON []byte
+
+// ModProfile holds a named collection of modification parameters. Fields map
+// directly to the equivalent dicomtool modify command-line parameters; the
+// JSON keys are identical to dicomtool's Profile so the stores interoperate.
+type ModProfile struct {
+	Base             string                `json:"base,omitempty"`
+	Sets             []string              `json:"set,omitempty"`
+	Removes          []string              `json:"remove,omitempty"`
+	Keep             []string              `json:"keep,omitempty"`
+	DOB              string                `json:"dob,omitempty"`
+	UIDSuffix        string                `json:"uid,omitempty"`
+	RemapUIDs        bool                  `json:"remapuids,omitempty"`
+	Priv             bool                  `json:"noprivate,omitempty"`
+	KeepPrivate      bool                  `json:"keepprivate,omitempty"`
+	Dicomdir         bool                  `json:"dicomdir,omitempty"`
+	Verbose          bool                  `json:"verbose,omitempty"`
+	MaskRows         int                   `json:"maskrows,omitempty"`
+	IgnoreTypes      []string              `json:"ignoretype,omitempty"`
+	IgnoreModalities []string              `json:"ignoremodality,omitempty"`
+	FixVR            string                `json:"fixvr,omitempty"`
+	PerModality      map[string]ModProfile `json:"per-modality,omitempty"`
+}
+
+// ModProfileConfig maps profile names to their definitions.
+type ModProfileConfig map[string]ModProfile
+
+// TagConfig maps user-defined shortcut phrases to DICOM tag strings ("GGGG,EEEE").
+type TagConfig map[string]string
+
+// Resolve returns the tag string for phrase if it exists in the config,
+// otherwise returns phrase unchanged.
+func (c TagConfig) Resolve(phrase string) string {
+	if c == nil {
+		return phrase
+	}
+	if t, ok := c[phrase]; ok {
+		return t
+	}
+	return phrase
+}
+
+// modifyProfilesPath returns ~/.dicomqr/profiles.json.
+func modifyProfilesPath() (string, error) {
+	dir, err := appSettingsDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "profiles.json"), nil
+}
+
+// modifyTagsPath returns ~/.dicomqr/tags.json.
+func modifyTagsPath() (string, error) {
+	dir, err := appSettingsDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "tags.json"), nil
+}
+
+// loadModProfileConfig reads the profile store at path. A missing file returns
+// an empty config without error.
+func loadModProfileConfig(path string) (ModProfileConfig, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return ModProfileConfig{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var cfg ModProfileConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// saveModProfileConfig writes cfg to the profile store at path as indented
+// JSON, atomically. The JSON keys match dicomtool's Profile exactly, so the
+// saved file remains copy-compatible between the two tools. Saving normalizes
+// the file's layout (alphabetized profile names, 2-space indent) and drops any
+// JSON keys ModProfile does not declare — the two tools have full field parity
+// today, so nothing is lost.
+func saveModProfileConfig(path string, cfg ModProfileConfig) error {
+	if cfg == nil {
+		cfg = ModProfileConfig{}
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteJSON(path, data)
+}
+
+// loadTagConfig reads the tag alias map at path. A missing file returns an
+// empty config without error.
+func loadTagConfig(path string) (TagConfig, error) {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return TagConfig{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var cfg TagConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// ensureDefaultModifyConfigs creates ~/.dicomqr/profiles.json and tags.json
+// with compiled-in defaults if they do not already exist. O_EXCL guarantees an
+// existing (possibly hand-edited) file is never overwritten.
+func ensureDefaultModifyConfigs() {
+	dir, err := appSettingsDir()
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	seed := func(name string, content []byte) {
+		f, err := os.OpenFile(filepath.Join(dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			return // already exists (or unwritable) — leave it alone
+		}
+		defer f.Close()
+		f.Write(content)
+	}
+	seed("profiles.json", defaultModProfilesJSON)
+	seed("tags.json", defaultModTagsJSON)
+}
+
+// resolveModProfile returns the effective ModProfile for name after fully
+// resolving its base chain. Circular references are detected and returned as
+// an error.
+func resolveModProfile(name string, cfg ModProfileConfig) (ModProfile, error) {
+	return resolveModProfileChain(name, cfg, make(map[string]bool))
+}
+
+func resolveModProfileChain(name string, cfg ModProfileConfig, visited map[string]bool) (ModProfile, error) {
+	if visited[name] {
+		return ModProfile{}, fmt.Errorf("circular base reference in profile %q", name)
+	}
+	visited[name] = true
+
+	p, ok := cfg[name]
+	if !ok {
+		return ModProfile{}, fmt.Errorf("profile %q not found", name)
+	}
+	if p.Base == "" {
+		return p, nil
+	}
+
+	base, err := resolveModProfileChain(p.Base, cfg, visited)
+	if err != nil {
+		return ModProfile{}, err
+	}
+	return mergeModProfiles(base, p), nil
+}
+
+// mergeModProfiles returns a new ModProfile that represents base with override
+// applied on top. Override wins for scalars and integers (when non-zero);
+// booleans are OR'd; Sets use per-tag precedence (override wins); Removes are
+// a union; override.Keep is subtracted from the merged removal list.
+func mergeModProfiles(base, override ModProfile) ModProfile {
+	result := base
+
+	if override.DOB != "" {
+		result.DOB = override.DOB
+	}
+	if override.UIDSuffix != "" {
+		result.UIDSuffix = override.UIDSuffix
+	}
+	if override.MaskRows > 0 {
+		result.MaskRows = override.MaskRows
+	}
+	if override.FixVR != "" {
+		result.FixVR = override.FixVR
+	}
+
+	result.Priv = base.Priv || override.Priv
+	result.Dicomdir = base.Dicomdir || override.Dicomdir
+	result.Verbose = base.Verbose || override.Verbose
+	result.RemapUIDs = base.RemapUIDs || override.RemapUIDs
+
+	// Sets: override wins per tag; base contributes tags not in override.
+	overrideTags := make(map[string]bool, len(override.Sets))
+	for _, s := range override.Sets {
+		if t, _, ok := strings.Cut(s, "="); ok {
+			overrideTags[strings.ToLower(strings.TrimSpace(t))] = true
+		}
+	}
+	result.Sets = make([]string, 0, len(base.Sets)+len(override.Sets))
+	for _, s := range base.Sets {
+		if t, _, ok := strings.Cut(s, "="); ok {
+			if !overrideTags[strings.ToLower(strings.TrimSpace(t))] {
+				result.Sets = append(result.Sets, s)
+			}
+		}
+	}
+	result.Sets = append(result.Sets, override.Sets...)
+
+	// Removes: union, deduplicated.
+	seen := make(map[string]bool, len(base.Removes)+len(override.Removes))
+	result.Removes = nil
+	for _, r := range append(base.Removes, override.Removes...) {
+		if !seen[r] {
+			seen[r] = true
+			result.Removes = append(result.Removes, r)
+		}
+	}
+
+	// Keep: union, deduplicated.
+	seenK := make(map[string]bool, len(base.Keep)+len(override.Keep))
+	result.Keep = nil
+	for _, k := range append(base.Keep, override.Keep...) {
+		if !seenK[k] {
+			seenK[k] = true
+			result.Keep = append(result.Keep, k)
+		}
+	}
+
+	// KeepPrivate: OR.
+	result.KeepPrivate = base.KeepPrivate || override.KeepPrivate
+
+	// Apply override.Keep to filter result.Removes: a child profile can restore
+	// tags that a parent profile removes.
+	if len(override.Keep) > 0 {
+		keepSet := make(map[string]bool, len(override.Keep))
+		for _, k := range override.Keep {
+			keepSet[strings.ToLower(strings.TrimSpace(k))] = true
+		}
+		filtered := make([]string, 0, len(result.Removes))
+		for _, r := range result.Removes {
+			if !keepSet[strings.ToLower(strings.TrimSpace(r))] {
+				filtered = append(filtered, r)
+			}
+		}
+		result.Removes = filtered
+	}
+
+	// PerModality: merge maps, normalizing keys to uppercase. Override's entries
+	// win per key; if both define the same modality, merge them recursively.
+	if len(base.PerModality) > 0 || len(override.PerModality) > 0 {
+		result.PerModality = make(map[string]ModProfile, len(base.PerModality)+len(override.PerModality))
+		for k, v := range base.PerModality {
+			result.PerModality[strings.ToUpper(k)] = v
+		}
+		for k, v := range override.PerModality {
+			uk := strings.ToUpper(k)
+			if existing, ok := result.PerModality[uk]; ok {
+				result.PerModality[uk] = mergeModProfiles(existing, v)
+			} else {
+				result.PerModality[uk] = v
+			}
+		}
+	}
+
+	// IgnoreTypes: union, deduplicated (case-insensitive).
+	seenT := make(map[string]bool, len(base.IgnoreTypes)+len(override.IgnoreTypes))
+	result.IgnoreTypes = nil
+	for _, v := range append(base.IgnoreTypes, override.IgnoreTypes...) {
+		key := strings.ToLower(v)
+		if !seenT[key] {
+			seenT[key] = true
+			result.IgnoreTypes = append(result.IgnoreTypes, v)
+		}
+	}
+
+	// IgnoreModalities: union, deduplicated (case-insensitive).
+	seenM := make(map[string]bool, len(base.IgnoreModalities)+len(override.IgnoreModalities))
+	result.IgnoreModalities = nil
+	for _, v := range append(base.IgnoreModalities, override.IgnoreModalities...) {
+		key := strings.ToLower(v)
+		if !seenM[key] {
+			seenM[key] = true
+			result.IgnoreModalities = append(result.IgnoreModalities, v)
+		}
+	}
+
+	result.Base = "" // resolved profile carries no further base reference
+	return result
+}
+
+// parseTagString converts a "GGGG,EEEE" hex string into a tag.Tag. Leading
+// zeros are optional ("8,80" is 0008,0080).
+func parseTagString(s string) (tag.Tag, error) {
+	parts := strings.SplitN(s, ",", 2)
+	if len(parts) != 2 {
+		return tag.Tag{}, fmt.Errorf("expected format GGGG,EEEE")
+	}
+	group, err := strconv.ParseUint(strings.TrimSpace(parts[0]), 16, 16)
+	if err != nil {
+		return tag.Tag{}, fmt.Errorf("invalid group %q: %w", parts[0], err)
+	}
+	elem, err := strconv.ParseUint(strings.TrimSpace(parts[1]), 16, 16)
+	if err != nil {
+		return tag.Tag{}, fmt.Errorf("invalid element %q: %w", parts[1], err)
+	}
+	return tag.Tag{Group: uint16(group), Element: uint16(elem)}, nil
+}
+
+// tagDisplayName returns a human-readable name for t: the standard dictionary
+// name when known, else the alias-map name pointing at t, else "".
+func tagDisplayName(t tag.Tag, aliases TagConfig) string {
+	if info, err := tag.Find(t); err == nil && info.Name != "" {
+		return info.Name
+	}
+	for name, tagStr := range aliases {
+		if at, err := parseTagString(tagStr); err == nil && at == t {
+			return name
+		}
+	}
+	return ""
+}

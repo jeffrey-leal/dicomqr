@@ -22,8 +22,8 @@ func TestSanitize(t *testing.T) {
 		{"less<than", "less_than"},
 		{"grea>ter", "grea_ter"},
 		{"pi|pe", "pi_pe"},
-		{"CON", "_CON"},   // Windows reserved name
-		{"con", "_con"},   // case-insensitive
+		{"CON", "_CON"}, // Windows reserved name
+		{"con", "_con"}, // case-insensitive
 		{"NUL", "_NUL"},
 		{"COM1", "_COM1"},
 		{"LPT9", "_LPT9"},
@@ -42,9 +42,9 @@ func TestSanitize(t *testing.T) {
 
 func TestTruncateRunes(t *testing.T) {
 	tests := []struct {
-		in      string
-		max     int
-		want    string
+		in   string
+		max  int
+		want string
 	}{
 		{"hello", 10, "hello"},
 		{"hello", 5, "hello"},

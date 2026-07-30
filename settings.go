@@ -56,12 +56,34 @@ type Settings struct {
 	// Empty means no external viewer is configured.
 	ViewerPath string `json:"viewerPath"`
 
+	// Tag viewer (View Tags window) appearance, ported from dicomhdr.
+	// ItalicPrivate renders private tags in italic; MalformedColor is the
+	// RRGGBBAA colour for public tags whose VR violates the standard;
+	// TagProfiles colour user-defined tag sets (first enabled profile
+	// containing a tag wins; the malformed highlight takes precedence).
+	ItalicPrivate  bool         `json:"italicPrivate"`
+	MalformedColor string       `json:"malformedColor"`
+	TagProfiles    []TagProfile `json:"tagProfiles"`
+
 	// RetrieveStallTimeoutSec aborts a retrieve when no progress response and
 	// no received file arrives for this many seconds — recovery from PACS
 	// servers whose C-MOVE agent stalls on non-image objects (SR/PR). 0 uses
 	// the default (120 s); negative disables stall detection (e.g. for slow
 	// tape archives).
 	RetrieveStallTimeoutSec int `json:"retrieveStallTimeoutSec,omitempty"`
+
+	// ModifyOutputDir is the default output folder for modification exports,
+	// used directly by the modification dialog so no folder picker appears on
+	// routine runs (Change… overrides it for a single run). Empty means the
+	// dialog asks on the first run and persists that choice here. Must lie
+	// outside the download folder — enforced on Apply and again at
+	// modification time.
+	ModifyOutputDir string `json:"modifyOutputDir"`
+
+	// ExportFormat ("csv" or "json") is the file type listed first in the
+	// tag viewer's Export Tags… save dialog, and the format applied when the
+	// typed filename has no extension.
+	ExportFormat string `json:"exportFormat"`
 }
 
 func appSettingsDir() (string, error) {
@@ -146,22 +168,35 @@ func saveSettingsE(s Settings) error {
 	if err != nil {
 		return fmt.Errorf("locate settings file: %w", err)
 	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create settings directory: %w", err)
-	}
 	if s.Profiles == nil {
 		s.Profiles = []ServerProfile{}
+	}
+	if s.TagProfiles == nil {
+		s.TagProfiles = []TagProfile{}
 	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
+	if err := atomicWriteJSON(path, data); err != nil {
+		return err
+	}
+	log.Printf("settings: saved %s", path)
+	return nil
+}
 
-	// Write to temp file first; os.Rename is atomic on NTFS.
-	tmp, err := os.CreateTemp(dir, ".settings_*.json.tmp")
+// atomicWriteJSON writes data to path via a temp file + rename (atomic on
+// NTFS) so a crash mid-write never corrupts the destination. The final rename
+// is retried briefly: antivirus and indexing tools open freshly written files
+// and can hold the destination just long enough to fail a single attempt.
+func atomicWriteJSON(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create directory for %s: %w", filepath.Base(path), err)
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+"_*.tmp")
 	if err != nil {
-		return fmt.Errorf("create temp settings file: %w", err)
+		return fmt.Errorf("create temp file: %w", err)
 	}
 	tmpPath := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
@@ -176,7 +211,6 @@ func saveSettingsE(s Settings) error {
 	var renameErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if renameErr = os.Rename(tmpPath, path); renameErr == nil {
-			log.Printf("settings: saved %s", path)
 			return nil
 		}
 		time.Sleep(150 * time.Millisecond)

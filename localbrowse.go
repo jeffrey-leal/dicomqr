@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -310,15 +311,11 @@ func showDeleteDialog(w fyne.Window, cfg *Settings, paths []string, description 
 				pruneEmptyDirs(dir, root)
 			}
 			fyne.Do(func() {
-				msg := fmt.Sprintf("Deleted %d file(s).", nOK)
+				dlg.Hide()
 				if nFail > 0 {
-					msg += fmt.Sprintf(" %d could not be deleted.", nFail)
+					dialog.ShowError(fmt.Errorf(
+						"deleted %d file(s); %d could not be deleted", nOK, nFail), w)
 				}
-				statusLbl.SetText(msg)
-				deleteBtn.Hide()
-				cancelBtn.SetText("Close")
-				cancelBtn.OnTapped = func() { dlg.Hide() }
-				cancelBtn.Enable()
 				if onDeleted != nil {
 					onDeleted()
 				}
@@ -518,6 +515,16 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 		})
 		previewItem.Disabled = studyUID == "" // patient-level: too broad to preview
 
+		capturedLabel := model.labelFor(id)
+		// Tag-level review: the dicomhdr-style tag inspector over this node's
+		// files, in its own window. Enabled at every level — files are parsed
+		// concurrently and the tree populates incrementally, so even a whole
+		// patient loads progressively rather than blocking.
+		tagsItem := fyne.NewMenuItem("View Tags", func() {
+			go showTagViewerWindow(a, cfg, "DICOM Tags — "+capturedLabel, capturedPaths)
+		})
+		tagsItem.Disabled = len(capturedPaths) == 0
+
 		viewerItem := fyne.NewMenuItem("Open in Viewer", func() { openInViewer(localFolder) })
 		viewerItem.Disabled = cfg.ViewerPath == ""
 		capturedFolder := localFolder
@@ -529,19 +536,53 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 				fmt.Sprintf("Push %d file(s) from %q to a DICOM destination.",
 					len(capturedPaths), model.labelFor(id)))
 		})
-		capturedLabel := model.labelFor(id)
 		deleteItem := fyne.NewMenuItem("Delete…", func() {
 			showDeleteDialog(w, cfg, capturedPaths,
 				fmt.Sprintf("Delete %q from local storage.", capturedLabel),
 				func() { pruneMissing(capturedPaths) })
 		})
+		// Modification: apply a de-identification profile to this patient/study.
+		// Profiles are re-read on every menu open so hand-edits to
+		// ~/.dicomqr/profiles.json take effect immediately (dicomtool semantics).
+		modItem := fyne.NewMenuItem("Modification", nil)
+		modItem.Disabled = seriesUID != "" // patient and study levels only
+		if !modItem.Disabled {
+			var children []*fyne.MenuItem
+			if profPath, err := modifyProfilesPath(); err == nil {
+				if profCfg, err := loadModProfileConfig(profPath); err == nil {
+					names := make([]string, 0, len(profCfg))
+					for name := range profCfg {
+						names = append(names, name)
+					}
+					sort.Strings(names)
+					capturedRoot := scanDir
+					if capturedRoot == "" {
+						capturedRoot = cfg.DownloadDir
+					}
+					capturedStudyLevel := studyUID != ""
+					for _, name := range names {
+						children = append(children, fyne.NewMenuItem(name, func() {
+							showModificationDialog(w, cfg, name, capturedLabel, capturedPaths, capturedRoot, capturedStudyLevel)
+						}))
+					}
+				}
+			}
+			if len(children) == 0 {
+				none := fyne.NewMenuItem("(no profiles defined)", nil)
+				none.Disabled = true
+				children = []*fyne.MenuItem{none}
+			}
+			modItem.ChildMenu = fyne.NewMenu("", children...)
+		}
 		copyUID := fyne.NewMenuItem("Copy UID", func() { w.Clipboard().SetContent(uid) })
 		copyLabel := fyne.NewMenuItem("Copy label", func() { w.Clipboard().SetContent(model.labelFor(id)) })
 		popup := widget.NewPopUpMenu(fyne.NewMenu("",
 			previewItem,
+			tagsItem,
 			viewerItem,
 			openFolderItem,
 			pushItem,
+			modItem,
 			deleteItem,
 			fyne.NewMenuItemSeparator(),
 			copyUID, copyLabel,
@@ -572,6 +613,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 			row.Refresh()
 		},
 	)
+	treeCollapseFix(tree)
 
 	scanStatusLbl := widget.NewLabel("Click Scan to index the download folder.")
 
@@ -762,7 +804,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 	filterBar := container.NewBorder(nil, nil, nil,
 		container.NewHBox(
 			widget.NewButton("Expand All", func() { tree.OpenAllBranches() }),
-			widget.NewButton("Collapse All", func() { tree.CloseAllBranches() }),
+			widget.NewButton("Collapse All", func() { collapseAllTree(tree) }),
 			widget.NewButton("Clear", func() {
 				filterEntry.SetText("")
 				model.setFilter("")

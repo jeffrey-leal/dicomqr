@@ -151,6 +151,7 @@ func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, 
 			row.Refresh()
 		},
 	)
+	treeCollapseFix(tree)
 
 	scanStatusLbl := widget.NewLabel("Select a source folder and click Scan.")
 	importStatusLbl := widget.NewLabel("")
@@ -246,7 +247,7 @@ func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, 
 	filterBar := container.NewBorder(nil, nil, nil,
 		container.NewHBox(
 			widget.NewButton("Expand All", func() { tree.OpenAllBranches() }),
-			widget.NewButton("Collapse All", func() { tree.CloseAllBranches() }),
+			widget.NewButton("Collapse All", func() { collapseAllTree(tree) }),
 			widget.NewButton("Clear", func() {
 				filterEntry.SetText("")
 				model.setFilter("")

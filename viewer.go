@@ -500,7 +500,10 @@ func formatDicomTime(s string) string {
 // unsupportedTransferSyntaxNames lists encapsulated transfer syntaxes the
 // built-in viewer cannot decode. JPEG 2000 (…4.90/…4.91) is intentionally absent
 // — it is handled by decodeJPEG2000Frame when built with the openjpeg tag, and
-// otherwise reports its own "not built in" message.
+// otherwise reports its own "not built in" message. JPEG Lossless (…4.57/…4.70)
+// stays listed — transcode.go uses these names in its own error text — but the
+// viewer veto lets it pass when built with the jpeglossless tag, where it is
+// handled by decodeJPEGLosslessFrame.
 var unsupportedTransferSyntaxNames = map[string]string{
 	"1.2.840.10008.1.2.4.57": "JPEG Lossless Non-Hierarchical",
 	"1.2.840.10008.1.2.4.70": "JPEG Lossless (Process 14, SV1)",
@@ -997,10 +1000,13 @@ func loadDicomImage(path string) (viewerState, error) {
 	}
 	// Reject encapsulated transfer syntaxes the built-in viewer cannot decode
 	// (JPEG-LS, RLE, lossless JPEG) up front with a clear message instead of a
-	// raw decode error. JPEG 2000 is handled by decodeFrame and is not listed.
+	// raw decode error. JPEG 2000 is handled by decodeFrame and is not listed;
+	// JPEG Lossless is listed but passes through when its decoder is built in.
 	if name, unsup := unsupportedTransferSyntaxNames[transferSyntax]; unsup {
-		return viewerState{}, fmt.Errorf(
-			"%s compressed images cannot be decoded by the built-in viewer\n\nUse Open in Viewer to open this file in an external DICOM viewer.", name)
+		if !(jpegLosslessAvailable && isJPEGLosslessTransferSyntax(transferSyntax)) {
+			return viewerState{}, fmt.Errorf(
+				"%s compressed images cannot be decoded by the built-in viewer\n\nUse Open in Viewer to open this file in an external DICOM viewer.", name)
+		}
 	}
 
 	wc, ww, hasWindow := dicomWindowParams(ds)
@@ -1017,13 +1023,27 @@ func loadDicomImage(path string) (viewerState, error) {
 		samplesPerPixel = 1
 	}
 
+	// A single-frame encapsulated image may legally arrive split across several
+	// fragments (PS3.5 §A.4); the parser emits one frame per fragment, so
+	// frames[0] alone would be a truncated codestream. Reassemble the full
+	// stream before decoding (Philips echo JPEG Lossless files ship ~5
+	// fragments per image). NumberOfFrames is VR IS, so datasetInt — not
+	// dicomIntParam, which panics on string values — must read it.
+	if nFrames := datasetInt(&ds, tag.NumberOfFrames, 1); nFrames <= 1 && len(frames) > 1 && frames[0].IsEncapsulated() {
+		if merged, mErr := mergeEncapsulatedFragments(frames); mErr == nil {
+			frames = []*frame.Frame{merged}
+		}
+	}
+
 	df, err := decodeFrame(frames[0], transferSyntax, hasWindow, wc, ww, slope, intercept, isSigned, bitsAlloc, photometric)
 
 	// Fallback: some DICOM implementations store uncompressed pixel data with
 	// an undefined-length VL, which the library mistakes for encapsulated (JPEG)
 	// data. When jpeg.Decode fails, re-interpret the raw bytes natively. This
-	// never applies to JPEG 2000, whose bytes are a genuine codestream.
-	if err != nil && frames[0].IsEncapsulated() && rows > 0 && cols > 0 && !isJPEG2000TransferSyntax(transferSyntax) {
+	// never applies to JPEG 2000 or JPEG Lossless, whose bytes are a genuine
+	// codestream.
+	if err != nil && frames[0].IsEncapsulated() && rows > 0 && cols > 0 &&
+		!isJPEG2000TransferSyntax(transferSyntax) && !isJPEGLosslessTransferSyntax(transferSyntax) {
 		df, err = decodeRawPixelFallback(
 			frames[0].EncapsulatedData.Data,
 			rows, cols, samplesPerPixel, bitsAlloc,
@@ -1135,6 +1155,17 @@ func isJPEG2000TransferSyntax(ts string) bool {
 	return jpeg2000TransferSyntaxes[strings.TrimSpace(ts)]
 }
 
+// jpegLosslessTransferSyntaxes are the DICOM JPEG Lossless (ITU-T T.81
+// process 14, SOF3) transfer syntax UIDs.
+var jpegLosslessTransferSyntaxes = map[string]bool{
+	"1.2.840.10008.1.2.4.57": true, // JPEG Lossless, Non-Hierarchical (Process 14)
+	"1.2.840.10008.1.2.4.70": true, // JPEG Lossless, Non-Hierarchical, First-Order Prediction (SV1)
+}
+
+func isJPEGLosslessTransferSyntax(ts string) bool {
+	return jpegLosslessTransferSyntaxes[strings.TrimSpace(ts)]
+}
+
 // decodeFrame converts a parsed DICOM frame into a decodedFrame. Grayscale
 // pixels are rescaled (slope/intercept) into a float buffer once so the viewer
 // can re-window them cheaply; colour frames are rendered directly and are not
@@ -1142,12 +1173,16 @@ func isJPEG2000TransferSyntax(ts string) bool {
 // otherwise from the 1st–99th percentile of the rescaled values.
 //
 // transferSyntax selects the decode path for encapsulated frames: JPEG 2000 is
-// handled by the OpenJPEG-backed decoder (decodeJPEG2000Frame); other
+// handled by the OpenJPEG-backed decoder (decodeJPEG2000Frame), JPEG Lossless
+// by the libjpeg-turbo-backed decoder (decodeJPEGLosslessFrame); other
 // encapsulated syntaxes fall through to the library's JPEG Baseline decoder.
 func decodeFrame(f *frame.Frame, transferSyntax string, hasWindow bool, wc, ww, slope, intercept float64, isSigned bool, bitsAlloc int, photometric string) (*decodedFrame, error) {
 	if f.IsEncapsulated() {
 		if isJPEG2000TransferSyntax(transferSyntax) {
 			return decodeJPEG2000Frame(f.EncapsulatedData.Data, slope, intercept, hasWindow, wc, ww, photometric)
+		}
+		if isJPEGLosslessTransferSyntax(transferSyntax) {
+			return decodeJPEGLosslessFrame(f.EncapsulatedData.Data, slope, intercept, hasWindow, wc, ww, photometric, isSigned)
 		}
 		img, err := f.GetImage()
 		if err != nil {

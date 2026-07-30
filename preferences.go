@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"image/color"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strconv"
@@ -133,7 +135,24 @@ func hexToColor(s string) color.Color {
 	return color.RGBA{R: 0x00, G: 0x78, B: 0xD4, A: 0xFF}
 }
 
-// showPreferencesDialog opens the preferences dialog with UI, Connections, and Retrieve sections.
+// boldLabel returns a label rendered in bold — the standard section-header style.
+func boldLabel(text string) *widget.Label {
+	l := widget.NewLabel(text)
+	l.TextStyle = fyne.TextStyle{Bold: true}
+	return l
+}
+
+// prefSection stacks a bold header, a separator, and the section content —
+// the visual building block of the Preferences tabs.
+func prefSection(title string, content ...fyne.CanvasObject) *fyne.Container {
+	objs := append([]fyne.CanvasObject{boldLabel(title), widget.NewSeparator()}, content...)
+	return container.NewVBox(objs...)
+}
+
+// showPreferencesDialog opens the tabbed preferences dialog: SCP & Network
+// (local SCP identity, download folder, stall timeout, server profiles), User
+// Interface (appearance, external viewer, tag highlights and profiles), and
+// Modification & Export (de-identification profiles and defaults).
 func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Settings, onApply func(Settings)) {
 	themeLabel := "Light"
 	if current.isDark {
@@ -175,12 +194,7 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 	selItalicCheck := widget.NewCheck("Italic", nil)
 	selItalicCheck.SetChecked(cfg.SelectionItalic)
 
-	// UI section
-	uiHeader := widget.NewLabel("UI")
-	uiHeader.TextStyle = fyne.TextStyle{Bold: true}
-	uiSection := container.NewVBox(
-		uiHeader,
-		widget.NewSeparator(),
+	appearanceSection := prefSection("Appearance",
 		widget.NewForm(
 			widget.NewFormItem("Theme", themeSelect),
 			widget.NewFormItem("Tree font", fontSelect),
@@ -189,7 +203,7 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 		),
 	)
 
-	// Connections section — server profiles
+	// Server profiles list
 	pendingProfiles := append([]ServerProfile(nil), cfg.Profiles...)
 	profileList := container.NewVBox()
 
@@ -247,16 +261,9 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 	profileScroll := container.NewVScroll(profileList)
 	profileScroll.SetMinSize(fyne.NewSize(0, 160))
 
-	connHeader := widget.NewLabel("Connections")
-	connHeader.TextStyle = fyne.TextStyle{Bold: true}
-	connSection := container.NewVBox(
-		connHeader,
-		widget.NewSeparator(),
-		profileScroll,
-		addProfileBtn,
-	)
+	serverSection := prefSection("Server Profiles", profileScroll, addProfileBtn)
 
-	// Retrieve section
+	// Network — local SCP identity, download folder, stall watchdog
 	localAEEntry := widget.NewEntry()
 	localAEEntry.SetText(cfg.LocalAETitle)
 	localPortEntry := widget.NewEntry()
@@ -275,16 +282,21 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 		}()
 	})
 
-	retHeader := widget.NewLabel("Retrieve")
-	retHeader.TextStyle = fyne.TextStyle{Bold: true}
-	retSection := container.NewVBox(
-		retHeader,
-		widget.NewSeparator(),
+	stallEntry := widget.NewEntry()
+	if cfg.RetrieveStallTimeoutSec != 0 {
+		stallEntry.SetText(strconv.Itoa(cfg.RetrieveStallTimeoutSec))
+	}
+	stallEntry.SetPlaceHolder("120 (default)")
+	stallItem := widget.NewFormItem("Retrieve stall timeout (s)", stallEntry)
+	stallItem.HintText = "Abort a retrieve after this many seconds without data; negative disables"
+
+	networkSection := prefSection("Network",
 		widget.NewForm(
 			widget.NewFormItem("Local AE Title", localAEEntry),
 			widget.NewFormItem("Local SCP port", localPortEntry),
 			widget.NewFormItem("Download folder",
 				container.NewBorder(nil, nil, nil, dirBrowseBtn, downloadDirEntry)),
+			stallItem,
 		),
 	)
 
@@ -310,15 +322,236 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 		}
 	})
 
-	viewerHeader := widget.NewLabel("Image Viewer")
-	viewerHeader.TextStyle = fyne.TextStyle{Bold: true}
-	viewerSection := container.NewVBox(
-		viewerHeader,
-		widget.NewSeparator(),
+	viewerSection := prefSection("Image Viewer",
 		container.NewBorder(nil, nil,
 			widget.NewLabel("External viewer"),
 			container.NewHBox(viewerBrowseBtn, detectBtn),
 			viewerPathEntry,
+		),
+	)
+
+	// Tag Highlights section — private-tag italics and the malformed-VR colour
+	// used by the View Tags window (ported from dicomhdr).
+	italicCheck := widget.NewCheck("Italicize", nil)
+	italicCheck.SetChecked(cfg.ItalicPrivate)
+
+	chosenMalColor := malformedTagColor(cfg)
+	malSwatch := canvas.NewRectangle(chosenMalColor)
+	malSwatch.SetMinSize(fyne.NewSize(40, 20))
+	malColorBtn := widget.NewButton("Choose colour…", func() {
+		picker := dialog.NewColorPicker("Malformed tag colour",
+			"Colour applied to tags whose VR violates the standard", func(c color.Color) {
+				if c == nil {
+					return
+				}
+				r, g, b, a := c.RGBA()
+				chosenMalColor = color.RGBA{R: uint8(r >> 8), G: uint8(g >> 8), B: uint8(b >> 8), A: uint8(a >> 8)}
+				malSwatch.FillColor = chosenMalColor
+				malSwatch.Refresh()
+			}, w)
+		picker.Advanced = true
+		picker.Show()
+	})
+
+	hlSection := prefSection("Tag Highlights",
+		widget.NewForm(
+			widget.NewFormItem("Private tags", italicCheck),
+			widget.NewFormItem("Malformed tag", container.NewHBox(malSwatch, malColorBtn)),
+		),
+	)
+
+	// Tag Profiles section — named tag sets coloured in the View Tags window.
+	pendingTagProfiles := append([]TagProfile(nil), cfg.TagProfiles...)
+	tagProfileList := container.NewVBox()
+
+	var buildTagProfileList func()
+	buildTagProfileList = func() {
+		rows := make([]fyne.CanvasObject, len(pendingTagProfiles))
+		for i := range pendingTagProfiles {
+			i := i
+			check := widget.NewCheck("", func(enabled bool) {
+				pendingTagProfiles[i].Enabled = enabled
+			})
+			check.SetChecked(pendingTagProfiles[i].Enabled)
+			nameLabel := widget.NewLabel(fmt.Sprintf("%s  (%d tags)",
+				pendingTagProfiles[i].Name, len(pendingTagProfiles[i].Tags)))
+			editBtn := widget.NewButton("Edit", func() {
+				showTagProfileEditor(w, pendingTagProfiles[i], func(updated TagProfile) {
+					updated.Enabled = pendingTagProfiles[i].Enabled
+					pendingTagProfiles[i] = updated
+					buildTagProfileList()
+				})
+			})
+			deleteBtn := widget.NewButton("Delete", func() {
+				pendingTagProfiles = append(pendingTagProfiles[:i], pendingTagProfiles[i+1:]...)
+				buildTagProfileList()
+			})
+			rows[i] = container.NewBorder(nil, nil,
+				container.NewHBox(check, nameLabel),
+				container.NewHBox(editBtn, deleteBtn),
+			)
+		}
+		tagProfileList.Objects = rows
+		tagProfileList.Refresh()
+	}
+	buildTagProfileList()
+
+	addTagProfileBtn := widget.NewButton("Add profile…", func() {
+		newP := TagProfile{
+			Name:    "New Profile",
+			Color:   color.RGBA{R: 0x00, G: 0x80, B: 0xFF, A: 0xFF},
+			Enabled: true,
+		}
+		showTagProfileEditor(w, newP, func(added TagProfile) {
+			pendingTagProfiles = append(pendingTagProfiles, added)
+			buildTagProfileList()
+		})
+	})
+
+	tagProfileScroll := container.NewVScroll(tagProfileList)
+	tagProfileScroll.SetMinSize(fyne.NewSize(0, 120))
+
+	tpSection := prefSection("Tag Profiles", tagProfileScroll, addTagProfileBtn)
+
+	// Modification profiles — the de-identification recipes in
+	// ~/.dicomqr/profiles.json. Edited as a working copy like the other lists
+	// and committed only on Apply, and only when something actually changed —
+	// the file is hand-editable and must never be rewritten gratuitously. If it
+	// fails to parse, editing is disabled and Apply never overwrites it.
+	var (
+		loadedModProfiles  ModProfileConfig
+		modProfilesLoadErr error
+	)
+	if profPath, perr := modifyProfilesPath(); perr != nil {
+		modProfilesLoadErr = perr
+	} else {
+		loadedModProfiles, modProfilesLoadErr = loadModProfileConfig(profPath)
+	}
+	pendingModProfiles := maps.Clone(loadedModProfiles)
+	if pendingModProfiles == nil {
+		pendingModProfiles = ModProfileConfig{}
+	}
+
+	modProfileList := container.NewVBox()
+	var buildModProfileList func()
+	buildModProfileList = func() {
+		names := make([]string, 0, len(pendingModProfiles))
+		for n := range pendingModProfiles {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		rows := make([]fyne.CanvasObject, len(names))
+		for i, n := range names {
+			n := n
+			p := pendingModProfiles[n]
+			desc := fmt.Sprintf("%s  (%d set, %d remove", n, len(p.Sets), len(p.Removes))
+			if p.Base != "" {
+				desc += ", base: " + p.Base
+			}
+			desc += ")"
+			nameLabel := widget.NewLabel(desc)
+			editBtn := widget.NewButton("Edit", func() {
+				showModProfileEditor(w, n, pendingModProfiles[n], pendingModProfiles,
+					func(newName string, updated ModProfile) {
+						if newName != n {
+							delete(pendingModProfiles, n)
+							// Keep base chains intact across a rename.
+							for on, op := range pendingModProfiles {
+								if op.Base == n {
+									op.Base = newName
+									pendingModProfiles[on] = op
+								}
+							}
+						}
+						pendingModProfiles[newName] = updated
+						buildModProfileList()
+					})
+			})
+			deleteBtn := widget.NewButton("Delete", func() {
+				var dependents []string
+				for on, op := range pendingModProfiles {
+					if on != n && op.Base == n {
+						dependents = append(dependents, on)
+					}
+				}
+				doDelete := func() {
+					delete(pendingModProfiles, n)
+					buildModProfileList()
+				}
+				if len(dependents) > 0 {
+					sort.Strings(dependents)
+					dialog.ShowConfirm("Delete profile",
+						fmt.Sprintf("%q is the base of: %s.\nDeleting it will break those profiles. Delete anyway?",
+							n, strings.Join(dependents, ", ")),
+						func(ok bool) {
+							if ok {
+								doDelete()
+							}
+						}, w)
+					return
+				}
+				doDelete()
+			})
+			rows[i] = container.NewBorder(nil, nil, nil,
+				container.NewHBox(editBtn, deleteBtn), nameLabel)
+		}
+		modProfileList.Objects = rows
+		modProfileList.Refresh()
+	}
+
+	addModProfileBtn := widget.NewButton("Add profile…", func() {
+		showModProfileEditor(w, "", ModProfile{}, pendingModProfiles,
+			func(newName string, added ModProfile) {
+				pendingModProfiles[newName] = added
+				buildModProfileList()
+			})
+	})
+
+	var modProfileSection fyne.CanvasObject
+	if modProfilesLoadErr != nil {
+		errLbl := widget.NewLabel(fmt.Sprintf(
+			"profiles.json could not be read: %v\n\nFix or delete the file to enable profile editing. Apply will not overwrite it.",
+			modProfilesLoadErr))
+		errLbl.Wrapping = fyne.TextWrapWord
+		modProfileSection = prefSection("Modification Profiles", errLbl)
+	} else {
+		buildModProfileList()
+		modProfileScroll := container.NewVScroll(modProfileList)
+		modProfileScroll.SetMinSize(fyne.NewSize(0, 140))
+		modProfileSection = prefSection("Modification Profiles", modProfileScroll, addModProfileBtn)
+	}
+
+	// Modification/export defaults
+	modOutDirEntry := widget.NewEntry()
+	modOutDirEntry.SetText(cfg.ModifyOutputDir)
+	modOutDirEntry.SetPlaceHolder("No default — the first folder chosen in the Modification dialog is saved here")
+	modOutBrowseBtn := widget.NewButton("Browse…", func() {
+		go func() {
+			dir, err := sqweekdialog.Directory().Title("Choose default output folder for modified files").Browse()
+			if err != nil {
+				return
+			}
+			fyne.Do(func() { modOutDirEntry.SetText(dir) })
+		}()
+	})
+	modOutItem := widget.NewFormItem("Default output folder",
+		container.NewBorder(nil, nil, nil, modOutBrowseBtn, modOutDirEntry))
+	modOutItem.HintText = "Used directly by the Modification dialog (no picker on routine runs); must be outside the download folder"
+
+	exportFormatSelect := widget.NewSelect([]string{"CSV", "JSON"}, nil)
+	if strings.EqualFold(cfg.ExportFormat, "json") {
+		exportFormatSelect.SetSelected("JSON")
+	} else {
+		exportFormatSelect.SetSelected("CSV")
+	}
+
+	exportFmtItem := widget.NewFormItem("Default export format", exportFormatSelect)
+	exportFmtItem.HintText = "File type listed first in the View Tags Export Tags… save dialog"
+
+	defaultsSection := prefSection("Defaults",
+		widget.NewForm(
+			modOutItem,
+			exportFmtItem,
 		),
 	)
 
@@ -347,21 +580,58 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 		if p, err := strconv.Atoi(localPortEntry.Text); err == nil && p > 0 && p < 65536 {
 			port = p
 		}
-
-		updated := Settings{
-			DarkTheme:       current.isDark,
-			FontName:        current.fontName,
-			LocalAETitle:    localAEEntry.Text,
-			LocalSCPPort:    port,
-			DownloadDir:     downloadDirEntry.Text,
-			Profiles:        pendingProfiles,
-			WindowWidth:     cfg.WindowWidth,
-			WindowHeight:    cfg.WindowHeight,
-			SelectionColor:  colorToHex(chosenSelColor),
-			SelectionBold:   selBoldCheck.Checked,
-			SelectionItalic: selItalicCheck.Checked,
-			ViewerPath:      viewerPathEntry.Text,
+		stall := cfg.RetrieveStallTimeoutSec
+		if s := strings.TrimSpace(stallEntry.Text); s == "" {
+			stall = 0 // blank = use the built-in default (120 s)
+		} else if v, err := strconv.Atoi(s); err == nil {
+			stall = v
 		}
+
+		// Copy-then-overwrite: fields without dialog controls (window size,
+		// anything added later) carry through instead of being silently zeroed.
+		updated := *cfg
+		updated.DarkTheme = current.isDark
+		updated.FontName = current.fontName
+		updated.LocalAETitle = localAEEntry.Text
+		updated.LocalSCPPort = port
+		updated.DownloadDir = downloadDirEntry.Text
+		updated.Profiles = pendingProfiles
+		updated.SelectionColor = colorToHex(chosenSelColor)
+		updated.SelectionBold = selBoldCheck.Checked
+		updated.SelectionItalic = selItalicCheck.Checked
+		updated.ViewerPath = viewerPathEntry.Text
+		updated.ItalicPrivate = italicCheck.Checked
+		updated.MalformedColor = colorToHex(chosenMalColor)
+		updated.TagProfiles = pendingTagProfiles
+		updated.RetrieveStallTimeoutSec = stall
+		updated.ModifyOutputDir = strings.TrimSpace(modOutDirEntry.Text)
+		if exportFormatSelect.Selected == "JSON" {
+			updated.ExportFormat = "json"
+		} else {
+			updated.ExportFormat = "csv"
+		}
+
+		if updated.ModifyOutputDir != "" && pathWithinDir(updated.ModifyOutputDir, updated.DownloadDir) {
+			dialog.ShowError(fmt.Errorf(
+				"the default modification output folder must be outside the download folder (%s) — modified files are never mixed into the local index",
+				updated.DownloadDir), w)
+			return
+		}
+
+		// Commit modification-profile edits. Nothing else holds the working
+		// copy, so a failed save means the edits are gone once the dialog
+		// closes — say so.
+		if modProfilesLoadErr == nil && !reflect.DeepEqual(pendingModProfiles, loadedModProfiles) {
+			profPath, perr := modifyProfilesPath()
+			if perr == nil {
+				perr = saveModProfileConfig(profPath, pendingModProfiles)
+			}
+			if perr != nil {
+				dialog.ShowError(fmt.Errorf(
+					"Modification profile changes could not be saved to disk and will be lost:\n\n%v", perr), w)
+			}
+		}
+
 		if err := saveSettingsE(updated); err != nil {
 			// Apply for this session regardless, but make the persistence
 			// failure impossible to miss — losing a mid-session preference
@@ -371,6 +641,7 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 		}
 		a.Settings().SetTheme(current)
 		onApply(updated)
+		refreshOpenTagViewers()
 		d.Hide()
 	})
 
@@ -379,9 +650,21 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 		container.NewPadded(container.NewBorder(nil, nil, nil, container.NewHBox(cancelBtn, applyBtn))),
 	)
 
-	minWidth := canvas.NewRectangle(color.Transparent)
-	minWidth.SetMinSize(fyne.NewSize(640, 0))
-	content := container.NewStack(minWidth, container.NewVBox(uiSection, connSection, retSection, viewerSection, buttonRow))
+	// Three tabs, each scrolling independently; the button row stays pinned
+	// below the tab container so Cancel/Apply are always visible.
+	tabs := container.NewAppTabs(
+		container.NewTabItem("SCP & Network",
+			container.NewVScroll(container.NewVBox(networkSection, serverSection))),
+		container.NewTabItem("User Interface",
+			container.NewVScroll(container.NewVBox(appearanceSection, viewerSection, hlSection, tpSection))),
+		container.NewTabItem("Modification & Export",
+			container.NewVScroll(container.NewVBox(modProfileSection, defaultsSection))),
+	)
+
+	minSize := canvas.NewRectangle(color.Transparent)
+	minSize.SetMinSize(fyne.NewSize(640, 520))
+	content := container.NewStack(minSize,
+		container.NewBorder(nil, buttonRow, nil, nil, tabs))
 	d = dialog.NewCustomWithoutButtons("Preferences", content, w)
 	d.Show()
 }

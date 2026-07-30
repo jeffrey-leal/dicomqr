@@ -160,6 +160,22 @@ func transcodeDICOMFile(path, targetTS string) (bool, error) {
 	return true, nil
 }
 
+// mergeEncapsulatedFragments reassembles the fragments of one encapsulated
+// single-frame image into a single frame holding the complete codestream.
+// PS3.5 §A.4: fragment boundaries are arbitrary splits of one stream, so
+// plain in-order concatenation restores it (only the final fragment may carry
+// a padding byte, which JPEG-family decoders ignore after EOI).
+func mergeEncapsulatedFragments(frames []*frame.Frame) (*frame.Frame, error) {
+	var merged []byte
+	for _, fr := range frames {
+		if fr == nil || !fr.IsEncapsulated() {
+			return nil, errors.New("mixed native and encapsulated fragments")
+		}
+		merged = append(merged, fr.EncapsulatedData.Data...)
+	}
+	return &frame.Frame{Encapsulated: true, EncapsulatedData: frame.EncapsulatedFrame{Data: merged}}, nil
+}
+
 // decompressPixelData converts encapsulated frames to native frames. colorOut
 // reports whether any frame decoded to colour (the caller then rewrites the
 // Photometric Interpretation as RGB).
@@ -173,14 +189,11 @@ func decompressPixelData(ds *sdicom.Dataset, info sdicom.PixelDataInfo, tsUID st
 	// not match its frame count cannot be mapped reliably — bail out.
 	encFrames := info.Frames
 	if numberOfFrames == 1 && len(encFrames) > 1 {
-		var merged []byte
-		for _, fr := range encFrames {
-			if fr == nil || !fr.IsEncapsulated() {
-				return info, false, errors.New("mixed native and encapsulated fragments")
-			}
-			merged = append(merged, fr.EncapsulatedData.Data...)
+		mergedFrame, err := mergeEncapsulatedFragments(encFrames)
+		if err != nil {
+			return info, false, err
 		}
-		encFrames = []*frame.Frame{{Encapsulated: true, EncapsulatedData: frame.EncapsulatedFrame{Data: merged}}}
+		encFrames = []*frame.Frame{mergedFrame}
 	} else if len(encFrames) != numberOfFrames {
 		return info, false, fmt.Errorf("%d fragments for %d frames — cannot map fragments to frames", len(encFrames), numberOfFrames)
 	}
