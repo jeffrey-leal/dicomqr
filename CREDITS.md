@@ -54,9 +54,14 @@ Sections referenced:
 | [grailbio/go-dicom](https://github.com/grailbio/go-dicom) | GRAIL Inc. | Apache 2.0 | DICOM dataset encoding / file header writing |
 | [suyashkumar/dicom](https://github.com/suyashkumar/dicom) v1.1.0 | Suyash Kumar | MIT | DICOM file parsing for received files |
 | [sqweek/dialog](https://github.com/sqweek/dialog) | sqweek | ISC | Native Windows file/folder picker dialogs |
+| [catppuccin/fyne](https://github.com/catppuccin/fyne) v1.0.0 | Catppuccin community | MIT | Catppuccin colour themes (Preferences > Colour theme) |
+| [fyne.io/x/fyne](https://github.com/fyne-io/fyne-x) (vendored excerpt) | Fyne.io contributors | BSD 3-Clause | Adwaita colour scheme (`adwaitatheme.go`) |
 
 A vendored copy of `algm/go-netdicom` is included under `thirdparty/go-netdicom`
-with its original Apache 2.0 licence intact.
+with its original Apache 2.0 licence intact. The Adwaita colour tables in
+`adwaitatheme.go` are vendored from the fyne-x community repository (BSD
+3-Clause) rather than imported, so the fyne-x module's tracking of Fyne's
+development branch cannot silently upgrade the pinned GUI framework.
 
 ---
 

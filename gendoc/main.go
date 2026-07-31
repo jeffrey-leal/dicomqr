@@ -499,7 +499,7 @@ const stylesXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 
 func buildContent(d Formatter) {
 
-	d.Cover("dicomqr", "User Manual  v1.10.0",
+	d.Cover("dicomqr", "User Manual  v1.11.0",
 		time.Now().Format("January 2, 2006"),
 		"A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.")
 
@@ -775,6 +775,7 @@ func buildContent(d Formatter) {
 
 	d.H3("8.3.4  Study Overview Grid")
 	d.P("The overview window shows one thumbnail per series — the middle slice of each series rendered in parallel. Thumbnails flow from the top-left, wrapping into as many columns as fit the window, and reflow when the window is resized. Double-click any thumbnail to open that series in the full series viewer.")
+	d.P("A series with nothing to display — SR, KO, PR and other non-image objects, or pixel data the built-in decoders cannot render — appears as a white tile with its modality in large bold black text instead of an image. Double-clicking the tile still opens the appropriate viewer for the series.")
 	d.P("While the overview is generated, a progress dialog counts the series as they load — studies with thousands of images can take several seconds. Series previews and the folder Preview button show the same dialog while large image sets are scanned and sorted; the application remains responsive throughout.")
 
 	d.H3("8.3.5  DICOM Annotation Overlay")
@@ -809,6 +810,7 @@ func buildContent(d Formatter) {
 	d.H2("8.5  Pushing to a PACS")
 	d.P("Right-click any node and select Push to PACS…, or select items and click Push Selected…, to send files to a remote PACS via C-STORE SCU.")
 	d.P("A dialog appears with a destination selector (any configured server profile), a progress bar and per-file counter, and a Cancel button. The push creates a new association per operation and does not require the PACS tab to be connected.")
+	d.P("Files are sent exactly as stored: the association offers each file's own transfer syntax, and when the server accepts it the stored bytes go out verbatim — no re-encoding, byte-perfect, including compressed files when the destination accepts their syntax. If the server negotiates a different syntax instead, the file is converted locally to the negotiated uncompressed syntax (on a temporary copy — the local file is never modified) and sent in that form; a file that cannot be converted is skipped and counted as failed. Every failed file is recorded in the Activity Log with the actual reason.")
 
 	d.H2("8.6  Deleting Local Files")
 	d.P("Right-click any node and select Delete…, or select items and click Delete Selected…, to permanently remove files from disk. A confirmation dialog shows the file count and total size. After deletion, empty directories are pruned and the deleted entries are removed from the tree and its index automatically — no rescan needed.")
@@ -900,7 +902,7 @@ func buildContent(d Formatter) {
 	d.H2("12.3  Help Menu")
 	d.Table([]Row{
 		{"Item", "Description"},
-		{"Activity Log…", "Opens the in-app activity log showing the last 500 lines of the DICOM protocol log. Buttons: Refresh (manual update), Copy All (clipboard), Clear. The log auto-refreshes once per second while the dialog is open."},
+		{"Activity Log…", "Opens the in-app activity log (the last 5000 captured lines). A step-wise level selector scales the view from Errors only, through Errors + warnings and Activity (one line per meaningful operation — the default), up to Everything (full DICOM protocol detail); a filter box narrows the view to lines containing a substring, and a counter shows how many lines each severity holds. Both filters apply to the display only — capture is always complete, so raising the level retroactively reveals the full detail of something that already happened, and dicom.log always records everything. The chosen level persists across sessions. Buttons: Refresh (manual update), Copy Shown (copies the filtered view to the clipboard), Clear. The log auto-refreshes once per second while the dialog is open."},
 		{"About", "Displays the application version, build date, and library credits."},
 		{"Client info…", "Displays the local AE Title, SCP port, and detected IP address."},
 	})
@@ -948,7 +950,8 @@ func buildContent(d Formatter) {
 	d.P("Appearance:")
 	d.Table([]Row{
 		{"Setting", "Description"},
-		{"Theme", "Selects the application colour theme: Light or Dark."},
+		{"Colour theme", "Selects the colour theme pack: Default (the stock Fyne palette), Adwaita (the GNOME colour specification), or one of the four Catppuccin flavours — Latte (light), Frappé, Macchiato, and Mocha (dark). Default and Adwaita respond to the Light/Dark choice below; the Catppuccin flavours are fixed palettes, so the Theme radio is disabled while one is selected."},
+		{"Theme", "Selects the light or dark variant of the colour theme (Default and Adwaita packs only)."},
 		{"Tree font", "Selects the font used for results tree rows. Select (default) to use the application's built-in font."},
 		{"Selection colour", "The colour applied to selected rows. Click Choose colour… to open a colour picker. If unset, selected rows follow the theme's primary accent colour."},
 		{"Selection style", "The font style applied to selected rows: Bold and/or Italic."},
@@ -1000,7 +1003,7 @@ func buildContent(d Formatter) {
 	d.P("The status bar at the bottom of the window provides real-time feedback. A coloured LED indicator (gray / amber / green) precedes the status text.")
 	d.Table([]Row{
 		{"Situation", "Status bar text"},
-		{"Application started, not connected", "`v1.10.0`"},
+		{"Application started, not connected", "`v1.11.0`"},
 		{"Connecting to server", "`Connecting…`"},
 		{"Connected", "`Connected: <AE>@<host>:<port>`"},
 		{"Connection cancelled", "`Connection cancelled`"},
@@ -1050,6 +1053,8 @@ func buildContent(d Formatter) {
 		{"`windowWidth`", "`0`", "Saved window width in pixels. 0 uses the default; updated automatically on close."},
 		{"`windowHeight`", "`0`", "Saved window height in pixels."},
 		{"`retrieveStallTimeoutSec`", "`0`", "Abort a retrieve when no progress response and no received file arrives for this many seconds. 0 uses the default (120 s); -1 disables stall detection. Recovers from PACS servers whose C-MOVE agent hangs on non-image objects (SR/PR). Editable in Preferences > SCP & Network."},
+		{"`uiTheme`", "`\"\"`", "Colour theme pack: empty (stock theme), `adwaita`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, or `catppuccin-mocha`."},
+		{"`logViewLevel`", "`\"activity\"`", "Activity Log view filter: `errors`, `warnings`, `activity`, or `everything`. Display-time only — capture and dicom.log always record everything."},
 		{"`italicPrivate`", "`true`", "Render private tags in italic in the View Tags window."},
 		{"`malformedColor`", "`\"E54545FF\"`", "RRGGBBAA colour for tags whose value representation violates the standard."},
 		{"`tagProfiles`", "PHI profile", "Array of tag-highlight profiles (name, colour, enabled, tag list) — see Section 14.2. Wire format matches dicomhdr."},

@@ -59,13 +59,18 @@ CGO_ENABLED=1 CC=/c/msys64/mingw64/bin/gcc.exe \
 | `jpeg2000_stub.go` | Fallback when built without the `openjpeg` tag |
 | `jpeglossless_turbo.go` | CGO JPEG Lossless (SOF3, .57/.70) decoder via libjpeg-turbo 3.x (`//go:build jpeglossless`) — viewer-only; the transcode/negotiation paths intentionally exclude JPEG Lossless |
 | `jpeglossless_stub.go` | Fallback when built without the `jpeglossless` tag |
-| `logcapture.go` | In-memory log ring buffer and Activity Log dialog |
+| `logcapture.go` | Leveled in-memory log ring (5000 entries) and Activity Log dialog with step-wise severity filter (Errors only → Everything, persisted as `logViewLevel`) plus substring filter; `logError`/`logWarn`/`logInfo` helpers tag app lines `[E]`/`[W]`/`[I]` — use these instead of `log.Printf` (untagged lines classify as protocol chatter, shown only at Everything) |
 | `settings.go` | `Settings` struct, load/save, embedded defaults |
 | `serverprofile.go` | `ServerProfile` struct for saved server connections |
-| `preferences.go` | `appTheme`, system font scanner, tabbed preferences dialog (SCP & Network / User Interface / Modification & Export; Apply copies current settings and overwrites only edited fields) |
-| `transfersyntax.go` | Transfer syntax UID constants, labels, and `fileTransferSyntaxUID` (meta-only parse) |
+| `preferences.go` | `appTheme` (wraps a colour theme pack, forcing the configured light/dark variant and font), theme pack registry (`themePackBase`: Default / Adwaita / four Catppuccin flavours, persisted as `uiTheme`), system font scanner, tabbed preferences dialog (SCP & Network / User Interface / Modification & Export; Apply copies current settings and overwrites only edited fields) |
+| `adwaitatheme.go` | Adwaita colour scheme vendored from fyne-x (BSD-3) — colours only, icons stay stock; vendored because the fyne-x module tracks Fyne master and would silently upgrade the pinned framework |
+| `transfersyntax.go` | Transfer syntax UID constants, labels, `fileTransferSyntaxUID` (meta-only parse), and `fileMetaIdentity` (hand-rolled File Meta scan returning SOP class/instance/TS UIDs plus the dataset byte offset — feeds the raw-bytes push) |
 | `transcode.go` | Local conversion enforcing a profile's required syntax (Explicit/Implicit VR LE): `acceptedSyntaxesFor` builds the negotiable set (required first, then locally convertible — other LE VR, JPEG Baseline/Extended, JPEG 2000), and the receive path transcodes any non-required arrival in place before it reaches the download folder; objects that cannot be obtained in the required syntax — whether the server cannot deliver them in a negotiable syntax (failed sub-operations) or a delivered object fails local conversion (e.g. a screenshot with undecodable pixel data) — are skipped and reported (Activity Log + retrieve summary) while the rest of the retrieve continues; only a retrieve where the server delivers nothing at all raises an error dialog |
 | `export.go` | CSV and JSON export of a single instance's element list from the tag viewer (right-click an instance row → Export Tags…) — the application's only export; always the complete instance regardless of the search filter, tags formatted `[GGGG,EEEE]` zero-filled 4-digit hex (square brackets, not parentheses — Excel parses `(0020,0001)` as the negative number -20,001; brackets import as text with no formula wrapper needed) |
+
+## DICOM library policy
+
+**suyashkumar/dicom owns everything application code does with DICOM files** — parsing, writing, presenting. **grailbio/go-dicom is an internal detail of the vendored netdicom stack** (Q/R element plumbing, DIMSE wire encoding, dicomlog) and must never be imported by new application code: it is archived with a pre-2018 data dictionary, so any path that re-encodes through it mistypes newer tags (e.g. 0018,9362 → UN → unencodable). The C-STORE push therefore sends stored dataset bytes verbatim (no parse/re-encode); remaining grailbio usage in app code (dicomnet.go Q/R elements, storagescp.go meta writer, main.go dicomlog) is legacy scheduled for phased migration, each step gated on live PACS testing.
 
 ## Key dependencies
 
@@ -75,6 +80,7 @@ CGO_ENABLED=1 CC=/c/msys64/mingw64/bin/gcc.exe \
 - `github.com/grailbio/go-dicom` — DICOM dataset encoding used by the C-STORE SCU and SCP
 - `github.com/sqweek/dialog` — native Windows file/folder picker
 - `modernc.org/sqlite` — pure-Go SQLite (no CGO) for the Local Browse persistent index
+- `github.com/catppuccin/fyne` — Catppuccin colour themes (Preferences > Colour theme). Do NOT add `fyne.io/x/fyne` as a dependency — it tracks Fyne's master branch and silently upgrades the pinned `fyne.io/fyne/v2`; the Adwaita colours are vendored in `adwaitatheme.go` instead
 
 ## Documentation
 

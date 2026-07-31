@@ -19,19 +19,83 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	catppuccin "github.com/catppuccin/fyne"
 	sqweekdialog "github.com/sqweek/dialog"
 )
 
-// appTheme wraps a base Fyne theme and optionally overrides the font.
+// Theme pack values persisted in Settings.UITheme ("" = the stock Fyne theme).
+// Each maps to a base fyne.Theme in themePackBase and a display label in
+// themePackLabels.
+const (
+	themePackDefault   = ""
+	themePackAdwaita   = "adwaita"
+	themePackLatte     = "catppuccin-latte"
+	themePackFrappe    = "catppuccin-frappe"
+	themePackMacchiato = "catppuccin-macchiato"
+	themePackMocha     = "catppuccin-mocha"
+)
+
+// themePackLabels maps pack values to the labels shown in the Preferences
+// selector, in display order.
+var themePackLabels = []struct{ pack, label string }{
+	{themePackDefault, "Default"},
+	{themePackAdwaita, "Adwaita"},
+	{themePackLatte, "Catppuccin Latte (light)"},
+	{themePackFrappe, "Catppuccin Frappé (dark)"},
+	{themePackMacchiato, "Catppuccin Macchiato (dark)"},
+	{themePackMocha, "Catppuccin Mocha (dark)"},
+}
+
+// themePackBase returns the base theme for a pack value. Unknown values (e.g.
+// a hand-edited settings.json) fall back to the stock theme.
+func themePackBase(pack string) fyne.Theme {
+	switch pack {
+	case themePackAdwaita:
+		return adwaitaTheme{}
+	case themePackLatte, themePackFrappe, themePackMacchiato, themePackMocha:
+		t := catppuccin.New()
+		switch pack {
+		case themePackLatte:
+			t.SetFlavor(catppuccin.Latte)
+		case themePackFrappe:
+			t.SetFlavor(catppuccin.Frappe)
+		case themePackMacchiato:
+			t.SetFlavor(catppuccin.Macchiato)
+		case themePackMocha:
+			t.SetFlavor(catppuccin.Mocha)
+		}
+		return t
+	default:
+		return theme.DefaultTheme()
+	}
+}
+
+// themePackHasVariants reports whether the pack responds to the Light/Dark
+// choice. The Catppuccin flavors are fixed palettes, so the variant radio is
+// disabled while one is selected.
+func themePackHasVariants(pack string) bool {
+	return pack == themePackDefault || pack == themePackAdwaita
+}
+
+// appTheme wraps a base Fyne theme (the selected theme pack), forcing the
+// configured Light/Dark variant and optionally overriding the font.
 type appTheme struct {
 	base     fyne.Theme
 	font     fyne.Resource
 	fontName string
 	isDark   bool
+	pack     string
 }
 
 func (t *appTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
-	return t.base.Color(name, variant)
+	// Force the configured variant rather than following the OS: the Theme
+	// radio in Preferences is the single source of truth. Packs with a fixed
+	// palette (Catppuccin flavors) ignore the variant entirely.
+	v := fyne.ThemeVariant(theme.VariantLight)
+	if t.isDark {
+		v = theme.VariantDark
+	}
+	return t.base.Color(name, v)
 }
 
 func (t *appTheme) Font(style fyne.TextStyle) fyne.Resource {
@@ -52,14 +116,8 @@ func (t *appTheme) Size(name fyne.ThemeSizeName) float32 {
 	return t.base.Size(name)
 }
 
-func newAppTheme(isDark bool) *appTheme {
-	t := &appTheme{isDark: isDark}
-	if isDark {
-		t.base = theme.DarkTheme()
-	} else {
-		t.base = theme.LightTheme()
-	}
-	return t
+func newAppTheme(isDark bool, pack string) *appTheme {
+	return &appTheme{isDark: isDark, pack: pack, base: themePackBase(pack)}
 }
 
 func systemFontDirs() []string {
@@ -161,6 +219,27 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 	themeSelect := widget.NewRadioGroup([]string{"Light", "Dark"}, nil)
 	themeSelect.SetSelected(themeLabel)
 
+	// Colour theme pack selector. The Light/Dark radio applies only to packs
+	// with variants; the fixed Catppuccin flavors disable it.
+	packLabels := make([]string, len(themePackLabels))
+	packByLabel := make(map[string]string, len(themePackLabels))
+	currentPackLabel := themePackLabels[0].label
+	for i, p := range themePackLabels {
+		packLabels[i] = p.label
+		packByLabel[p.label] = p.pack
+		if p.pack == current.pack {
+			currentPackLabel = p.label
+		}
+	}
+	themePackSelect := widget.NewSelect(packLabels, func(label string) {
+		if themePackHasVariants(packByLabel[label]) {
+			themeSelect.Enable()
+		} else {
+			themeSelect.Disable()
+		}
+	})
+	themePackSelect.SetSelected(currentPackLabel)
+
 	fontSelect := widget.NewSelect([]string{"(default)", "(loading…)"}, nil)
 	if current.fontName != "" {
 		fontSelect.SetSelected(current.fontName)
@@ -196,6 +275,7 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 
 	appearanceSection := prefSection("Appearance",
 		widget.NewForm(
+			widget.NewFormItem("Colour theme", themePackSelect),
 			widget.NewFormItem("Theme", themeSelect),
 			widget.NewFormItem("Tree font", fontSelect),
 			widget.NewFormItem("Selection colour", container.NewHBox(selColorSwatch, selColorBtn)),
@@ -559,11 +639,8 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 	cancelBtn := widget.NewButton("Cancel", func() { d.Hide() })
 	applyBtn := widget.NewButton("Apply", func() {
 		current.isDark = themeSelect.Selected == "Dark"
-		if current.isDark {
-			current.base = theme.DarkTheme()
-		} else {
-			current.base = theme.LightTheme()
-		}
+		current.pack = packByLabel[themePackSelect.Selected]
+		current.base = themePackBase(current.pack)
 		if fontSelect.Selected == "(default)" {
 			current.font = nil
 			current.fontName = ""
@@ -591,6 +668,7 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 		// anything added later) carry through instead of being silently zeroed.
 		updated := *cfg
 		updated.DarkTheme = current.isDark
+		updated.UITheme = current.pack
 		updated.FontName = current.fontName
 		updated.LocalAETitle = localAEEntry.Text
 		updated.LocalSCPPort = port

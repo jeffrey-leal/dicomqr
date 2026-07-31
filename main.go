@@ -27,7 +27,7 @@ import (
 	"github.com/grailbio/go-dicom/dicomlog"
 )
 
-const version = "1.10.0"
+const version = "1.11.0"
 
 // LED colours for connection and SCP state indicators.
 var (
@@ -106,7 +106,7 @@ func collapseAllTree(tree *widget.Tree) {
 // nothing; on a normal shutdown the process is gone before the timer fires.
 func armExitWatchdog() {
 	time.AfterFunc(3*time.Second, func() {
-		log.Printf("exit watchdog: shutdown wedged 3s after close — forcing process exit")
+		logError("exit watchdog: shutdown wedged 3s after close — forcing process exit")
 		os.Exit(0)
 	})
 }
@@ -123,7 +123,7 @@ func main() {
 	cfg := loadSettings()
 	// Record the session's starting configuration so a log file alone can
 	// answer "what was the app actually configured to do" after the fact.
-	log.Printf("settings: %d profile(s), download dir %s, local AE %s, SCP port %d",
+	logInfo("settings: %d profile(s), download dir %s, local AE %s, SCP port %d",
 		len(cfg.Profiles), cfg.DownloadDir, cfg.LocalAETitle, cfg.LocalSCPPort)
 
 	// Persistent SQLite index of the download directory backing the Local
@@ -131,7 +131,7 @@ func main() {
 	// catalog method is nil-safe and the tab falls back to in-memory scans.
 	cat, catErr := openCatalog(cfg.DownloadDir)
 	if catErr != nil {
-		log.Printf("catalog: open: %v", catErr)
+		logError("catalog: open: %v", catErr)
 		cat = nil
 	}
 
@@ -143,7 +143,7 @@ func main() {
 		w.Resize(fyne.NewSize(900, 650))
 	}
 
-	currentTheme := newAppTheme(cfg.DarkTheme)
+	currentTheme := newAppTheme(cfg.DarkTheme, cfg.UITheme)
 	if cfg.FontName != "" {
 		if path := fontPathByName(cfg.FontName); path != "" {
 			if res, err := loadFontResource(path); err == nil {
@@ -295,7 +295,7 @@ func main() {
 	// saved here: state mid-panic is not trustworthy.
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("FATAL: panic on main goroutine: %v\n%s", r, debug.Stack())
+			logError("FATAL: panic on main goroutine: %v\n%s", r, debug.Stack())
 			stopClock()
 			shutdownSCP()
 			cat.Close()
@@ -1021,10 +1021,10 @@ func main() {
 		}
 
 		count := len(targets)
-		log.Printf("retrieve: %d targets, destAE=%s port=%d method=%s requiredTS=%q",
+		logInfo("retrieve: %d targets, destAE=%s port=%d method=%s requiredTS=%q",
 			count, cfg.LocalAETitle, cfg.LocalSCPPort, method, prof.requiredTransferSyntax())
 		for i, t := range targets {
-			log.Printf("  target[%d]: level=%s patientID=%s studyUID=%s seriesUID=%s", i, t.level, t.patientID, t.studyUID, t.seriesUID)
+			logInfo("  target[%d]: level=%s patientID=%s studyUID=%s seriesUID=%s", i, t.level, t.patientID, t.studyUID, t.seriesUID)
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -1112,7 +1112,7 @@ func main() {
 							idle := time.Duration(time.Now().UnixNano() - lastActivity.Load())
 							if idle > stallTimeout {
 								stalled.Store(true)
-								log.Printf("retrieve: no server activity for %v — aborting stalled retrieve", stallTimeout)
+								logWarn("retrieve: no server activity for %v — aborting stalled retrieve", stallTimeout)
 								cancel()
 								return
 							}
@@ -1144,7 +1144,7 @@ func main() {
 			getCallback := func(txUID, scUID, siUID string, data []byte) error {
 				path, converted, skippedFile, saveErr := saveGetFile(cfg.DownloadDir, txUID, scUID, siUID, data, requiredTS)
 				if saveErr != nil {
-					log.Printf("c-get: save file: %v", saveErr)
+					logError("c-get: save file: %v", saveErr)
 					return saveErr
 				}
 				if skippedFile {
@@ -1203,7 +1203,7 @@ func main() {
 				case "AUTO":
 					err = cl.Get(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, getCallback, onProg)
 					if err != nil && ctx.Err() == nil {
-						log.Printf("retrieve: c-get failed (%v), falling back to c-move", err)
+						logWarn("retrieve: c-get failed (%v), falling back to c-move", err)
 						// The C-MOVE retry re-delivers the whole target; counts
 						// from the failed C-GET attempt are superseded.
 						srvFailedCur.Store(0)
@@ -1218,7 +1218,7 @@ func main() {
 				// latest value is its final one.
 				if f := srvFailedCur.Swap(0); f > 0 {
 					srvFailedTotal += f
-					log.Printf("retrieve: server could not deliver %d object(s) for %s %d/%d — continuing",
+					logWarn("retrieve: server could not deliver %d object(s) for %s %d/%d — continuing",
 						f, label, idx, count)
 				}
 
@@ -1227,7 +1227,7 @@ func main() {
 						cancelled = true
 						break
 					}
-					log.Printf("retrieve: %s %d/%d error (continuing): %v", label, idx, count, err)
+					logError("retrieve: %s %d/%d error (continuing): %v", label, idx, count, err)
 					errCount++
 					failed = append(failed, tgt)
 				}
@@ -1265,7 +1265,7 @@ func main() {
 				convertedTotal += sc.ConvertedCount() - scpConvBase
 			}
 			if convertedTotal > 0 {
-				log.Printf("retrieve: %d of %d file(s) arrived in a non-required syntax and were converted locally to %s",
+				logInfo("retrieve: %d of %d file(s) arrived in a non-required syntax and were converted locally to %s",
 					convertedTotal, n, requiredTS)
 			}
 			skippedTotal := getSkipped.Load()
@@ -1273,15 +1273,15 @@ func main() {
 				skippedTotal += sc.SkippedCount() - scpSkipBase
 			}
 			if skippedTotal > 0 {
-				log.Printf("retrieve: %d object(s) could not be converted to %s and were skipped (not saved) — see the SKIPPED entries above for details",
+				logWarn("retrieve: %d object(s) could not be converted to %s and were skipped (not saved) — see the SKIPPED entries above for details",
 					skippedTotal, requiredTS)
 			}
 			if srvFailedTotal > 0 {
 				if requiredTS != "" {
-					log.Printf("retrieve: the server could not deliver %d object(s) in %s or any locally convertible syntax — not received (likely stored in a format without a built-in decoder, e.g. JPEG-LS, RLE, JPEG Lossless)",
+					logError("retrieve: the server could not deliver %d object(s) in %s or any locally convertible syntax — not received (likely stored in a format without a built-in decoder, e.g. JPEG-LS, RLE, JPEG Lossless)",
 						srvFailedTotal, requiredTS)
 				} else {
-					log.Printf("retrieve: the server reported %d failed sub-operation(s)", srvFailedTotal)
+					logWarn("retrieve: the server reported %d failed sub-operation(s)", srvFailedTotal)
 				}
 			}
 			fyne.Do(func() {
@@ -1544,7 +1544,7 @@ func main() {
 		bd = "unknown"
 	}
 	helpMenu := fyne.NewMenu("Help",
-		fyne.NewMenuItem("Activity Log…", func() { showLogDialog(w) }),
+		fyne.NewMenuItem("Activity Log…", func() { showLogDialog(w, &cfg) }),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("About", func() {
 			iconImg := canvas.NewImageFromResource(appIcon)
@@ -1698,8 +1698,9 @@ func (s *fileLogSink) Write(p []byte) (int, error) {
 	}
 	if err != nil && s.failures.Add(1) == 1 {
 		// Report straight to the ring — routing through the log package here
-		// would recurse into this sink.
-		appLog.Write([]byte("dicom.log unwritable: " + err.Error()))
+		// would recurse into this sink. Tagged [E] so the line surfaces at the
+		// errors-only view level.
+		appLog.Write([]byte("[E] dicom.log unwritable: " + err.Error()))
 	}
 	return len(p), nil
 }
@@ -1728,5 +1729,5 @@ func setupLogFile() {
 		}
 	}
 	log.SetOutput(io.MultiWriter(sinks...))
-	log.Printf("dicomqr v%s (build %s) session start — log: %s", version, buildDate, logPath)
+	logInfo("dicomqr v%s (build %s) session start — log: %s", version, buildDate, logPath)
 }

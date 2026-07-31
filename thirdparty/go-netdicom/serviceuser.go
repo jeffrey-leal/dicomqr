@@ -252,6 +252,41 @@ func (su *ServiceUser) CStore(ds *dicom.DataSet) error {
 	return runCStoreOnAssociation(cs.upcallCh, su.disp.downcallCh, su.cm, cs.messageID, ds)
 }
 
+// CStoreRaw issues a C-STORE request sending an already-encoded dataset
+// verbatim — no parse, no re-encode, so the wire bytes are exactly the stored
+// file's. data must be the dataset portion only (File Meta group stripped),
+// encoded in transferSyntaxUID. When transferSyntaxUID differs from the
+// syntax negotiated for sopClassUID a *TransferSyntaxMismatchError is
+// returned (carrying the negotiated UID) and nothing is sent; the caller may
+// convert the dataset and retry. Local addition (dicomqr Phase 1 of the DICOM
+// library standardization).
+//
+// REQUIRES: Connect() or SetConn has been called.
+func (su *ServiceUser) CStoreRaw(sopClassUID, sopInstanceUID, transferSyntaxUID string, data []byte) error {
+	err := su.waitUntilReady()
+	if err != nil {
+		return err
+	}
+	doassert(su.cm != nil)
+	context, err := su.cm.lookupByAbstractSyntaxUID(sopClassUID)
+	if err != nil {
+		return err
+	}
+	fileTS := transferSyntaxUID
+	if canonical, cerr := dicomio.CanonicalTransferSyntaxUID(fileTS); cerr == nil {
+		fileTS = canonical
+	}
+	if fileTS != context.transferSyntaxUID {
+		return &TransferSyntaxMismatchError{Negotiated: context.transferSyntaxUID, File: transferSyntaxUID}
+	}
+	cs, err := su.disp.newCommand(su.cm, context)
+	if err != nil {
+		return err
+	}
+	defer su.disp.deleteCommand(cs)
+	return runCStoreRawOnAssociation(cs.upcallCh, su.disp.downcallCh, su.cm, cs.messageID, sopClassUID, sopInstanceUID, data)
+}
+
 // QRLevel is used to specify the element hierarchy assumed during C-FIND,
 // C-GET, and C-MOVE. P3.4, C.3.
 //

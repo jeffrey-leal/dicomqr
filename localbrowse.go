@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -395,6 +394,7 @@ func showPushDialog(w fyne.Window, cfg *Settings, paths []string, description st
 			_ = client.StoreFiles(ctx, paths, func(p StoreProgress) {
 				if p.Err != nil {
 					nFail++
+					logError("push: failed %s: %v", filepath.Base(p.Path), p.Err)
 				} else {
 					nOK++
 				}
@@ -409,7 +409,7 @@ func showPushDialog(w fyne.Window, cfg *Settings, paths []string, description st
 				progressBar.SetValue(1)
 				msg := fmt.Sprintf("Done — %d sent", nOK)
 				if nFail > 0 {
-					msg += fmt.Sprintf(", %d failed", nFail)
+					msg += fmt.Sprintf(", %d failed (see Activity Log)", nFail)
 				}
 				statusLbl.SetText(msg)
 				pushBtn.Hide()
@@ -507,8 +507,9 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 					continue
 				}
 				thumbs = append(thumbs, seriesThumb{
-					label: model.labelFor(childID),
-					paths: ps,
+					label:    model.labelFor(childID),
+					modality: model.modalityFor(childID),
+					paths:    ps,
 				})
 			}
 			go showStudyOverviewWindow(a, w, previewTitle, thumbs)
@@ -750,7 +751,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 			})
 			if err == nil {
 				if dbErr := cat.replaceAll(studies, series, files); dbErr != nil {
-					log.Printf("catalog: replace after scan: %v", dbErr)
+					logError("catalog: replace after scan: %v", dbErr)
 				}
 			}
 			fyne.Do(func() {
@@ -903,7 +904,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 		if cat != nil && cfg.DownloadDir != "" && cat.Dir() != cfg.DownloadDir {
 			go func() {
 				if err := cat.Reopen(cfg.DownloadDir); err != nil {
-					log.Printf("catalog: reopen %s: %v", cfg.DownloadDir, err)
+					logError("catalog: reopen %s: %v", cfg.DownloadDir, err)
 					return
 				}
 				reloadFromDB("")

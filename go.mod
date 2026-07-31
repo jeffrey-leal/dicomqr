@@ -4,11 +4,13 @@ go 1.26.2
 
 require (
 	fyne.io/fyne/v2 v2.7.3
+	github.com/catppuccin/fyne v1.0.0
 	github.com/sqweek/dialog v0.0.0-20260123140253-64c163d53aac
 	modernc.org/sqlite v1.54.0
 )
 
 require (
+	github.com/catppuccin/go v0.3.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect

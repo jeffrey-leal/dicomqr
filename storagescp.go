@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -227,7 +226,7 @@ func (s *StorageSCP) Start() error {
 				policy = fmt.Sprintf("required transfer syntax %s (accepting %v for local conversion)",
 					req, p.AcceptedTransferSyntaxes[1:])
 			}
-			log.Printf("scp: association from %s (%s)", conn.RemoteAddr(), policy)
+			logInfo("scp: association from %s (%s)", conn.RemoteAddr(), policy)
 			go netdicom.RunProviderForConn(ctx, conn, p)
 		}
 	}()
@@ -279,7 +278,7 @@ func (s *StorageSCP) handleCStore(
 	// next Start.
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("scp: PANIC receiving %s: %v\n%s", sopInstanceUID, r, debug.Stack())
+			logError("scp: PANIC receiving %s: %v\n%s", sopInstanceUID, r, debug.Stack())
 			st = dimse.Status{Status: dimse.CStoreOutOfResources,
 				ErrorComment: fmt.Sprintf("receiver internal error: %v", r)}
 		}
@@ -349,7 +348,7 @@ func (s *StorageSCP) handleCStore(
 		changed, convErr := transcodeDICOMFile(tmpPath, req)
 		if convErr != nil {
 			s.skipped.Add(1)
-			log.Printf("scp: SKIPPED %s — cannot convert to %s: %v (series %q, SOP class %s); object not saved, retrieve continues",
+			logWarn("scp: SKIPPED %s — cannot convert to %s: %v (series %q, SOP class %s); object not saved, retrieve continues",
 				sopInstanceUID, transferSyntaxLabel(req), convErr, seriesDesc, sopClassUID)
 			os.Remove(tmpPath)
 			return dimse.Success
@@ -593,7 +592,7 @@ func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID str
 	if requiredTS != "" && transferSyntaxUID != requiredTS {
 		changed, convErr := transcodeDICOMFile(tmpPath, requiredTS)
 		if convErr != nil {
-			log.Printf("c-get: SKIPPED %s — cannot convert to %s: %v (series %q, SOP class %s); object not saved, retrieve continues",
+			logWarn("c-get: SKIPPED %s — cannot convert to %s: %v (series %q, SOP class %s); object not saved, retrieve continues",
 				sopInstanceUID, transferSyntaxLabel(requiredTS), convErr, seriesDesc, sopClassUID)
 			os.Remove(tmpPath)
 			return "", false, true, nil

@@ -4,7 +4,6 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -36,6 +35,8 @@ var defaultSettingsJSON []byte
 // Settings holds all persisted application preferences.
 type Settings struct {
 	DarkTheme    bool            `json:"darkTheme"`
+	UITheme      string          `json:"uiTheme"`      // colour theme pack ("" = stock Fyne theme; see themePackBase)
+	LogViewLevel string          `json:"logViewLevel"` // Activity Log view filter ("" = activity; see logViewOptions)
 	FontName     string          `json:"fontName"`
 	LocalAETitle string          `json:"localAETitle"`
 	LocalSCPPort int             `json:"localSCPPort"`
@@ -154,7 +155,7 @@ func loadSettings() Settings {
 // changes were lost without a trace).
 func saveSettings(s Settings) {
 	if err := saveSettingsE(s); err != nil {
-		log.Printf("settings: save failed: %v", err)
+		logError("settings: save failed: %v", err)
 	}
 }
 
@@ -181,7 +182,7 @@ func saveSettingsE(s Settings) error {
 	if err := atomicWriteJSON(path, data); err != nil {
 		return err
 	}
-	log.Printf("settings: saved %s", path)
+	logInfo("settings: saved %s", path)
 	return nil
 }
 

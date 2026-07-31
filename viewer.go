@@ -977,17 +977,31 @@ func decodeRawPixelFallback(data []byte, rows, cols, samplesPerPixel, bitsAlloc 
 // loadDicomImage parses a DICOM file and returns a windowed image.Image.
 // Only the first frame of multi-frame objects is rendered.
 func loadDicomImage(path string) (viewerState, error) {
+	// The parser pushes each frame into frameCh with a blocking send DURING
+	// ParseFile, so the channel must be drained concurrently: draining only
+	// after ParseFile returns deadlocks on any file with more frames than the
+	// channel buffer — NM/SPECT stores the whole acquisition as one file of
+	// 40-240 frames (CT/MR are one frame per file, which is why only NM
+	// studies froze the preview).
 	frameCh := make(chan *frame.Frame, 8)
+	collected := make(chan []*frame.Frame, 1)
+	go func() {
+		var fs []*frame.Frame
+		for f := range frameCh {
+			fs = append(fs, f)
+		}
+		collected <- fs
+	}()
 	ds, err := sdicom.ParseFile(path, frameCh)
 	if err != nil {
-		for range frameCh {
-		}
+		// The library closes frameCh only on success. After ParseFile returns
+		// no sender remains, so closing here is safe and lets the collector
+		// goroutine finish instead of blocking forever on the open channel.
+		close(frameCh)
+		<-collected
 		return viewerState{}, err
 	}
-	var frames []*frame.Frame
-	for f := range frameCh {
-		frames = append(frames, f)
-	}
+	frames := <-collected
 	if len(frames) == 0 {
 		return viewerState{}, errors.New("no pixel data in file")
 	}
@@ -1269,34 +1283,66 @@ func clampToUint8(v float64) uint8 {
 	return uint8(v)
 }
 
-// seriesThumb bundles a display label and the pre-sorted file paths for one
-// series, used by the study overview window.
+// seriesThumb bundles a display label, the series modality, and the pre-sorted
+// file paths for one series, used by the study overview window.
 type seriesThumb struct {
-	label string
-	paths []string // sorted by InstanceNumber
+	label    string
+	modality string // shown as the thumbnail stand-in when nothing is renderable
+	paths    []string // sorted by InstanceNumber
 }
 
-// thumbnailCell is a widget displaying a single DICOM thumbnail image with a
+// thumbSide is the square edge of a study-overview thumbnail.
+const thumbSide = 180
+
+// modalityPlaceholder builds the stand-in tile for a series with nothing to
+// display — SR, KO, PR and other non-image objects, or pixel data none of the
+// built-in decoders can render: a white square with the modality in black
+// bold text scaled to fill about 80% of the tile. Matches the study overview
+// in dicomhdr-java.
+func modalityPlaceholder(modality string) fyne.CanvasObject {
+	txt := strings.ToUpper(strings.TrimSpace(modality))
+	if txt == "" {
+		txt = "?"
+	}
+	t := canvas.NewText(txt, color.Black)
+	t.TextStyle = fyne.TextStyle{Bold: true}
+	// Measure at an arbitrary base size, then scale so the larger dimension
+	// fills 80% of the tile.
+	const base = 100
+	m := fyne.MeasureText(txt, base, t.TextStyle)
+	t.TextSize = base * thumbSide * 0.8 / fyne.Max(m.Width, m.Height)
+	bg := canvas.NewRectangle(color.White)
+	bg.SetMinSize(fyne.NewSize(thumbSide, thumbSide))
+	return container.NewStack(bg, container.NewCenter(t))
+}
+
+// thumbnailCell is a widget displaying a single DICOM thumbnail — the series'
+// middle-slice image, or the modality placeholder when it has none — with a
 // label below it. Double-tapping opens the full series viewer.
 type thumbnailCell struct {
 	widget.BaseWidget
-	imgObj *canvas.Image
-	lbl    *widget.Label
-	paths  []string
-	title  string
-	app    fyne.App
+	preview fyne.CanvasObject
+	lbl     *widget.Label
+	paths   []string
+	title   string
+	app     fyne.App
 }
 
-func newThumbnailCell(img image.Image, label, title string, paths []string, app fyne.App) *thumbnailCell {
+func newThumbnailCell(img image.Image, modality, label, title string, paths []string, app fyne.App) *thumbnailCell {
 	c := &thumbnailCell{
-		imgObj: canvas.NewImageFromImage(img),
-		lbl:    widget.NewLabelWithStyle(label, fyne.TextAlignCenter, fyne.TextStyle{}),
-		paths:  paths,
-		title:  title,
-		app:    app,
+		lbl:   widget.NewLabelWithStyle(label, fyne.TextAlignCenter, fyne.TextStyle{}),
+		paths: paths,
+		title: title,
+		app:   app,
 	}
-	c.imgObj.FillMode = canvas.ImageFillContain
-	c.imgObj.SetMinSize(fyne.NewSize(180, 180))
+	if img != nil {
+		imgObj := canvas.NewImageFromImage(img)
+		imgObj.FillMode = canvas.ImageFillContain
+		imgObj.SetMinSize(fyne.NewSize(thumbSide, thumbSide))
+		c.preview = imgObj
+	} else {
+		c.preview = modalityPlaceholder(modality)
+	}
 	c.lbl.Truncation = fyne.TextTruncateEllipsis
 	c.ExtendBaseWidget(c)
 	return c
@@ -1311,7 +1357,7 @@ func (c *thumbnailCell) DoubleTapped(_ *fyne.PointEvent) {
 func (c *thumbnailCell) CreateRenderer() fyne.WidgetRenderer {
 	c.ExtendBaseWidget(c)
 	return widget.NewSimpleRenderer(
-		container.NewBorder(nil, c.lbl, nil, nil, c.imgObj),
+		container.NewBorder(nil, c.lbl, nil, nil, c.preview),
 	)
 }
 
@@ -1397,11 +1443,9 @@ func showStudyOverviewWindow(a fyne.App, parent fyne.Window, title string, serie
 
 		cells := make([]fyne.CanvasObject, len(series))
 		for i, s := range series {
-			img := thumbs[i].img
-			if img == nil {
-				img = image.NewGray(image.Rect(0, 0, 1, 1))
-			}
-			cells[i] = newThumbnailCell(img, s.label, "DICOM Preview — "+s.label, s.paths, a)
+			// A nil image (no pixel data, or nothing the built-in decoders can
+			// render) selects the modality placeholder tile.
+			cells[i] = newThumbnailCell(thumbs[i].img, s.modality, s.label, "DICOM Preview — "+s.label, s.paths, a)
 		}
 
 		// GridWrap reflows cells top-left to bottom-right as the window is

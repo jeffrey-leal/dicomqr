@@ -1,5 +1,7 @@
 {
   "darkTheme": false,
+  "uiTheme": "",
+  "logViewLevel": "activity",
   "fontName": "",
   "localAETitle": "DICOMQR",
   "localSCPPort": 11112,

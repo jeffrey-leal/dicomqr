@@ -80,12 +80,30 @@ func acceptedSyntaxesFor(requiredTS string) []string {
 // decoder or the rewrite fails — the original file is left untouched on every
 // error path.
 func transcodeDICOMFile(path, targetTS string) (bool, error) {
+	tmpPath, changed, err := transcodeDICOMFileToTemp(path, targetTS, filepath.Dir(path))
+	if err != nil || !changed {
+		return false, err
+	}
+	// Rename over the original (atomic on NTFS; MoveFileEx replaces existing
+	// files) — the temp was created in the same directory for this reason.
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return false, err
+	}
+	return true, nil
+}
+
+// transcodeDICOMFileToTemp converts a COPY of path to targetTS, written as a
+// temp file in tmpDir; the source file is never touched. Returns ("", false,
+// nil) when the file is already in targetTS. On success the caller owns the
+// returned temp file and must remove or rename it.
+func transcodeDICOMFileToTemp(path, targetTS, tmpDir string) (string, bool, error) {
 	tsUID := fileTransferSyntaxUID(path)
 	if tsUID == "" {
-		return false, errors.New("cannot determine transfer syntax")
+		return "", false, errors.New("cannot determine transfer syntax")
 	}
 	if tsUID == targetTS {
-		return false, nil
+		return "", false, nil
 	}
 	// A rewrite is required. An uncompressed source only needs a VR re-encode;
 	// a compressed source must have a built-in decoder or we cannot proceed.
@@ -94,12 +112,12 @@ func transcodeDICOMFile(path, targetTS string) (bool, error) {
 		if n, known := unsupportedTransferSyntaxNames[tsUID]; known {
 			name = n + " (" + tsUID + ")"
 		}
-		return false, fmt.Errorf("no built-in decoder for %s", name)
+		return "", false, fmt.Errorf("no built-in decoder for %s", name)
 	}
 
 	ds, err := sdicom.ParseFile(path, nil)
 	if err != nil {
-		return false, fmt.Errorf("parse: %w", err)
+		return "", false, fmt.Errorf("parse: %w", err)
 	}
 
 	// Decompress encapsulated pixel data. Native pixel data and objects without
@@ -108,40 +126,37 @@ func transcodeDICOMFile(path, targetTS string) (bool, error) {
 	if pdElem, pdErr := ds.FindElementByTag(tag.PixelData); pdErr == nil {
 		info, ok := pdElem.Value.GetValue().(sdicom.PixelDataInfo)
 		if !ok {
-			return false, errors.New("unexpected PixelData value type")
+			return "", false, errors.New("unexpected PixelData value type")
 		}
 		if info.IsEncapsulated {
 			newInfo, colorOut, decErr := decompressPixelData(&ds, info, tsUID)
 			if decErr != nil {
-				return false, decErr
+				return "", false, decErr
 			}
 			newPD, elemErr := sdicom.NewElement(tag.PixelData, newInfo)
 			if elemErr != nil {
-				return false, elemErr
+				return "", false, elemErr
 			}
 			replaceElement(&ds, newPD)
 			if colorOut {
 				// Both decoders emit interleaved RGB for colour frames.
 				if err := setElementValue(&ds, tag.PhotometricInterpretation, []string{"RGB"}); err != nil {
-					return false, err
+					return "", false, err
 				}
 				if err := setElementValue(&ds, tag.PlanarConfiguration, []int{0}); err != nil {
-					return false, err
+					return "", false, err
 				}
 			}
 		}
 	}
 
 	if err := setElementValue(&ds, tag.TransferSyntaxUID, []string{targetTS}); err != nil {
-		return false, err
+		return "", false, err
 	}
 
-	// Write to a temp file in the same directory, then rename over the
-	// original (atomic on NTFS; MoveFileEx replaces existing files).
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".transcode_*.tmp")
+	tmp, err := os.CreateTemp(tmpDir, ".transcode_*.tmp")
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
 	tmpPath := tmp.Name()
 	writeErr := sdicom.Write(tmp, ds, sdicom.SkipVRVerification(), sdicom.SkipValueTypeVerification())
@@ -149,15 +164,11 @@ func transcodeDICOMFile(path, targetTS string) (bool, error) {
 	if writeErr != nil || closeErr != nil {
 		os.Remove(tmpPath)
 		if writeErr != nil {
-			return false, fmt.Errorf("re-encode: %w", writeErr)
+			return "", false, fmt.Errorf("re-encode: %w", writeErr)
 		}
-		return false, closeErr
+		return "", false, closeErr
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
-		return false, err
-	}
-	return true, nil
+	return tmpPath, true, nil
 }
 
 // mergeEncapsulatedFragments reassembles the fragments of one encapsulated

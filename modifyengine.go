@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -256,7 +255,7 @@ func runModificationToZip(ctx context.Context, files []string, rootDir, zipPath 
 	params modifyParams, rels map[string]string, progress func(done, total int)) modifyResult {
 
 	fail := func(err error) modifyResult {
-		log.Printf("modify: zip export %s failed: %v", zipPath, err)
+		logError("modify: zip export %s failed: %v", zipPath, err)
 		return modifyResult{Failed: len(files),
 			Failures: []modifyFailure{{File: zipPath, Error: err.Error()}}}
 	}
@@ -281,7 +280,7 @@ func runModificationToZip(ctx context.Context, files []string, rootDir, zipPath 
 	}
 	if ferr != nil {
 		os.Remove(tmpPath)
-		log.Printf("modify: zip export %s failed: %v", zipPath, ferr)
+		logError("modify: zip export %s failed: %v", zipPath, ferr)
 		res.Failures = append(res.Failures, modifyFailure{File: zipPath, Error: "finalize zip: " + ferr.Error()})
 		res.Failed += res.Processed
 		res.Processed = 0
@@ -339,7 +338,7 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 	)
 	total := len(jobs)
 	recordFailure := func(path string, err error) {
-		log.Printf("modify: failed %s: %v", path, err)
+		logError("modify: failed %s: %v", path, err)
 		mu.Lock()
 		res.Failed++
 		res.Failures = append(res.Failures, modifyFailure{File: path, Error: err.Error()})

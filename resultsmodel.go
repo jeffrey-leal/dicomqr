@@ -41,6 +41,7 @@ type resultNode struct {
 	studyDesc    string // study nodes
 	seriesNumber string // series nodes
 	seriesDesc   string // series nodes
+	modality     string // series nodes
 }
 
 // resultsModel is the data model backing the Fyne widget.Tree for query results.
@@ -138,9 +139,18 @@ func (m *resultsModel) addSeries(studyUID, seriesUID, modality, seriesNumber, se
 			parentID:          sID,
 			seriesNumber:      seriesNumber,
 			seriesDesc:        seriesDesc,
+			modality:          modality,
 		}
 		m.sortedInsert(&study.children, rID)
 	}
+}
+
+// modalityFor returns the modality of a series node ("" for other kinds).
+func (m *resultsModel) modalityFor(id string) string {
+	if n, ok := m.nodes[id]; ok {
+		return n.modality
+	}
+	return ""
 }
 
 func (m *resultsModel) parentOf(id string) string {

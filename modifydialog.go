@@ -11,7 +11,6 @@ import (
 	"context"
 	"fmt"
 	"image/color"
-	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -139,7 +138,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	for _, s := range resolved.Sets {
 		tagStr, value, ok := strings.Cut(s, "=")
 		if !ok || strings.TrimSpace(tagStr) == "" {
-			log.Printf("modify: ignoring malformed set entry %q in profile %q", s, profileName)
+			logWarn("modify: ignoring malformed set entry %q in profile %q", s, profileName)
 			continue
 		}
 		entry := widget.NewEntry()
@@ -521,7 +520,7 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 	}
 
 	go func() {
-		log.Printf("modify: profile %q, %d file(s) → %s", profileName, total, outDir)
+		logInfo("modify: profile %q, %d file(s) → %s", profileName, total, outDir)
 		onProgress := func(done, tot int) {
 			if done%10 == 0 || done == tot {
 				fyne.Do(func() {
@@ -536,7 +535,7 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 		} else {
 			res = runModification(ctx, files, rootDir, outDir, params, rels, onProgress)
 		}
-		log.Printf("modify: %q finished — %d written, %d skipped, %d failed, cancelled=%v → %s",
+		logInfo("modify: %q finished — %d written, %d skipped, %d failed, cancelled=%v → %s",
 			profileName, res.Processed, res.Skipped, res.Failed, res.Canceled, outDir)
 		fyne.Do(func() {
 			progressBar.SetValue(1)

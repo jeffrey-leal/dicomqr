@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -406,18 +409,52 @@ type StoreProgress struct {
 // onProgress is called after each file attempt. The goroutine checks ctx
 // between files so cancellation stops the loop promptly. Returns nil when all
 // files have been attempted; ctx.Err() when cancelled.
+//
+// Files are sent as stored bytes, verbatim (DICOM library policy, Phase 1):
+// the association offers each file's own transfer syntax so no re-encode —
+// and no data dictionary — is involved in the common case. A file whose
+// stored syntax the server did not accept is converted locally to the
+// negotiated uncompressed syntax (on a temp copy; sources are never touched)
+// and resent; a file that cannot be converted is reported and skipped.
 func (c *DicomClient) StoreFiles(ctx context.Context, paths []string, onProgress func(StoreProgress)) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
+	// Offer the union of the files' stored transfer syntaxes, then the two
+	// uncompressed syntaxes as universal fallbacks (Implicit VR LE is
+	// mandatory for every conformant implementation, PS3.5 §10.1).
+	seenTS := map[string]bool{}
+	var offerTS []string
+	addTS := func(ts string) {
+		if ts != "" && !seenTS[ts] {
+			seenTS[ts] = true
+			offerTS = append(offerTS, ts)
+		}
+	}
+	for _, p := range paths {
+		addTS(fileTransferSyntaxUID(p))
+	}
+	addTS(tsExplicitVRLE)
+	addTS(tsImplicitVRLE)
+
 	su, err := netdicom.NewServiceUser(netdicom.ServiceUserParams{
-		CalledAETitle:  c.profile.RemoteAETitle,
-		CallingAETitle: c.localAETitle,
-		SOPClasses:     sopclass.StorageClasses,
+		CalledAETitle:    c.profile.RemoteAETitle,
+		CallingAETitle:   c.localAETitle,
+		SOPClasses:       sopclass.StorageClasses,
+		TransferSyntaxes: offerTS,
 	})
 	if err != nil {
-		return fmt.Errorf("c-store: create service user: %w", err)
+		// A stored syntax the negotiation layer does not recognize must not
+		// sink the whole push — retry with the standard uncompressed set.
+		su, err = netdicom.NewServiceUser(netdicom.ServiceUserParams{
+			CalledAETitle:  c.profile.RemoteAETitle,
+			CallingAETitle: c.localAETitle,
+			SOPClasses:     sopclass.StorageClasses,
+		})
+		if err != nil {
+			return fmt.Errorf("c-store: create service user: %w", err)
+		}
 	}
 
 	type result struct{ err error }
@@ -433,13 +470,7 @@ func (c *DicomClient) StoreFiles(ctx context.Context, paths []string, onProgress
 				resultCh <- result{ctx.Err()}
 				return
 			}
-			ds, readErr := dicom.ReadDataSetFromFile(path, dicom.ReadOptions{})
-			var fileErr error
-			if readErr != nil {
-				fileErr = readErr
-			} else {
-				fileErr = su.CStore(ds)
-			}
+			fileErr := storeFileRaw(su, path)
 			if onProgress != nil {
 				onProgress(StoreProgress{Done: i + 1, Total: total, Path: path, Err: fileErr})
 			}
@@ -454,6 +485,53 @@ func (c *DicomClient) StoreFiles(ctx context.Context, paths []string, onProgress
 		abortAndReap(su, resultCh)
 		return ctx.Err()
 	}
+}
+
+// storeFileRaw sends one stored file verbatim over an established push
+// association. On a transfer-syntax mismatch it converts a temp copy to the
+// negotiated uncompressed syntax and resends; any other error — including an
+// unconvertible mismatch — is returned for per-file reporting.
+func storeFileRaw(su *netdicom.ServiceUser, path string) error {
+	ident, err := fileMetaIdentity(path)
+	if err != nil {
+		return fmt.Errorf("read file meta: %w", err)
+	}
+	sendFrom := func(p string, offset int64, ts string) error {
+		raw, rerr := os.ReadFile(p)
+		if rerr != nil {
+			return rerr
+		}
+		if int64(len(raw)) <= offset {
+			return errors.New("file holds no dataset after the meta group")
+		}
+		return su.CStoreRaw(ident.sopClassUID, ident.sopInstanceUID, ts, raw[offset:])
+	}
+
+	err = sendFrom(path, ident.datasetOffset, ident.transferSyntaxUID)
+	var mismatch *netdicom.TransferSyntaxMismatchError
+	if !errors.As(err, &mismatch) {
+		return err
+	}
+	if !isUncompressedOnDisk(mismatch.Negotiated) {
+		return fmt.Errorf("stored as %s but the server negotiated %s — no local conversion available",
+			transferSyntaxLabel(ident.transferSyntaxUID), transferSyntaxLabel(mismatch.Negotiated))
+	}
+	tmpPath, changed, terr := transcodeDICOMFileToTemp(path, mismatch.Negotiated, os.TempDir())
+	if terr != nil {
+		return fmt.Errorf("cannot convert %s to negotiated %s: %w",
+			transferSyntaxLabel(ident.transferSyntaxUID), transferSyntaxLabel(mismatch.Negotiated), terr)
+	}
+	if !changed {
+		return err // defensive: mismatch reported but file already in the negotiated syntax
+	}
+	defer os.Remove(tmpPath)
+	tmpIdent, ierr := fileMetaIdentity(tmpPath)
+	if ierr != nil {
+		return fmt.Errorf("read converted file meta: %w", ierr)
+	}
+	logInfo("c-store: %s converted %s → %s for push (server did not accept the stored syntax)",
+		filepath.Base(path), transferSyntaxLabel(ident.transferSyntaxUID), transferSyntaxLabel(mismatch.Negotiated))
+	return sendFrom(tmpPath, tmpIdent.datasetOffset, tmpIdent.transferSyntaxUID)
 }
 
 // WorklistResult holds one Modality Worklist C-FIND response item.
