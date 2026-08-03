@@ -14,12 +14,14 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	sdicom "github.com/suyashkumar/dicom"
@@ -27,130 +29,75 @@ import (
 	"github.com/suyashkumar/dicom/pkg/tag"
 )
 
-// dicomInstance pairs a .dcm file path with its InstanceNumber for sorting and
-// with the number of frames the file holds.
-type dicomInstance struct {
-	path           string
-	instanceNumber int
-	frames         int
-}
+// postUI hands a change to the UI goroutine. Every background path in the
+// viewer — clip buffering, filmstrip thumbnails, cine playback, on-demand frame
+// loads — goes through it rather than calling fyne.Do directly, so there is a
+// single definition of what "on the UI goroutine" means for the viewer.
+//
+// It is a variable because Fyne's test driver has no UI thread: it runs fyne.Do
+// inline on whichever goroutine calls it, so a windowed test would have
+// background work touching widgets in parallel with construction — which
+// corrupts Fyne's own state and panics. Tests substitute a version that
+// serialises the calls. In the shipped app this is exactly fyne.Do.
+var postUI = fyne.Do
 
 // viewerSlice identifies one navigable image in the viewer: a file plus the
 // zero-based index of a frame within that file. CT and MR store one frame per
 // file and so contribute a single slice each; NM/SPECT stores a whole
 // acquisition (40-240 frames) as one multi-frame file, which contributes one
 // slice per frame — without this the viewer would show only its first frame.
+//
+// Slices are the navigation model for series with no multi-frame instance. A
+// series that holds one navigates by chapter instead (see chapters.go), because
+// flattening every frame of every clip onto one slider is unusable for
+// ultrasound; slices are still what picks a series' middle frame for a
+// thumbnail.
 type viewerSlice struct {
 	path  string
 	frame int
 }
 
-// dicomInstanceInfo parses InstanceNumber and NumberOfFrames from a DICOM file
-// without reading pixel data. Both come from a single parse: ordering a series
-// already costs one header read per file, and the viewer needs every file's
-// frame count to build its slice list. NumberOfFrames is VR IS (a string), so
-// datasetInt — not dicomIntParam, which panics on string values — must read it.
-// An unreadable file reports one frame so it still occupies a slice and shows
-// its own load error when selected.
-func dicomInstanceInfo(path string) (instanceNumber, frames int) {
-	ds, err := sdicom.ParseFile(path, nil, sdicom.SkipPixelData())
-	if err != nil {
-		return 0, 1
-	}
-	frames = datasetInt(&ds, tag.NumberOfFrames, 1)
-	if frames < 1 {
-		frames = 1
-	}
-	return datasetInt(&ds, tag.InstanceNumber, 0), frames
-}
-
-// sortInstances orders instances by InstanceNumber, then by path.
-func sortInstances(instances []dicomInstance) {
-	sort.SliceStable(instances, func(i, j int) bool {
-		if instances[i].instanceNumber != instances[j].instanceNumber {
-			return instances[i].instanceNumber < instances[j].instanceNumber
-		}
-		return instances[i].path < instances[j].path
-	})
-}
-
-// expandFrames flattens ordered instances into the viewer's navigable slice
-// list, one entry per frame of each file.
-func expandFrames(instances []dicomInstance) []viewerSlice {
-	slices := make([]viewerSlice, 0, len(instances))
-	for _, inst := range instances {
-		n := inst.frames
-		if n < 1 {
-			n = 1
-		}
-		for f := 0; f < n; f++ {
-			slices = append(slices, viewerSlice{path: inst.path, frame: f})
+// expandFrames flattens ordered chapters into a navigable slice list, one entry
+// per frame of each file.
+func expandFrames(chapters []chapter) []viewerSlice {
+	slices := make([]viewerSlice, 0, len(chapters))
+	for _, c := range chapters {
+		for f := 0; f < maxInt(1, c.frames); f++ {
+			slices = append(slices, viewerSlice{path: c.path, frame: f})
 		}
 	}
 	return slices
 }
 
-// slicePaths returns the distinct file paths behind a slice list, in order.
-// Frames of one file are always adjacent, so a single-step comparison suffices.
-func slicePaths(slices []viewerSlice) []string {
-	var paths []string
-	for _, s := range slices {
-		if len(paths) == 0 || paths[len(paths)-1] != s.path {
-			paths = append(paths, s.path)
-		}
+// chapterPaths returns the chapters' file paths, in order.
+func chapterPaths(chapters []chapter) []string {
+	paths := make([]string, len(chapters))
+	for i, c := range chapters {
+		paths[i] = c.path
 	}
 	return paths
 }
 
-// collectDicomFiles walks dir and returns the navigable slices of every .dcm
-// file it contains, ordered by InstanceNumber and expanded frame by frame.
-func collectDicomFiles(dir string) ([]viewerSlice, error) {
-	var instances []dicomInstance
+// collectDicomFiles walks dir and returns one chapter per .dcm file it holds,
+// ordered by InstanceNumber.
+func collectDicomFiles(dir string) ([]chapter, error) {
+	var paths []string
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil || info.IsDir() {
 			return nil
 		}
 		if strings.EqualFold(filepath.Ext(path), ".dcm") {
-			num, frames := dicomInstanceInfo(path)
-			instances = append(instances, dicomInstance{
-				path:           path,
-				instanceNumber: num,
-				frames:         frames,
-			})
+			paths = append(paths, path)
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	if len(instances) == 0 {
+	if len(paths) == 0 {
 		return nil, errors.New("no DICOM files found in: " + dir)
 	}
-	sortInstances(instances)
-	return expandFrames(instances), nil
-}
-
-// sortDicomSlices returns the navigable slices of rawPaths, ordered by DICOM
-// InstanceNumber and expanded frame by frame.
-func sortDicomSlices(rawPaths []string) []viewerSlice {
-	return sortDicomSlicesProgress(rawPaths, nil)
-}
-
-// sortDicomSlicesProgress is sortDicomSlices with an optional progress
-// callback, invoked after each file's header parse with the count completed so
-// far. Parsing every file takes seconds for large series, so callers driving a
-// busy indicator use this form.
-func sortDicomSlicesProgress(rawPaths []string, progress func(done int)) []viewerSlice {
-	instances := make([]dicomInstance, len(rawPaths))
-	for i, p := range rawPaths {
-		num, frames := dicomInstanceInfo(p)
-		instances[i] = dicomInstance{path: p, instanceNumber: num, frames: frames}
-		if progress != nil {
-			progress(i + 1)
-		}
-	}
-	sortInstances(instances)
-	return expandFrames(instances)
+	return scanChapters(paths, nil), nil
 }
 
 // imageAnnotations holds the overlay text for a single DICOM image, organised
@@ -1474,19 +1421,19 @@ func modalityPlaceholder(modality string) fyne.CanvasObject {
 // label below it. Double-tapping opens the full series viewer.
 type thumbnailCell struct {
 	widget.BaseWidget
-	preview fyne.CanvasObject
-	lbl     *widget.Label
-	slices  []viewerSlice
-	title   string
-	app     fyne.App
+	preview  fyne.CanvasObject
+	lbl      *widget.Label
+	chapters []chapter
+	title    string
+	app      fyne.App
 }
 
-func newThumbnailCell(img image.Image, modality, label, title string, slices []viewerSlice, app fyne.App) *thumbnailCell {
+func newThumbnailCell(img image.Image, modality, label, title string, chapters []chapter, app fyne.App) *thumbnailCell {
 	c := &thumbnailCell{
-		lbl:    widget.NewLabelWithStyle(label, fyne.TextAlignCenter, fyne.TextStyle{}),
-		slices: slices,
-		title:  title,
-		app:    app,
+		lbl:      widget.NewLabelWithStyle(label, fyne.TextAlignCenter, fyne.TextStyle{}),
+		chapters: chapters,
+		title:    title,
+		app:      app,
 	}
 	if img != nil {
 		imgObj := canvas.NewImageFromImage(img)
@@ -1503,8 +1450,8 @@ func newThumbnailCell(img image.Image, modality, label, title string, slices []v
 
 // DoubleTapped opens the full series viewer for this thumbnail's files.
 func (c *thumbnailCell) DoubleTapped(_ *fyne.PointEvent) {
-	slices, title, app := c.slices, c.title, c.app
-	go openViewerWindow(app, title, slices, nil)
+	chapters, title, app := c.chapters, c.title, c.app
+	go openViewerWindow(app, title, chapters, nil)
 }
 
 func (c *thumbnailCell) CreateRenderer() fyne.WidgetRenderer {
@@ -1573,7 +1520,7 @@ func showStudyOverviewWindow(a fyne.App, parent fyne.Window, title string, serie
 	// multi-frame acquisition (NM/SPECT) shows its central slice rather than
 	// its first frame.
 	thumbs := make([]viewerState, len(series))
-	sorted := make([][]viewerSlice, len(series))
+	sorted := make([][]chapter, len(series))
 	var loaded atomic.Int32
 	var wg sync.WaitGroup
 	for i, s := range series {
@@ -1582,9 +1529,9 @@ func showStudyOverviewWindow(a fyne.App, parent fyne.Window, title string, serie
 		go func() {
 			defer wg.Done()
 			if len(s.paths) > 0 {
-				slices := sortDicomSlices(s.paths)
-				sorted[i] = slices
-				if len(slices) > 0 {
+				chapters := scanChapters(s.paths, nil)
+				sorted[i] = chapters
+				if slices := expandFrames(chapters); len(slices) > 0 {
 					mid := slices[len(slices)/2]
 					vs, err := loadDicomFrame(mid.path, mid.frame)
 					if err == nil {
@@ -1638,9 +1585,9 @@ func showStudyOverviewWindow(a fyne.App, parent fyne.Window, title string, serie
 // Must be called from a non-UI goroutine.
 func showDicomViewer(a fyne.App, parent fyne.Window, folder string) {
 	busy := showBusyDialog(parent, "Generating preview", "Scanning folder for DICOM files…")
-	slices, collectErr := collectDicomFiles(folder)
+	chapters, collectErr := collectDicomFiles(folder)
 	busy.hide()
-	openViewerWindow(a, "DICOM Preview — "+filepath.Base(folder), slices, collectErr)
+	openViewerWindow(a, "DICOM Preview — "+filepath.Base(folder), chapters, collectErr)
 }
 
 // showDicomViewerPaths opens the DICOM preview window for a specific set of files.
@@ -1660,7 +1607,7 @@ func showDicomViewerPaths(a fyne.App, parent fyne.Window, title string, rawPaths
 	total := len(rawPaths)
 	busy := showBusyDialog(parent, "Generating series preview",
 		fmt.Sprintf("Sorting images (0/%d)…", total))
-	sorted := sortDicomSlicesProgress(rawPaths, func(done int) {
+	chapters := scanChapters(rawPaths, func(done int) {
 		// Throttle updates: one per 50 files is smooth enough and avoids
 		// flooding the UI event queue on multi-thousand-image series.
 		if done%50 == 0 || done == total {
@@ -1668,7 +1615,7 @@ func showDicomViewerPaths(a fyne.App, parent fyne.Window, title string, rawPaths
 		}
 	})
 	busy.hide()
-	openViewerWindow(a, title, sorted, nil)
+	openViewerWindow(a, title, chapters, nil)
 }
 
 // presetNames returns the ordered preset names of a list for the dropdown.
@@ -1821,6 +1768,23 @@ func (v *imageViewport) setContent(df *decodedFrame, wc, ww float64, ann imageAn
 	v.renderBase(wc, ww)
 	v.applyDisplay()
 	v.refreshOverlay()
+}
+
+// setPlaybackFrame swaps in another frame of the same clip — same dimensions,
+// same window, same annotations — so it skips the annotation rebuild, the
+// buffer reset and the zoom/pan recalculation that setContent performs. This is
+// the per-frame cine path, which runs at up to 60 fps: at that rate rebuilding
+// the eight annotation objects costs more than the image swap itself and makes
+// the overlay flicker. The counter and on-image annotation are brought back
+// into agreement when playback stops.
+func (v *imageViewport) setPlaybackFrame(df *decodedFrame, idx int) {
+	if df == nil {
+		return
+	}
+	v.frame = df
+	v.idx = idx
+	v.renderBase(v.wc, v.ww)
+	v.applyDisplay()
 }
 
 // renderBase produces v.base for the current frame at (wc, ww). For grayscale
@@ -2052,22 +2016,70 @@ func (r *viewportRenderer) Refresh()                     { canvas.Refresh(r.v) }
 func (r *viewportRenderer) Objects() []fyne.CanvasObject { return r.objects }
 func (r *viewportRenderer) Destroy()                     {}
 
+// stableMinLayout sizes its single child to the full container and reports a
+// high-water-mark MinSize — the largest the child's min has ever been. It
+// exists to keep rapidly changing status text from perturbing the window's
+// minimum size: any canvas min-size change makes Fyne re-apply the window's
+// size limits (EnsureMinSize → fitContent → SetSizeLimits), and GLFW's Windows
+// implementation of SetSizeLimits is MoveWindow(..., repaint=TRUE) — a full
+// repaint of the window including its OS frame. At cine-playback rate (the
+// frame counter re-labels ~10×/s, and a proportional font gives "Frame 31 /
+// 72" and "Frame 32 / 72" different widths) that is a storm of frame repaints,
+// visible as flickering lines around and behind the window while a clip plays.
+// The min may still grow the first few times a longer text appears; it never
+// shrinks, which for a viewer window is harmless — and after one loop of a
+// clip every width has been seen and it stops changing entirely.
+type stableMinLayout struct {
+	max fyne.Size
+}
+
+func (l *stableMinLayout) MinSize(objs []fyne.CanvasObject) fyne.Size {
+	for _, o := range objs {
+		l.max = l.max.Max(o.MinSize())
+	}
+	return l.max
+}
+
+func (l *stableMinLayout) Layout(objs []fyne.CanvasObject, size fyne.Size) {
+	for _, o := range objs {
+		o.Resize(size)
+		o.Move(fyne.Position{})
+	}
+}
+
+// stableMin wraps a widget whose text changes at display rate (frame counter,
+// W/L info, chapter label) so those changes cannot alter the window's minimum
+// size — see stableMinLayout.
+func stableMin(obj fyne.CanvasObject) fyne.CanvasObject {
+	return container.New(&stableMinLayout{}, obj)
+}
+
 // openViewerWindow creates and shows the interactive DICOM image viewer window.
 // Must be called from a non-UI goroutine; all widget creation is via fyne.Do.
-func openViewerWindow(a fyne.App, title string, slices []viewerSlice, collectErr error) {
+//
+// The window navigates in one of two modes, decided by the series itself:
+//
+//   - Slice mode, for a series of single-frame instances (CT, MR): one slider
+//     position per image, as it has always been.
+//   - Chapter mode, when any instance holds more than one frame: one chapter per
+//     instance, the slider scoped to the chapter on screen, and a cine transport
+//     with a filmstrip beneath. Flattening a 173-instance echo study onto one
+//     5256-position slider — no seam between loops, no way to play any of them —
+//     is what this exists to avoid.
+func openViewerWindow(a fyne.App, title string, chapters []chapter, collectErr error) {
 	// Route non-image modalities (SR, KO, AU, PR) to the document viewer.
-	if collectErr == nil && len(slices) > 0 {
-		paths := slicePaths(slices)
+	if collectErr == nil && len(chapters) > 0 {
+		paths := chapterPaths(chapters)
 		if mod := seriesModality(paths); isDocumentModality(mod) {
 			openSRWindow(a, title, paths)
 			return
 		}
 	}
 
-	fyne.Do(func() {
+	postUI(func() {
 		win := a.NewWindow(title)
 
-		if collectErr != nil || len(slices) == 0 {
+		if collectErr != nil || len(chapters) == 0 {
 			msg := "No DICOM files found."
 			if collectErr != nil {
 				msg = collectErr.Error()
@@ -2078,12 +2090,30 @@ func openViewerWindow(a fyne.App, title string, slices []viewerSlice, collectErr
 			return
 		}
 
-		total := len(slices)
-		current := total / 2 // open at the middle slice
+		// A series holding a multi-frame instance plays as chapters; anything else
+		// keeps the plain one-position-per-image slider.
+		chapterMode := anyMultiFrame(chapters)
+		slices := expandFrames(chapters)
+		if chapterMode {
+			logInfo("viewer: chapter mode — %d chapters, %d frames (%s)",
+				len(chapters), totalChapterFrames(chapters), title)
+		}
 
-		// One parsed file is cached for the lifetime of this window, so
-		// scrolling through a multi-frame acquisition decodes a single frame per
-		// step instead of re-parsing the whole file each time.
+		// Navigation state. In slice mode current indexes slices; in chapter mode
+		// it is the frame within the active chapter and curChapter is the file.
+		curChapter := len(chapters) / 2
+		current := 0
+		total := len(slices)
+		if chapterMode {
+			total = chapters[curChapter].frames
+		} else {
+			current = total / 2 // open at the middle slice
+		}
+
+		// One parsed file is cached for the lifetime of this window, so scrolling
+		// through a multi-frame acquisition decodes a single frame per step
+		// instead of re-parsing the whole file each time. In chapter mode this is
+		// the on-demand path for frames the clip buffer has not reached.
 		cache := &dicomFileCache{}
 
 		viewport := newImageViewport()
@@ -2098,8 +2128,9 @@ func openViewerWindow(a fyne.App, title string, slices []viewerSlice, collectErr
 		counterLbl := widget.NewLabel(fmt.Sprintf("— / %d", total))
 		counterLbl.Alignment = fyne.TextAlignCenter
 
-		slider := widget.NewSlider(0, float64(total-1))
+		slider := widget.NewSlider(0, float64(maxInt(1, total)-1))
 		slider.Step = 1
+		sliderMuting := false // guards programmatic slider moves during playback
 
 		// Window state shared across slices. userAdjusted means the user dragged
 		// W/L (or it is otherwise custom); presetName tracks the active preset.
@@ -2153,55 +2184,345 @@ func openViewerWindow(a fyne.App, title string, slices []viewerSlice, collectErr
 			}
 		}
 
-		// Forward-declared so loadAndShow can reference it before its full initialisation.
+		// Forward-declared so the display path can reference them before their
+		// full initialisation.
 		var overlayCheck *widget.Check
+		var cineRow *fyne.Container
+		var strip *chapterStrip
+		var playBtn *widget.Button
+		var sweepCheck *widget.Check
+		var fpsSelect *widget.Select
+		var prevBtn, nextBtn *widget.Button
+		var chapterLbl *widget.Label
+		var updateCounter func()
+		var selectChapter func(index int)
+
+		// ── Cine state (chapter mode only) ────────────────────────────────────
+		//
+		// Each chapter remembers where it was left, at what rate, and whether it
+		// was playing, so leaving a loop and coming back resumes it as it was.
+		type chapterViewState struct {
+			frame   int
+			fps     float64
+			bounce  bool
+			playing bool
+		}
+		chapterStates := make([]chapterViewState, len(chapters))
+		for i, c := range chapters {
+			// Opening on the middle frame matches the filmstrip thumbnail and the
+			// "open at the middle slice" rule the viewer already follows.
+			chapterStates[i] = chapterViewState{frame: c.frames / 2, fps: c.fps, bounce: c.bounce}
+		}
+		player := newCinePlayer()
+		// The buffer is read by the player's readiness gate on its own goroutine,
+		// so it is held in an atomic rather than a plain variable.
+		var clipRef atomic.Pointer[clipBuffer]
+		lastCounterSync := time.Now()
+
+		// applyState puts a fully decoded frame on screen: the full path, taken on
+		// every load that may change modality, dimensions or window.
+		applyState := func(st viewerState, idx, span int, keepView bool) {
+			// Pick the modality-appropriate preset set and colour map on the
+			// first frame (and on the rare chance the modality changes mid-series).
+			if st.frame.modality != currentModality {
+				currentModality = st.frame.modality
+				presetList = presetsForModality(currentModality)
+				presetMuting = true
+				presetSelect.Options = presetNames(presetList)
+				presetSelect.SetSelected("Default")
+				presetSelect.Refresh()
+				presetMuting = false
+				presetName = "Default"
+				userAdjusted = false
+
+				curMapName = defaultColorMapForModality(currentModality)
+				colorMuting = true
+				colorSelect.SetSelected(curMapName)
+				colorMuting = false
+				viewport.curMap = colorMapByName(curMapName) // used by setContent below
+			}
+			wc, ww := targetWindow(st.frame)
+			curWC, curWW = wc, ww
+			viewport.setContent(st.frame, wc, ww, st.ann, idx, span, keepView)
+			setInfo(st.frame, wc, ww)
+			if len(st.frame.overlays) > 0 {
+				overlayCheck.Show()
+			}
+			if st.frame.windowable() {
+				presetSelect.Enable()
+				colorSelect.Enable()
+			} else {
+				presetSelect.Disable()
+				colorSelect.Disable()
+			}
+		}
+
+		// ── Slice mode display ────────────────────────────────────────────────
 
 		loadAndShow := func(idx int, keepView bool) {
 			counterLbl.SetText(fmt.Sprintf("%d / %d  (loading…)", idx+1, total))
 			go func() {
 				st, err := cache.load(slices[idx].path, slices[idx].frame)
-				fyne.Do(func() {
+				postUI(func() {
 					if err != nil {
 						infoLabel.SetText("Error: " + err.Error())
 						counterLbl.SetText(fmt.Sprintf("%d / %d", idx+1, total))
 						return
 					}
-					// Pick the modality-appropriate preset set and colour map on the
-					// first frame (and on the rare chance the modality changes mid-series).
-					if st.frame.modality != currentModality {
-						currentModality = st.frame.modality
-						presetList = presetsForModality(currentModality)
-						presetMuting = true
-						presetSelect.Options = presetNames(presetList)
-						presetSelect.SetSelected("Default")
-						presetSelect.Refresh()
-						presetMuting = false
-						presetName = "Default"
-						userAdjusted = false
-
-						curMapName = defaultColorMapForModality(currentModality)
-						colorMuting = true
-						colorSelect.SetSelected(curMapName)
-						colorMuting = false
-						viewport.curMap = colorMapByName(curMapName) // used by setContent below
-					}
-					wc, ww := targetWindow(st.frame)
-					curWC, curWW = wc, ww
-					viewport.setContent(st.frame, wc, ww, st.ann, idx, total, keepView)
-					setInfo(st.frame, wc, ww)
-					if len(st.frame.overlays) > 0 {
-						overlayCheck.Show()
-					}
-					if st.frame.windowable() {
-						presetSelect.Enable()
-						colorSelect.Enable()
-					} else {
-						presetSelect.Disable()
-						colorSelect.Disable()
-					}
+					applyState(st, idx, total, keepView)
 					counterLbl.SetText(fmt.Sprintf("%d / %d", idx+1, total))
 				})
 			}()
+		}
+
+		// ── Chapter mode display ──────────────────────────────────────────────
+
+		// showChapterFrame shows a frame of the active chapter. A buffered frame
+		// is applied synchronously — that is the playback path, and it must not
+		// queue a goroutine per frame; anything else (a frame the buffer has not
+		// reached, or the first frame of a newly selected chapter) takes the
+		// ordinary on-demand route, so a chapter is scrubbable while it buffers.
+		showChapterFrame := func(frame int, keepView bool) {
+			c := chapters[curChapter]
+			clip := clipRef.Load()
+			if df := clip.frame(frame); df != nil {
+				ann := imageAnnotations{}
+				if a := clip.annotations(); a != nil {
+					ann = *a
+				}
+				applyState(viewerState{frame: df, ann: ann}, frame, c.frames, keepView)
+				updateCounter()
+				return
+			}
+			counterLbl.SetText(fmt.Sprintf("Frame %d / %d  (loading…)", frame+1, c.frames))
+			path := c.path
+			go func() {
+				st, err := cache.load(path, frame)
+				postUI(func() {
+					if path != chapters[curChapter].path {
+						return // the user moved on while this was loading
+					}
+					if err != nil {
+						infoLabel.SetText("Error: " + err.Error())
+						updateCounter()
+						return
+					}
+					applyState(st, frame, chapters[curChapter].frames, keepView)
+					updateCounter()
+				})
+			}()
+		}
+
+		// updateCounter writes "Frame 31 / 72", plus the buffer's state while it
+		// still matters: filling progress, or — for a clip too large to hold
+		// whole — how much of it the player can actually loop.
+		updateCounter = func() {
+			if !chapterMode {
+				counterLbl.SetText(fmt.Sprintf("%d / %d", current+1, total))
+				return
+			}
+			c := chapters[curChapter]
+			text := fmt.Sprintf("Frame %d / %d", current+1, c.frames)
+			if clip := clipRef.Load(); clip != nil {
+				switch {
+				case !clip.isComplete():
+					text += fmt.Sprintf("   (buffering %d / %d)", clip.decodedCount(), clip.capacity())
+				case clip.truncated():
+					text += fmt.Sprintf("   (too large to buffer whole — looping frames 1–%d)", clip.capacity())
+				}
+			}
+			counterLbl.SetText(text)
+		}
+
+		setPlaying := func(playing bool) {
+			if playing {
+				playBtn.SetIcon(theme.MediaPauseIcon())
+			} else {
+				playBtn.SetIcon(theme.MediaPlayIcon())
+			}
+		}
+
+		// ── Player wiring ─────────────────────────────────────────────────────
+
+		player.setReadiness(func(frame int) bool {
+			clip := clipRef.Load()
+			return clip == nil || clip.isReady(frame)
+		})
+		player.setOnFrame(func(frame int) {
+			// Posted from the player goroutine; a post that survives a chapter
+			// change or a stop is stale and must be dropped rather than shown
+			// against the wrong clip.
+			if !chapterMode || !player.isRunning() || frame >= chapters[curChapter].frames {
+				return
+			}
+			clip := clipRef.Load()
+			df := clip.frame(frame)
+			if df == nil {
+				return
+			}
+			current = frame
+			viewport.setPlaybackFrame(df, frame)
+			// The slider and counter are text and layout work; at 30-60 fps they
+			// cost more than the image swap and add nothing between refreshes, so
+			// they follow at ~10 Hz. Both are synced exactly when playback stops.
+			if time.Since(lastCounterSync) >= 100*time.Millisecond {
+				lastCounterSync = time.Now()
+				sliderMuting = true
+				slider.SetValue(float64(frame))
+				sliderMuting = false
+				updateCounter()
+			}
+		})
+
+		// syncAfterPlayback brings the slider, counter and on-image annotation
+		// back into exact agreement with the frame on screen once the throttled
+		// updates above stop arriving.
+		syncAfterPlayback := func() {
+			sliderMuting = true
+			slider.SetValue(float64(current))
+			sliderMuting = false
+			viewport.idx = current
+			viewport.refreshOverlay()
+			updateCounter()
+		}
+
+		pausePlayback := func() {
+			if !player.isRunning() {
+				return
+			}
+			player.stopPlayback()
+			chapterStates[curChapter].playing = false
+			setPlaying(false)
+			syncAfterPlayback()
+		}
+
+		// ── Chapter selection ─────────────────────────────────────────────────
+
+		selectChapter = func(index int) {
+			if index < 0 || index >= len(chapters) || index == curChapter {
+				return
+			}
+			// Save the outgoing chapter so returning to it resumes where it was.
+			// curChapter is -1 on the opening switch, when there is no outgoing
+			// chapter and nothing to carry over.
+			resumePlaying := false
+			if curChapter >= 0 {
+				resumePlaying = player.isRunning()
+				chapterStates[curChapter] = chapterViewState{
+					frame:   current,
+					fps:     player.currentFPS(),
+					bounce:  player.isBounce(),
+					playing: resumePlaying,
+				}
+			}
+			player.stopPlayback()
+			if old := clipRef.Load(); old != nil {
+				old.cancel()
+			}
+
+			curChapter = index
+			c := chapters[index]
+			remembered := chapterStates[index]
+			current = clampInt(remembered.frame, 0, maxInt(0, c.frames-1))
+			total = c.frames
+
+			clipRef.Store(startClipBuffer(c, func(decoded int) {
+				clip := clipRef.Load()
+				if clip == nil || clip.chapter.path != chapters[curChapter].path {
+					return // progress from a chapter already switched away from
+				}
+				if clip.truncated() {
+					// Confine the loop to the frames that fit rather than letting
+					// the player stall at the boundary. Frames past the buffer stay
+					// reachable by scrubbing.
+					player.setRange(0, clip.capacity()-1)
+				}
+				updateCounter()
+			}))
+
+			slider.Max = float64(maxInt(1, c.frames) - 1)
+			sliderMuting = true
+			slider.SetValue(float64(current))
+			sliderMuting = false
+			slider.Refresh()
+
+			player.configure(c.loopFrom, c.loopTo, remembered.fps, remembered.bounce, current)
+
+			// Transport reflects the incoming chapter, muted so restoring a
+			// remembered rate does not read as a user change.
+			playable := c.playable()
+			if playable {
+				playBtn.Enable()
+				sweepCheck.Enable()
+				fpsSelect.Enable()
+			} else {
+				playBtn.Disable()
+				sweepCheck.Disable()
+				fpsSelect.Disable()
+			}
+			sweepCheck.OnChanged = nil
+			sweepCheck.SetChecked(remembered.bounce)
+			sweepCheck.OnChanged = func(checked bool) {
+				player.setBounce(checked)
+				chapterStates[curChapter].bounce = checked
+			}
+			onFPSChanged := fpsSelect.OnChanged
+			fpsSelect.OnChanged = nil
+			fpsSelect.SetSelected(fpsOptionFor(remembered.fps, c.fps))
+			fpsSelect.OnChanged = onFPSChanged
+
+			prevBtn.Enable()
+			nextBtn.Enable()
+			if index == 0 {
+				prevBtn.Disable()
+			}
+			if index == len(chapters)-1 {
+				nextBtn.Disable()
+			}
+			chapterLbl.SetText(fmt.Sprintf("Chapter %d / %d  —  %s",
+				index+1, len(chapters), c.label))
+			if strip != nil {
+				strip.selectIndex(index)
+			}
+
+			// The incoming instance may differ in modality, dimensions and window,
+			// so the first frame of a new chapter takes the full path.
+			showChapterFrame(current, false)
+
+			resumePlaying = resumePlaying && playable
+			if resumePlaying {
+				player.start()
+			}
+			setPlaying(resumePlaying)
+		}
+
+		// ── Shared navigation ─────────────────────────────────────────────────
+
+		// gotoPosition moves to a slider position in whichever mode is active.
+		gotoPosition := func(pos int) {
+			if chapterMode {
+				if pos == current {
+					return
+				}
+				current = pos
+				// Scrubbing while a chapter plays does not fight the player: it is
+				// told where the user went and carries on from there.
+				player.setCurrentFrame(pos)
+				showChapterFrame(pos, true)
+				return
+			}
+			if pos == current {
+				return
+			}
+			current = pos
+			loadAndShow(pos, true)
+		}
+
+		slider.OnChanged = func(vf float64) {
+			if sliderMuting {
+				return
+			}
+			gotoPosition(int(vf))
 		}
 
 		viewport.onScroll = func(delta int) {
@@ -2237,15 +2558,6 @@ func openViewerWindow(a fyne.App, title string, slices []viewerSlice, collectErr
 			viewport.reWindow(wc, ww)
 		}
 
-		slider.OnChanged = func(vf float64) {
-			idx := int(vf)
-			if idx == current {
-				return
-			}
-			current = idx
-			loadAndShow(idx, true)
-		}
-
 		annCheck := widget.NewCheck("Annotations", func(checked bool) {
 			a.Preferences().SetBool("showAnnotations", checked)
 			viewport.setShowAnn(checked)
@@ -2264,8 +2576,60 @@ func openViewerWindow(a fyne.App, title string, slices []viewerSlice, collectErr
 			presetSelect.SetSelected("Default") // fires OnChanged → reset window
 		})
 
-		// Keyboard: arrows/page = slice navigation; +/- = zoom; R = reset window;
-		// Home/F = reset zoom & pan.
+		// ── Transport row and filmstrip ───────────────────────────────────────
+
+		togglePlay := func() {
+			if !chapterMode || !chapters[curChapter].playable() {
+				return
+			}
+			if player.isRunning() {
+				pausePlayback()
+				return
+			}
+			player.setCurrentFrame(current)
+			player.start()
+			chapterStates[curChapter].playing = true
+			setPlaying(true)
+		}
+
+		playBtn = widget.NewButtonWithIcon("", theme.MediaPlayIcon(), togglePlay)
+		sweepCheck = widget.NewCheck("Sweep", nil)
+		fpsSelect = widget.NewSelect(fpsOptions, nil)
+		fpsSelect.OnChanged = func(opt string) {
+			if !chapterMode {
+				return
+			}
+			fps := fpsFromOption(opt, chapters[curChapter].fps)
+			player.setFPS(fps)
+			chapterStates[curChapter].fps = fps
+		}
+		prevBtn = widget.NewButtonWithIcon("", theme.NavigateBackIcon(), func() {
+			selectChapter(curChapter - 1)
+		})
+		nextBtn = widget.NewButtonWithIcon("", theme.NavigateNextIcon(), func() {
+			selectChapter(curChapter + 1)
+		})
+		chapterLbl = widget.NewLabel("")
+
+		if chapterMode {
+			transport := container.NewHBox(
+				playBtn, sweepCheck,
+				widget.NewLabel("Rate:"), fpsSelect,
+				widget.NewLabel("  "), prevBtn, nextBtn, stableMin(chapterLbl),
+			)
+			// A one-chapter series (a single multi-frame NM/SPECT file, typically)
+			// gains the transport but has nothing to pick from, so the filmstrip
+			// would be a single cell of clutter.
+			if len(chapters) > 1 {
+				strip = newChapterStrip(chapters, func(index int) { selectChapter(index) })
+				cineRow = container.NewVBox(transport, strip.object())
+			} else {
+				cineRow = container.NewVBox(transport)
+			}
+		}
+
+		// Keyboard: arrows/page = frame navigation; +/- = zoom; R = reset window;
+		// Home/F = reset zoom & pan; Space = play/pause.
 		win.Canvas().SetOnTypedKey(func(e *fyne.KeyEvent) {
 			switch e.Name {
 			case fyne.KeyUp, fyne.KeyLeft, fyne.KeyPageUp:
@@ -2276,6 +2640,8 @@ func openViewerWindow(a fyne.App, title string, slices []viewerSlice, collectErr
 				if current < total-1 {
 					slider.SetValue(float64(current + 1))
 				}
+			case fyne.KeySpace:
+				togglePlay()
 			case fyne.KeyPlus, fyne.KeyEqual:
 				viewport.zoom = clampFloat(viewport.zoom*1.25, 1, 16)
 				viewport.applyDisplay()
@@ -2288,26 +2654,88 @@ func openViewerWindow(a fyne.App, title string, slices []viewerSlice, collectErr
 				presetSelect.SetSelected("Default")
 			}
 		})
+		if chapterMode {
+			win.Canvas().AddShortcut(
+				&desktop.CustomShortcut{KeyName: fyne.KeyLeft, Modifier: fyne.KeyModifierControl},
+				func(fyne.Shortcut) { selectChapter(curChapter - 1) })
+			win.Canvas().AddShortcut(
+				&desktop.CustomShortcut{KeyName: fyne.KeyRight, Modifier: fyne.KeyModifierControl},
+				func(fyne.Shortcut) { selectChapter(curChapter + 1) })
+		}
 
 		controls := container.NewHBox(
 			widget.NewLabel("Window:"), presetSelect,
 			widget.NewLabel("Colour:"), colorSelect,
 			annCheck, overlayCheck, resetBtn,
 		)
-		bottom := container.NewVBox(
-			container.NewCenter(counterLbl),
+		bottomItems := []fyne.CanvasObject{
+			stableMin(counterLbl), // counterLbl centres its own text
 			slider,
-			container.NewBorder(nil, nil, controls, nil, infoLabel),
-		)
+			container.NewBorder(nil, nil, controls, nil, stableMin(infoLabel)),
+		}
+		if cineRow != nil {
+			bottomItems = append(bottomItems, cineRow)
+		}
+		bottom := container.NewVBox(bottomItems...)
 
-		// Position the slider at the middle slice before showing. When current is
-		// nonzero this is a no-op for loading (guard below), so load explicitly.
-		slider.SetValue(float64(current))
+		// Playback and thumbnail decoding must not outlive the window: a closed
+		// viewer that keeps a ticker and a decode pool running would hold the
+		// process busy for the rest of the session.
+		win.SetOnClosed(func() {
+			player.stopPlayback()
+			if clip := clipRef.Load(); clip != nil {
+				clip.cancel()
+			}
+			if strip != nil {
+				strip.stop()
+			}
+		})
 
 		win.SetContent(container.NewBorder(nil, bottom, nil, nil, viewport))
 		win.Resize(fyne.NewSize(640, 720))
+		if chapterMode {
+			win.Resize(fyne.NewSize(760, 880)) // room for the transport and filmstrip
+		}
 		win.Show()
 
-		loadAndShow(current, false)
+		if chapterMode {
+			// selectChapter does the full switch, so aim it at a chapter index that
+			// cannot match the one it is asked for.
+			opening := curChapter
+			curChapter = -1
+			selectChapter(opening)
+		} else {
+			slider.SetValue(float64(current))
+			loadAndShow(current, false)
+		}
 	})
+}
+
+// fpsOptions are the playback rates offered in the transport, "Clip rate" being
+// whatever the instance itself states (which is what a chapter opens at).
+var fpsOptions = []string{"Clip rate", "5 fps", "10 fps", "15 fps", "20 fps", "24 fps", "30 fps", "60 fps"}
+
+// fpsFromOption resolves a transport selection to a rate, falling back to the
+// clip's own stated rate.
+func fpsFromOption(opt string, clipFPS float64) float64 {
+	n, err := strconv.Atoi(strings.TrimSuffix(opt, " fps"))
+	if err != nil || n <= 0 {
+		return clipFPS
+	}
+	return float64(n)
+}
+
+// fpsOptionFor picks the transport entry matching a rate, preferring "Clip
+// rate" when the rate is the one the instance stated.
+func fpsOptionFor(fps, clipFPS float64) string {
+	if math.Abs(fps-clipFPS) < 0.01 {
+		return fpsOptions[0]
+	}
+	want := fmt.Sprintf("%d fps", int(fps+0.5))
+	for _, opt := range fpsOptions[1:] {
+		if opt == want {
+			return opt
+		}
+	}
+	return fpsOptions[0]
 }

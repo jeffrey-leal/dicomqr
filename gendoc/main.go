@@ -727,7 +727,7 @@ func buildContent(d Formatter) {
 
 	d.H3("8.3.1  Series Viewer")
 	d.P("The series viewer displays one image at a time and opens at the middle slice. It supports interactive window/level, zoom and pan, and slice navigation by mouse or keyboard.")
-	d.P("Multi-frame files are navigated frame by frame. Most modalities (CT, MR) store one image per file, but nuclear-medicine acquisitions — SPECT reconstructions, projection sets, gated studies — store the whole acquisition as a single multi-frame file. The viewer counts every frame of every file in the series, so a 240-frame SPECT projection set held in one file scrolls as 240 slices, and the counter and slider span the whole acquisition rather than a single image. Scrolling within a multi-frame file re-reads nothing from disk: the file is parsed once and each frame is decoded as it is reached.")
+	d.P("Multi-frame files are navigated frame by frame. Most modalities (CT, MR) store one image per file, but ultrasound and nuclear medicine do not: an echo study stores each cine loop as a multi-frame file, and a SPECT reconstruction or projection set is one file holding the whole acquisition. A series containing any such file opens in chapter mode (see Section 8.3.7); a series of ordinary single-frame images keeps the plain one-position-per-image slider described here. Either way nothing is re-read from disk as you scroll: each file is parsed once and its frames decoded as they are reached.")
 	d.P("The bottom bar contains an image counter (e.g. `45 / 120`, counting frames), a navigation slider, a Window preset dropdown (see Section 8.3.2), a Colour map dropdown (see Section 8.3.3), an Annotations checkbox (see Section 8.3.5), an Overlays checkbox (see Section 8.3.6, shown only when overlay planes are present), a Reset button, and an info label showing pixel dimensions and the current W/L values.")
 	d.P("Mouse controls:")
 	d.Table([]Row{
@@ -797,7 +797,24 @@ func buildContent(d Formatter) {
 	d.P("The Overlays checkbox in the viewer bottom bar toggles this compositing on and off. The checkbox is hidden for series that contain no overlay planes and appears automatically on the first frame in which overlays are detected. The toggle state persists between sessions.")
 	d.P("Note: the obsolete encoding in which overlay bits are packed inside unused bits of the pixel data words (OverlayBitPosition > 0, retired in the DICOM 2004 edition) is not supported and is silently skipped.")
 
-	d.H3("8.3.7  Structured Report Viewer")
+	d.H3("8.3.7  Cine Playback and Chapters")
+	d.P("A series that contains a multi-frame instance opens in chapter mode: one chapter per instance, with the frame slider scoped to the chapter on screen rather than spanning the whole series. This is how ultrasound studies are meant to be read — an echo study is a set of independently playable cine loops, and a real one holds 88 clips and 85 stills across 173 instances, which flattened onto a single slider is one 5,256-position scrub with no seam between loops. A SPECT reconstruction or projection set, held in a single file, becomes a single chapter that plays as a cine through its slices.")
+	d.P("Beneath the ordinary bottom bar, chapter mode adds a transport row and a filmstrip:")
+	d.Table([]Row{
+		{"Control", "Effect"},
+		{"Play / Pause", "Plays the chapter on screen as a cine loop. Disabled for a still. Space does the same."},
+		{"Sweep", "Plays forward then backward instead of looping back to the first frame. Set automatically when the file asks for it."},
+		{"Rate", "Playback rate. Clip rate — the default — is whatever rate the file itself states; the fixed rates override it for that chapter."},
+		{"Previous / Next chapter", "Steps to the neighbouring instance. Ctrl+Left and Ctrl+Right do the same."},
+		{"Filmstrip", "One thumbnail per chapter — its middle frame — with the chapter's label and frame count. Click one to switch to it. The active chapter is outlined and is scrolled into view as you step through. Shown only when the series has more than one chapter."},
+	})
+	d.P("Each chapter remembers its own frame position, rate, sweep setting and whether it was playing, so leaving a loop and returning to it resumes where you were. The frame counter reads `Frame 31 / 72` within the chapter, and the chapter label beside the transport reads `Chapter 3 / 173`.")
+	d.P("Playback rate is read from the file — RecommendedDisplayFrameRate, CineRate, FrameTime, FrameTimeVector or ActualFrameDuration, whichever it carries, in that order of preference — and a file stating none plays at 15 fps. Where the file states a preferred playback range (StartTrim / StopTrim), the loop is confined to it while the slider still spans every frame, so trimming never hides frames from you.")
+	d.P("Chapter names come from whatever the file actually says: image comments, protocol name or a stated view code where present; failing those, what kind of ultrasound image it is (2D, Colour flow, PW Doppler, and combinations for duplex) taken from the region calibration sequence. Many vendors write none of the naming attributes on echo clips, in which case the thumbnail is what distinguishes one loop from another.")
+	d.P("So that playback runs at the rate the clip asks for, the chapter on screen is decoded into memory in the background — a second or so for a long loop, less for a typical one — and plays from there. Buffering progress appears in the frame counter, and you can scrub and play before it finishes. One clip is held at a time; an unusually long one is capped, in which case the counter says which frames the loop is confined to, and the rest of the clip is still reachable by scrubbing.")
+	d.P("On NVIDIA GPUs, dicomqr automatically turns off the graphics driver's \"Threaded optimization\" feature for its own executable at startup (it corrupts rendering when one window animates while others are open, appearing as streaks of light across the other window). This is written once to the NVIDIA driver profile — the same setting reachable manually via NVIDIA Control Panel > Manage 3D Settings > Program Settings — and takes effect at latest from the next launch. If streak artefacts ever appear regardless, check the Activity Log: a warning there means the driver profile could not be written and gives the manual steps.")
+
+	d.H3("8.3.8  Structured Report Viewer")
 	d.P("Series whose modality is SR (Structured Report), KO (Key Object Selection), AU (Audio), or PR (Presentation State) contain no pixel data and are automatically opened in the document viewer instead of the image viewer.")
 	d.P("The document viewer window has three areas:")
 	d.Bullet("Header — patient name, MRN, date of birth, sex and age; study date, accession number and description; modality, series information, content date/time, and the DICOM completion and verification status flags (e.g. COMPLETE · VERIFIED)")

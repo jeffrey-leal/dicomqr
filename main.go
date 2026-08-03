@@ -114,6 +114,10 @@ func armExitWatchdog() {
 func main() {
 	dicomlog.SetLevel(2)
 	setupLogFile()
+	// Before any GL context exists: make sure this executable's NVIDIA driver
+	// profile has Threaded Optimization off (see nvthreadctl.go — it corrupts
+	// multi-window rendering during cine playback). No-op on other GPUs.
+	disableNvidiaThreadedOptimization()
 	a := app.NewWithID("com.jeffreyleal.dicomqr")
 	a.SetIcon(appIcon)
 	w := a.NewWindow("dicomqr")

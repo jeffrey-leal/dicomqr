@@ -174,14 +174,14 @@ func TestParsedDicomFrameStateClampsIndex(t *testing.T) {
 	}
 }
 
-// The viewer navigates frames, so its slice list must hold one entry per frame
-// of every file, in InstanceNumber order.
-func TestSortDicomSlicesExpandsFrames(t *testing.T) {
+// A series of single-frame files navigates by slice, so its slice list must
+// hold one entry per frame of every file, in InstanceNumber order.
+func TestExpandFramesOrdersAndExpands(t *testing.T) {
 	dir := t.TempDir()
 	second := writeMultiframeTestFile(t, dir, 3, 2)
 	first := writeMultiframeTestFile(t, dir, 2, 1)
 
-	slices := sortDicomSlices([]string{second, first})
+	slices := expandFrames(scanChapters([]string{second, first}, nil))
 	want := []viewerSlice{
 		{path: first, frame: 0},
 		{path: first, frame: 1},
@@ -197,36 +197,10 @@ func TestSortDicomSlicesExpandsFrames(t *testing.T) {
 			t.Errorf("slice %d = %+v, want %+v", i, slices[i], want[i])
 		}
 	}
-	if got := slicePaths(slices); len(got) != 2 || got[0] != first || got[1] != second {
-		t.Errorf("slicePaths = %v, want [%s %s]", got, first, second)
-	}
-}
-
-func TestDicomInstanceInfoReadsFrameCount(t *testing.T) {
-	path := writeMultiframeTestFile(t, t.TempDir(), 7, 5)
-	num, frames := dicomInstanceInfo(path)
-	if num != 5 {
-		t.Errorf("instanceNumber = %d, want 5", num)
-	}
-	if frames != 7 {
-		t.Errorf("frames = %d, want 7", frames)
-	}
-}
-
-// A file that cannot be parsed still occupies exactly one slice, so the viewer
-// can select it and report its own load error.
-func TestDicomInstanceInfoUnreadableFileIsOneFrame(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "corrupt.dcm")
-	if err := os.WriteFile(path, []byte("this is not a DICOM file"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, frames := dicomInstanceInfo(path); frames != 1 {
-		t.Errorf("frames = %d for an unreadable file, want 1", frames)
-	}
 }
 
 func TestExpandFramesSingleFrameFiles(t *testing.T) {
-	slices := expandFrames([]dicomInstance{
+	slices := expandFrames([]chapter{
 		{path: "a.dcm", frames: 1},
 		{path: "b.dcm", frames: 0}, // absent/invalid NumberOfFrames still yields one slice
 	})
@@ -312,15 +286,20 @@ func TestSampleMultiframeFile(t *testing.T) {
 		t.Skip("set DICOMQR_MULTIFRAME_SAMPLE to a multi-frame DICOM file")
 	}
 
-	_, headerFrames := dicomInstanceInfo(path)
+	chapters := scanChapters([]string{path}, nil)
+	headerFrames := chapters[0].frames
 	if headerFrames < 2 {
 		t.Fatalf("%s declares %d frames — not a multi-frame file", path, headerFrames)
 	}
-	slices := sortDicomSlices([]string{path})
+	if !anyMultiFrame(chapters) {
+		t.Fatal("a multi-frame file must put the viewer into chapter mode")
+	}
+	slices := expandFrames(chapters)
 	if len(slices) != headerFrames {
 		t.Fatalf("got %d navigable slices, want one per frame (%d)", len(slices), headerFrames)
 	}
-	t.Logf("%s: %d frames → %d slices", filepath.Base(path), headerFrames, len(slices))
+	t.Logf("%s: %d frames → %d slices, label %q, %.0f fps",
+		filepath.Base(path), headerFrames, len(slices), chapters[0].label, chapters[0].fps)
 
 	p, err := parseDicomFile(path)
 	if err != nil {
