@@ -1528,7 +1528,14 @@ func main() {
 			})
 		}),
 		fyne.NewMenuItemSeparator(),
-		fyne.NewMenuItem("Quit", func() { saveSettings(cfg); stopClock(); shutdownSCP(); cat.Close(); armExitWatchdog(); a.Quit() }),
+		fyne.NewMenuItem("Quit", func() {
+			saveSettings(cfg)
+			stopClock()
+			shutdownSCP()
+			cat.Close()
+			armExitWatchdog()
+			a.Quit()
+		}),
 	)
 
 	queryMenu := fyne.NewMenu("Query",
