@@ -7,6 +7,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -92,6 +93,7 @@ type viewerParts struct {
 	cells   int
 	sliders int
 	buttons int
+	selects int
 }
 
 func inspectWindow(t *testing.T, win fyne.Window) viewerParts {
@@ -105,6 +107,8 @@ func inspectWindow(t *testing.T, win fyne.Window) viewerParts {
 			parts.sliders++
 		case *widget.Button:
 			parts.buttons++
+		case *widget.Select:
+			parts.selects++
 		}
 	})
 	return parts
@@ -216,6 +220,45 @@ func TestViewerWindowSingleChapterHasNoFilmstrip(t *testing.T) {
 	onUI(func() { parts = inspectWindow(t, win) })
 	if parts.cells != 0 {
 		t.Errorf("a one-chapter series built %d filmstrip cells, want none", parts.cells)
+	}
+}
+
+// A phased MR series (same slice stack covered twice) gains the Phase dropdown
+// beside Window and Colour; an ordinary series has only those two selects.
+func TestViewerWindowPhaseMode(t *testing.T) {
+	app := test.NewApp()
+	defer app.Quit()
+
+	dir := t.TempDir()
+	inst := 1
+	for p := 0; p < 2; p++ {
+		for s := 0; s < 3; s++ {
+			writeMRTestFile(t, dir, inst, p+1, []string{"2.38", "4.62"}[p], float64(60-3*s))
+			inst++
+		}
+	}
+	paths, err := filepath.Glob(filepath.Join(dir, "*.dcm"))
+	if err != nil || len(paths) != 6 {
+		t.Fatalf("glob: %v (%d files)", err, len(paths))
+	}
+	chapters := scanChapters(paths, nil)
+	if detectMRPhases(chapters) == nil {
+		t.Fatal("test series must detect as phased")
+	}
+
+	win := openViewerForTest(t, app, chapters)
+	defer onUI(func() { win.Close() })
+
+	var parts viewerParts
+	onUI(func() { parts = inspectWindow(t, win) })
+	if parts.selects != 3 {
+		t.Errorf("phased window has %d selects, want 3 (Phase, Window, Colour)", parts.selects)
+	}
+	if parts.sliders != 1 {
+		t.Errorf("found %d sliders, want 1", parts.sliders)
+	}
+	if parts.cells != 0 {
+		t.Errorf("phase mode built %d filmstrip cells, want none", parts.cells)
 	}
 }
 

@@ -60,6 +60,18 @@ type chapter struct {
 	loopFrom    int
 	loopTo      int
 	heartRate   int // bpm, 0 when not stated
+
+	// MR phase attributes, read in the same header pass — see mrphases.go.
+	// sliceLoc/orientation drive the structural detection; the rest only name
+	// the detected phases.
+	sliceLoc    float64
+	hasSliceLoc bool
+	orientation string // ImageOrientationPatient values joined; "" when absent
+	echoNumber  int    // EchoNumbers, 0 when absent
+	echoTime    string // EchoTime as stated (DS), "" when absent
+	seqName     string // SequenceName (vendor pulse-sequence id, e.g. *ep_b50t)
+	temporalPos int    // TemporalPositionIdentifier, 0 when absent
+	acqNumber   int    // AcquisitionNumber, 0 when absent
 }
 
 // playable reports whether there is anything to play: a still has not, so the
@@ -137,6 +149,7 @@ func chapterFromHeader(fileIndex int, path string, ds *sdicom.Dataset) chapter {
 	}
 	instance := datasetInt(ds, tag.InstanceNumber, fileIndex+1)
 	from, to := cineLoopRange(ds, frames)
+	sliceLoc, hasSliceLoc := datasetFloat(ds, tag.SliceLocation)
 	return chapter{
 		path:        path,
 		instanceNum: instance,
@@ -147,6 +160,14 @@ func chapterFromHeader(fileIndex int, path string, ds *sdicom.Dataset) chapter {
 		loopFrom:    from,
 		loopTo:      to,
 		heartRate:   maxInt(0, datasetInt(ds, tag.HeartRate, 0)),
+		sliceLoc:    sliceLoc,
+		hasSliceLoc: hasSliceLoc,
+		orientation: strings.Join(datasetStrings(ds, tag.ImageOrientationPatient), `\`),
+		echoNumber:  datasetInt(ds, tag.EchoNumbers, 0),
+		echoTime:    datasetString(ds, tag.EchoTime),
+		seqName:     datasetString(ds, tag.SequenceName),
+		temporalPos: datasetInt(ds, tag.TemporalPositionIdentifier, 0),
+		acqNumber:   datasetInt(ds, tag.AcquisitionNumber, 0),
 	}
 }
 

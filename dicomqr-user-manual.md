@@ -333,6 +333,8 @@ Multi-frame files are navigated frame by frame. Most modalities (CT, MR) store o
 
 The bottom bar contains an image counter (e.g. `45 / 120`, counting frames), a navigation slider, a Window preset dropdown (see Section 8.3.2), a Colour map dropdown (see Section 8.3.3), an Annotations checkbox (see Section 8.3.5), an Overlays checkbox (see Section 8.3.6, shown only when overlay planes are present), a Reset button, and an info label showing pixel dimensions and the current W/L values.
 
+Multi-phase MR series — a series that covers the same stack of slice positions several times over, such as an in-phase/out-of-phase pair, the b-values of a diffusion acquisition, or dynamic timepoints — opens in phase mode: the slider spans one phase's slices, and a Phase dropdown appears at the left of the bottom bar naming each phase from what the files state (echo number and TE, the pulse-sequence name carrying a b-value, temporal position or acquisition number). Switching phases — from the dropdown, or by pressing P to cycle — keeps the slice, zoom, pan and window, so it toggles between phases at the same anatomical position; this is the flicker comparison an in/out-phase sequence is read with. A series without this structure (including localizers with mixed planes and bolus-tracking series, which repeat one position over time) keeps the ordinary slider covering every image.
+
 Mouse controls:
 
 | Action | Effect |
@@ -350,6 +352,7 @@ Keyboard controls (while the viewer window is focused):
 | Up / Left / Page Up | Previous slice. |
 | Down / Right / Page Down | Next slice. |
 | `+` / `-` | Zoom in / out. |
+| P | Next phase (multi-phase MR series only) — toggles at the same slice. |
 | Home or F | Reset zoom and pan to fit. |
 | R | Reset the window to the default (clears any preset or manual adjustment). |
 

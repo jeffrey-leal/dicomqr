@@ -2099,8 +2099,24 @@ func openViewerWindow(a fyne.App, title string, chapters []chapter, collectErr e
 				len(chapters), totalChapterFrames(chapters), title)
 		}
 
-		// Navigation state. In slice mode current indexes slices; in chapter mode
-		// it is the frame within the active chapter and curChapter is the file.
+		// A single-frame series covering the same slice stack several times
+		// (in/out phase, diffusion b-values, dynamic timepoints) navigates one
+		// phase at a time, with a dropdown and the P key flipping between phases
+		// at the same slice — see mrphases.go. phases stays nil for ordinary
+		// series, which keep the flat list.
+		var phases []mrPhase
+		curPhase := 0
+		if !chapterMode {
+			if phases = detectMRPhases(chapters); phases != nil {
+				slices = phases[0].slices
+				logInfo("viewer: phase mode — %d phases × %d slices (%s)",
+					len(phases), len(phases[0].slices), title)
+			}
+		}
+
+		// Navigation state. In slice mode current indexes slices (of the active
+		// phase, when phased); in chapter mode it is the frame within the active
+		// chapter and curChapter is the file.
 		curChapter := len(chapters) / 2
 		current := 0
 		total := len(slices)
@@ -2273,6 +2289,44 @@ func openViewerWindow(a fyne.App, title string, chapters []chapter, collectErr e
 					counterLbl.SetText(fmt.Sprintf("%d / %d", idx+1, total))
 				})
 			}()
+		}
+
+		// ── Phase switching (phased slice mode only) ──────────────────────────
+		//
+		// Switching phases keeps the slice index — detection guarantees index i
+		// is the same anatomical position in every phase — and keeps the view
+		// (zoom/pan) and window, so flipping phases is a same-slice comparison,
+		// which is what an in/out-phase or b-value pair exists for.
+		var phaseSelect *widget.Select
+		var phaseMuting bool
+		switchPhase := func(p int) {
+			if phases == nil || p < 0 || p >= len(phases) || p == curPhase {
+				return
+			}
+			curPhase = p
+			slices = phases[p].slices
+			phaseMuting = true
+			phaseSelect.SetSelected(phases[p].label)
+			phaseMuting = false
+			loadAndShow(current, true)
+		}
+		if phases != nil {
+			labels := make([]string, len(phases))
+			for i, p := range phases {
+				labels[i] = p.label
+			}
+			phaseSelect = widget.NewSelect(labels, func(name string) {
+				if phaseMuting {
+					return
+				}
+				for i, p := range phases {
+					if p.label == name {
+						switchPhase(i)
+						return
+					}
+				}
+			})
+			phaseSelect.Selected = phases[0].label
 		}
 
 		// ── Chapter mode display ──────────────────────────────────────────────
@@ -2629,7 +2683,7 @@ func openViewerWindow(a fyne.App, title string, chapters []chapter, collectErr e
 		}
 
 		// Keyboard: arrows/page = frame navigation; +/- = zoom; R = reset window;
-		// Home/F = reset zoom & pan; Space = play/pause.
+		// Home/F = reset zoom & pan; Space = play/pause; P = next phase.
 		win.Canvas().SetOnTypedKey(func(e *fyne.KeyEvent) {
 			switch e.Name {
 			case fyne.KeyUp, fyne.KeyLeft, fyne.KeyPageUp:
@@ -2642,6 +2696,12 @@ func openViewerWindow(a fyne.App, title string, chapters []chapter, collectErr e
 				}
 			case fyne.KeySpace:
 				togglePlay()
+			case fyne.KeyP:
+				// Cycle phases at the same slice — the flicker comparison an
+				// in/out-phase pair is read with.
+				if phases != nil {
+					switchPhase((curPhase + 1) % len(phases))
+				}
 			case fyne.KeyPlus, fyne.KeyEqual:
 				viewport.zoom = clampFloat(viewport.zoom*1.25, 1, 16)
 				viewport.applyDisplay()
@@ -2663,11 +2723,16 @@ func openViewerWindow(a fyne.App, title string, chapters []chapter, collectErr e
 				func(fyne.Shortcut) { selectChapter(curChapter + 1) })
 		}
 
-		controls := container.NewHBox(
+		controlItems := []fyne.CanvasObject{}
+		if phaseSelect != nil {
+			controlItems = append(controlItems, widget.NewLabel("Phase:"), phaseSelect)
+		}
+		controlItems = append(controlItems,
 			widget.NewLabel("Window:"), presetSelect,
 			widget.NewLabel("Colour:"), colorSelect,
 			annCheck, overlayCheck, resetBtn,
 		)
+		controls := container.NewHBox(controlItems...)
 		bottomItems := []fyne.CanvasObject{
 			stableMin(counterLbl), // counterLbl centres its own text
 			slider,
