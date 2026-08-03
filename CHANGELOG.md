@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Multi-frame files preview every frame, not just the first** — previewing a SPECT reconstruction, projection set or any other multi-frame object showed a single image with the counter reading `1 / 1`: the viewer navigated *files*, and rendered only frame 0 of each. Most modalities store one image per file, so this was invisible on CT and MR, but nuclear medicine stores a whole acquisition in one file — everything after the first frame was unreachable. The viewer now navigates *frames*: each file's frame count is read during the header pass that already orders the series, and every frame becomes a navigable slice, so the counter, slider, wheel and arrow keys span the whole acquisition. The study overview thumbnail for such a series is likewise the middle frame of the acquisition rather than its first. Files are parsed once and cached, so stepping through a multi-frame acquisition decodes one frame per step instead of re-reading the file — a 240-frame projection set scrolls without re-parsing. Verified against a real SPECT/CT study: the 240-frame projection set, the 128- and 87-frame reconstructions, and both 42-frame recons now expose every frame, each decoding to distinct pixel data (the only repeated frames are the genuinely blank slices at the ends of a reconstruction volume)
+
+### Changed
+
+- **Activity Log opens at Errors only and renders instantly at any level** — the dialog now always opens at the Errors only view (problems first, verbosity on demand; the short-lived `logViewLevel` setting is retired — an unknown key in settings.json is ignored, so existing files need no migration). The log body moved from a monolithic text widget — which laid out every line at once, making a switch to Everything noticeably sluggish with a full 5000-line ring — to a virtualized list that renders only the visible rows, so any level switch or filter keystroke appears instantly regardless of ring size. Note the dialog reads the in-memory ring, never dicom.log, so no file I/O is involved. Log text is no longer mouse-selectable in place; instead, right-clicking any line offers Copy line, and Copy Shown copies the entire filtered view to the clipboard
+
 ## [1.11.0] — 2026-07-31
 
 ### Added

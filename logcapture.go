@@ -3,14 +3,17 @@ package main
 import (
 	"context"
 	"fmt"
+	"image/color"
 	"log"
 	"strings"
 	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -168,60 +171,45 @@ func renderLog(entries []logEntry, max logLevel, substr string) string {
 	return b.String()
 }
 
-// logViewOptions maps the persisted logViewLevel setting to the step-wise
-// view choices, in escalating order of verbosity.
+// logViewOptions is the step-wise view ladder, in escalating order of
+// verbosity.
 var logViewOptions = []struct {
-	key   string // value stored in settings.json
 	label string
 	max   logLevel
 }{
-	{"errors", "Errors only", logLevelError},
-	{"warnings", "Errors + warnings", logLevelWarn},
-	{"activity", "Activity", logLevelInfo},
-	{"everything", "Everything", logLevelProto},
+	{"Errors only", logLevelError},
+	{"Errors + warnings", logLevelWarn},
+	{"Activity", logLevelInfo},
+	{"Everything", logLevelProto},
 }
 
-// logViewIndex resolves a persisted logViewLevel value to an option index,
-// defaulting to Activity for empty or unknown values.
-func logViewIndex(key string) int {
-	for i, o := range logViewOptions {
-		if o.key == key {
-			return i
-		}
+// logRow is one Activity Log line: compact canvas.Text in the shared
+// rowLayout, with a right-click menu offering Copy line. It implements only
+// secondary taps, so primary clicks fall through to the List's own row
+// selection.
+type logRow struct {
+	widget.BaseWidget
+	ct     *canvas.Text
+	onMenu func(text string, pos fyne.Position)
+}
+
+func newLogRow(onMenu func(string, fyne.Position)) *logRow {
+	r := &logRow{
+		ct:     canvas.NewText("", theme.Color(theme.ColorNameForeground)),
+		onMenu: onMenu,
 	}
-	return 2 // "activity"
+	r.ct.TextSize = theme.TextSize()
+	r.ExtendBaseWidget(r)
+	return r
 }
 
-// readOnlyEntry is a multi-line Entry that stays enabled (so text renders in
-// the normal foreground colour rather than the faded disabled shade) but
-// swallows every editing input. Mouse selection, caret navigation, Select All
-// and Copy still work.
-type readOnlyEntry struct {
-	widget.Entry
+func (r *logRow) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(container.New(rowLayout{}, r.ct))
 }
 
-func newReadOnlyEntry() *readOnlyEntry {
-	e := &readOnlyEntry{}
-	e.MultiLine = true
-	e.Wrapping = fyne.TextWrapOff
-	e.ExtendBaseWidget(e)
-	return e
-}
-
-func (e *readOnlyEntry) TypedRune(_ rune) {}
-
-func (e *readOnlyEntry) TypedKey(ev *fyne.KeyEvent) {
-	switch ev.Name {
-	case fyne.KeyBackspace, fyne.KeyDelete, fyne.KeyReturn, fyne.KeyEnter, fyne.KeyTab:
-		return
-	}
-	e.Entry.TypedKey(ev)
-}
-
-func (e *readOnlyEntry) TypedShortcut(s fyne.Shortcut) {
-	switch s.(type) {
-	case *fyne.ShortcutCopy, *fyne.ShortcutSelectAll:
-		e.Entry.TypedShortcut(s)
+func (r *logRow) TappedSecondary(e *fyne.PointEvent) {
+	if r.onMenu != nil {
+		r.onMenu(r.ct.Text, e.AbsolutePosition)
 	}
 }
 
@@ -229,20 +217,48 @@ func (e *readOnlyEntry) TypedShortcut(s fyne.Shortcut) {
 // in-memory activity log through a step-wise severity filter (Errors only →
 // Everything) and an optional substring filter. Both apply at display time
 // over the always-complete ring, so raising the level retroactively reveals
-// already-captured detail. The chosen level persists as logViewLevel. A
+// already-captured detail. The dialog always opens at Errors only — problems
+// first, verbosity on demand. The rows are shown in a virtualized List that
+// renders only the visible slice, so even the full ring at Everything appears
+// instantly (the dialog reads the in-memory ring, never dicom.log). A
 // 1-second ticker updates the view while the dialog is open; the goroutine
 // exits when the Close button is pressed.
-func showLogDialog(w fyne.Window, cfg *Settings) {
-	entry := newReadOnlyEntry()
-
-	scroll := container.NewVScroll(entry)
-	scroll.SetMinSize(fyne.NewSize(820, 420))
+func showLogDialog(w fyne.Window) {
+	// Rows are compact logRow widgets (canvas.Text in the shared rowLayout —
+	// the results trees' styling) and the List's row separators are hidden,
+	// together restoring the dense line spacing of the old text view.
+	// Right-clicking a row offers Copy line; Copy Shown below covers bulk
+	// extraction.
+	onRowMenu := func(text string, pos fyne.Position) {
+		if text == "" {
+			return
+		}
+		item := fyne.NewMenuItem("Copy line", func() { w.Clipboard().SetContent(text) })
+		widget.NewPopUpMenu(fyne.NewMenu("", item), w.Canvas()).ShowAtPosition(pos)
+	}
+	var shown []logEntry
+	list := widget.NewList(
+		func() int { return len(shown) },
+		func() fyne.CanvasObject { return newLogRow(onRowMenu) },
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			if i >= len(shown) {
+				return
+			}
+			r := o.(*logRow)
+			r.ct.Text = shown[i].text
+			r.ct.Refresh()
+		},
+	)
+	list.HideSeparators = true
+	minSize := canvas.NewRectangle(color.Transparent)
+	minSize.SetMinSize(fyne.NewSize(820, 420))
+	listBox := container.NewStack(minSize, list)
 
 	labels := make([]string, len(logViewOptions))
 	for i, o := range logViewOptions {
 		labels[i] = o.label
 	}
-	viewIdx := logViewIndex(cfg.LogViewLevel)
+	viewIdx := 0 // always open at Errors only
 	levelSelect := widget.NewSelect(labels, nil)
 	levelSelect.SetSelectedIndex(viewIdx)
 
@@ -252,9 +268,10 @@ func showLogDialog(w fyne.Window, cfg *Settings) {
 	countsLbl := widget.NewLabel("")
 
 	// The 1-second ticker calls refresh unconditionally, so it must cost
-	// nothing while the log is quiet: re-setting a several-thousand-line Entry
-	// every tick kept the whole app busy. Skip everything unless the ring's
-	// generation or one of the view controls actually changed.
+	// nothing while the log is quiet: skip everything unless the ring's
+	// generation or one of the view controls actually changed. When something
+	// did change, the work is a filter pass over in-memory entries plus a
+	// virtualized List refresh — only the visible rows are ever laid out.
 	lastGen := ^uint64(0)
 	lastIdx, lastFilter := -1, "\x00"
 	refresh := func() {
@@ -279,21 +296,30 @@ func showLogDialog(w fyne.Window, cfg *Settings) {
 			}
 		}
 		countsLbl.SetText(fmt.Sprintf("errors %d · warnings %d · activity %d · protocol detail %d", nE, nW, nI, nP))
-		entry.SetText(renderLog(entries, logViewOptions[viewIdx].max, filterEntry.Text))
-		scroll.ScrollToBottom()
+
+		max := logViewOptions[viewIdx].max
+		needle := strings.ToLower(strings.TrimSpace(filterEntry.Text))
+		filtered := make([]logEntry, 0, len(entries))
+		for _, e := range entries {
+			if e.level > max {
+				continue
+			}
+			if needle != "" && !strings.Contains(strings.ToLower(e.text), needle) {
+				continue
+			}
+			filtered = append(filtered, e)
+		}
+		shown = filtered
+		list.Refresh()
+		list.ScrollToBottom()
 	}
 	refresh()
 
 	levelSelect.OnChanged = func(string) {
-		viewIdx = levelSelect.SelectedIndex()
-		if viewIdx < 0 {
-			viewIdx = logViewIndex("")
+		if idx := levelSelect.SelectedIndex(); idx >= 0 {
+			viewIdx = idx
 		}
 		refresh()
-		if key := logViewOptions[viewIdx].key; key != cfg.LogViewLevel {
-			cfg.LogViewLevel = key
-			saveSettings(*cfg)
-		}
 	}
 	filterEntry.OnChanged = func(string) { refresh() }
 
@@ -320,7 +346,7 @@ func showLogDialog(w fyne.Window, cfg *Settings) {
 			container.NewHBox(refreshBtn, copyBtn, clearBtn, layout.NewSpacer(), closeBtn),
 		),
 		nil, nil,
-		scroll,
+		listBox,
 	)
 
 	dlg := widget.NewModalPopUp(container.NewPadded(content), w.Canvas())

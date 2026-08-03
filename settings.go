@@ -35,8 +35,7 @@ var defaultSettingsJSON []byte
 // Settings holds all persisted application preferences.
 type Settings struct {
 	DarkTheme    bool            `json:"darkTheme"`
-	UITheme      string          `json:"uiTheme"`      // colour theme pack ("" = stock Fyne theme; see themePackBase)
-	LogViewLevel string          `json:"logViewLevel"` // Activity Log view filter ("" = activity; see logViewOptions)
+	UITheme      string          `json:"uiTheme"` // colour theme pack ("" = stock Fyne theme; see themePackBase)
 	FontName     string          `json:"fontName"`
 	LocalAETitle string          `json:"localAETitle"`
 	LocalSCPPort int             `json:"localSCPPort"`

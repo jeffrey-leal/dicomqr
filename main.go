@@ -1544,7 +1544,7 @@ func main() {
 		bd = "unknown"
 	}
 	helpMenu := fyne.NewMenu("Help",
-		fyne.NewMenuItem("Activity Log…", func() { showLogDialog(w, &cfg) }),
+		fyne.NewMenuItem("Activity Log…", func() { showLogDialog(w) }),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("About", func() {
 			iconImg := canvas.NewImageFromResource(appIcon)

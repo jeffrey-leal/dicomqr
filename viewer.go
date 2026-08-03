@@ -27,41 +27,95 @@ import (
 	"github.com/suyashkumar/dicom/pkg/tag"
 )
 
-// dicomInstance pairs a .dcm file path with its InstanceNumber for sorting.
+// dicomInstance pairs a .dcm file path with its InstanceNumber for sorting and
+// with the number of frames the file holds.
 type dicomInstance struct {
 	path           string
 	instanceNumber int
+	frames         int
 }
 
-// dicomInstanceNumber parses InstanceNumber from a DICOM file without pixel data.
-func dicomInstanceNumber(path string) int {
+// viewerSlice identifies one navigable image in the viewer: a file plus the
+// zero-based index of a frame within that file. CT and MR store one frame per
+// file and so contribute a single slice each; NM/SPECT stores a whole
+// acquisition (40-240 frames) as one multi-frame file, which contributes one
+// slice per frame — without this the viewer would show only its first frame.
+type viewerSlice struct {
+	path  string
+	frame int
+}
+
+// dicomInstanceInfo parses InstanceNumber and NumberOfFrames from a DICOM file
+// without reading pixel data. Both come from a single parse: ordering a series
+// already costs one header read per file, and the viewer needs every file's
+// frame count to build its slice list. NumberOfFrames is VR IS (a string), so
+// datasetInt — not dicomIntParam, which panics on string values — must read it.
+// An unreadable file reports one frame so it still occupies a slice and shows
+// its own load error when selected.
+func dicomInstanceInfo(path string) (instanceNumber, frames int) {
 	ds, err := sdicom.ParseFile(path, nil, sdicom.SkipPixelData())
 	if err != nil {
-		return 0
+		return 0, 1
 	}
-	elem, err := ds.FindElementByTag(tag.InstanceNumber)
-	if err != nil {
-		return 0
+	frames = datasetInt(&ds, tag.NumberOfFrames, 1)
+	if frames < 1 {
+		frames = 1
 	}
-	strs := sdicom.MustGetStrings(elem.Value)
-	if len(strs) == 0 {
-		return 0
-	}
-	n, _ := strconv.Atoi(strings.TrimSpace(strs[0]))
-	return n
+	return datasetInt(&ds, tag.InstanceNumber, 0), frames
 }
 
-// collectDicomFiles walks dir and returns .dcm file paths sorted by InstanceNumber.
-func collectDicomFiles(dir string) ([]string, error) {
+// sortInstances orders instances by InstanceNumber, then by path.
+func sortInstances(instances []dicomInstance) {
+	sort.SliceStable(instances, func(i, j int) bool {
+		if instances[i].instanceNumber != instances[j].instanceNumber {
+			return instances[i].instanceNumber < instances[j].instanceNumber
+		}
+		return instances[i].path < instances[j].path
+	})
+}
+
+// expandFrames flattens ordered instances into the viewer's navigable slice
+// list, one entry per frame of each file.
+func expandFrames(instances []dicomInstance) []viewerSlice {
+	slices := make([]viewerSlice, 0, len(instances))
+	for _, inst := range instances {
+		n := inst.frames
+		if n < 1 {
+			n = 1
+		}
+		for f := 0; f < n; f++ {
+			slices = append(slices, viewerSlice{path: inst.path, frame: f})
+		}
+	}
+	return slices
+}
+
+// slicePaths returns the distinct file paths behind a slice list, in order.
+// Frames of one file are always adjacent, so a single-step comparison suffices.
+func slicePaths(slices []viewerSlice) []string {
+	var paths []string
+	for _, s := range slices {
+		if len(paths) == 0 || paths[len(paths)-1] != s.path {
+			paths = append(paths, s.path)
+		}
+	}
+	return paths
+}
+
+// collectDicomFiles walks dir and returns the navigable slices of every .dcm
+// file it contains, ordered by InstanceNumber and expanded frame by frame.
+func collectDicomFiles(dir string) ([]viewerSlice, error) {
 	var instances []dicomInstance
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil || info.IsDir() {
 			return nil
 		}
 		if strings.EqualFold(filepath.Ext(path), ".dcm") {
+			num, frames := dicomInstanceInfo(path)
 			instances = append(instances, dicomInstance{
 				path:           path,
-				instanceNumber: dicomInstanceNumber(path),
+				instanceNumber: num,
+				frames:         frames,
 			})
 		}
 		return nil
@@ -72,47 +126,31 @@ func collectDicomFiles(dir string) ([]string, error) {
 	if len(instances) == 0 {
 		return nil, errors.New("no DICOM files found in: " + dir)
 	}
-	sort.SliceStable(instances, func(i, j int) bool {
-		if instances[i].instanceNumber != instances[j].instanceNumber {
-			return instances[i].instanceNumber < instances[j].instanceNumber
-		}
-		return instances[i].path < instances[j].path
-	})
-	paths := make([]string, len(instances))
-	for i, inst := range instances {
-		paths[i] = inst.path
-	}
-	return paths, nil
+	sortInstances(instances)
+	return expandFrames(instances), nil
 }
 
-// sortDicomByInstance returns paths sorted by DICOM InstanceNumber.
-func sortDicomByInstance(rawPaths []string) []string {
-	return sortDicomByInstanceProgress(rawPaths, nil)
+// sortDicomSlices returns the navigable slices of rawPaths, ordered by DICOM
+// InstanceNumber and expanded frame by frame.
+func sortDicomSlices(rawPaths []string) []viewerSlice {
+	return sortDicomSlicesProgress(rawPaths, nil)
 }
 
-// sortDicomByInstanceProgress is sortDicomByInstance with an optional progress
-// callback, invoked after each file's InstanceNumber parse with the count
-// completed so far. Parsing every file takes seconds for large series, so
-// callers driving a busy indicator use this form.
-func sortDicomByInstanceProgress(rawPaths []string, progress func(done int)) []string {
+// sortDicomSlicesProgress is sortDicomSlices with an optional progress
+// callback, invoked after each file's header parse with the count completed so
+// far. Parsing every file takes seconds for large series, so callers driving a
+// busy indicator use this form.
+func sortDicomSlicesProgress(rawPaths []string, progress func(done int)) []viewerSlice {
 	instances := make([]dicomInstance, len(rawPaths))
 	for i, p := range rawPaths {
-		instances[i] = dicomInstance{path: p, instanceNumber: dicomInstanceNumber(p)}
+		num, frames := dicomInstanceInfo(p)
+		instances[i] = dicomInstance{path: p, instanceNumber: num, frames: frames}
 		if progress != nil {
 			progress(i + 1)
 		}
 	}
-	sort.SliceStable(instances, func(i, j int) bool {
-		if instances[i].instanceNumber != instances[j].instanceNumber {
-			return instances[i].instanceNumber < instances[j].instanceNumber
-		}
-		return instances[i].path < instances[j].path
-	})
-	sorted := make([]string, len(instances))
-	for i, inst := range instances {
-		sorted[i] = inst.path
-	}
-	return sorted
+	sortInstances(instances)
+	return expandFrames(instances)
 }
 
 // imageAnnotations holds the overlay text for a single DICOM image, organised
@@ -974,9 +1012,131 @@ func decodeRawPixelFallback(data []byte, rows, cols, samplesPerPixel, bitsAlloc 
 	return df, nil
 }
 
-// loadDicomImage parses a DICOM file and returns a windowed image.Image.
-// Only the first frame of multi-frame objects is rendered.
+// parsedDicom is one DICOM file parsed once: its frames, plus every
+// dataset-derived parameter needed to decode and present any one of them.
+// Parsing is separated from decoding so that a multi-frame acquisition — NM and
+// SPECT store 40-240 frames in a single file — is read from disk once and then
+// decoded frame by frame as the user scrolls.
+type parsedDicom struct {
+	frames         []*frame.Frame
+	transferSyntax string
+
+	hasWindow bool
+	wc, ww    float64
+	slope     float64
+	intercept float64
+	isSigned  bool
+	bitsAlloc int
+	// Dimensions for the raw-pixel fallback path.
+	rows, cols      int
+	samplesPerPixel int
+	photometric     string
+
+	ann      imageAnnotations
+	overlays []dicomOverlay
+}
+
+// frameCount is the number of decodable frames in the file (at least 1 for any
+// successfully parsed file).
+func (p *parsedDicom) frameCount() int { return len(p.frames) }
+
+// frameState decodes one frame and renders it at its default window, ready for
+// display. idx is clamped, so a file whose declared NumberOfFrames overstates
+// what the parser could deliver still shows an image instead of failing.
+func (p *parsedDicom) frameState(idx int) (viewerState, error) {
+	if len(p.frames) == 0 {
+		return viewerState{}, errors.New("no pixel data in file")
+	}
+	f := p.frames[clampInt(idx, 0, len(p.frames)-1)]
+
+	df, err := decodeFrame(f, p.transferSyntax, p.hasWindow, p.wc, p.ww,
+		p.slope, p.intercept, p.isSigned, p.bitsAlloc, p.photometric)
+
+	// Fallback: some DICOM implementations store uncompressed pixel data with
+	// an undefined-length VL, which the library mistakes for encapsulated (JPEG)
+	// data. When jpeg.Decode fails, re-interpret the raw bytes natively. This
+	// never applies to JPEG 2000 or JPEG Lossless, whose bytes are a genuine
+	// codestream.
+	if err != nil && f.IsEncapsulated() && p.rows > 0 && p.cols > 0 &&
+		!isJPEG2000TransferSyntax(p.transferSyntax) && !isJPEGLosslessTransferSyntax(p.transferSyntax) {
+		df, err = decodeRawPixelFallback(
+			f.EncapsulatedData.Data,
+			p.rows, p.cols, p.samplesPerPixel, p.bitsAlloc,
+			p.hasWindow, p.wc, p.ww, p.slope, p.intercept, p.isSigned, p.photometric,
+		)
+	}
+	if err != nil {
+		return viewerState{}, err
+	}
+
+	df.modality = p.ann.modality
+	df.overlays = p.overlays
+
+	// Render the still image (thumbnails, initial view) through the modality's
+	// default colour map so NM/PET overviews appear in colour like the viewer.
+	img := df.render(colorMapByName(defaultColorMapForModality(df.modality)), df.wc, df.ww)
+	b := img.Bounds()
+	label := fmt.Sprintf("%d × %d", b.Dx(), b.Dy())
+	ann := p.ann // copy: windowStr is per-frame
+	if df.windowable() {
+		label += fmt.Sprintf("   W:%.0f  L:%.0f", df.ww, df.wc)
+		ann.windowStr = fmt.Sprintf("W: %.0f  L: %.0f", df.ww, df.wc)
+	}
+	return viewerState{img: img, frame: df, label: label, ann: ann}, nil
+}
+
+// dicomFileCache holds the most recently parsed file so that scrolling through
+// a multi-frame acquisition decodes only the requested frame instead of
+// re-reading and re-parsing the whole file for every frame. One cache belongs
+// to one viewer window and is released with it.
+type dicomFileCache struct {
+	mu     sync.Mutex
+	path   string
+	parsed *parsedDicom
+}
+
+// load returns the given frame of the given file, parsing the file only when it
+// is not the one already cached. The lock is held across the decode so that two
+// navigation events cannot parse the same file concurrently.
+func (c *dicomFileCache) load(path string, frameIdx int) (viewerState, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.parsed == nil || c.path != path {
+		p, err := parseDicomFile(path)
+		if err != nil {
+			// Drop the stale entry: the next attempt should re-parse rather than
+			// serve frames of a file the viewer has navigated away from.
+			c.path, c.parsed = "", nil
+			return viewerState{}, err
+		}
+		c.path, c.parsed = path, p
+	}
+	return c.parsed.frameState(frameIdx)
+}
+
+// loadDicomImage parses a DICOM file and returns its first frame, windowed and
+// rendered. Callers that navigate frames use parseDicomFile/frameState (via
+// dicomFileCache) instead so the file is parsed only once.
 func loadDicomImage(path string) (viewerState, error) {
+	p, err := parseDicomFile(path)
+	if err != nil {
+		return viewerState{}, err
+	}
+	return p.frameState(0)
+}
+
+// loadDicomFrame parses a DICOM file and returns the requested frame.
+func loadDicomFrame(path string, frameIdx int) (viewerState, error) {
+	p, err := parseDicomFile(path)
+	if err != nil {
+		return viewerState{}, err
+	}
+	return p.frameState(frameIdx)
+}
+
+// parseDicomFile reads a DICOM file's frames and the parameters needed to
+// decode them. It does not decode any pixels.
+func parseDicomFile(path string) (*parsedDicom, error) {
 	// The parser pushes each frame into frameCh with a blocking send DURING
 	// ParseFile, so the channel must be drained concurrently: draining only
 	// after ParseFile returns deadlocks on any file with more frames than the
@@ -999,11 +1159,11 @@ func loadDicomImage(path string) (viewerState, error) {
 		// goroutine finish instead of blocking forever on the open channel.
 		close(frameCh)
 		<-collected
-		return viewerState{}, err
+		return nil, err
 	}
 	frames := <-collected
 	if len(frames) == 0 {
-		return viewerState{}, errors.New("no pixel data in file")
+		return nil, errors.New("no pixel data in file")
 	}
 
 	transferSyntax := ""
@@ -1018,7 +1178,7 @@ func loadDicomImage(path string) (viewerState, error) {
 	// JPEG Lossless is listed but passes through when its decoder is built in.
 	if name, unsup := unsupportedTransferSyntaxNames[transferSyntax]; unsup {
 		if !(jpegLosslessAvailable && isJPEGLosslessTransferSyntax(transferSyntax)) {
-			return viewerState{}, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"%s compressed images cannot be decoded by the built-in viewer\n\nUse Open in Viewer to open this file in an external DICOM viewer.", name)
 		}
 	}
@@ -1043,45 +1203,38 @@ func loadDicomImage(path string) (viewerState, error) {
 	// stream before decoding (Philips echo JPEG Lossless files ship ~5
 	// fragments per image). NumberOfFrames is VR IS, so datasetInt — not
 	// dicomIntParam, which panics on string values — must read it.
-	if nFrames := datasetInt(&ds, tag.NumberOfFrames, 1); nFrames <= 1 && len(frames) > 1 && frames[0].IsEncapsulated() {
+	nFrames := datasetInt(&ds, tag.NumberOfFrames, 1)
+	if nFrames <= 1 && len(frames) > 1 && frames[0].IsEncapsulated() {
 		if merged, mErr := mergeEncapsulatedFragments(frames); mErr == nil {
 			frames = []*frame.Frame{merged}
 		}
 	}
-
-	df, err := decodeFrame(frames[0], transferSyntax, hasWindow, wc, ww, slope, intercept, isSigned, bitsAlloc, photometric)
-
-	// Fallback: some DICOM implementations store uncompressed pixel data with
-	// an undefined-length VL, which the library mistakes for encapsulated (JPEG)
-	// data. When jpeg.Decode fails, re-interpret the raw bytes natively. This
-	// never applies to JPEG 2000 or JPEG Lossless, whose bytes are a genuine
-	// codestream.
-	if err != nil && frames[0].IsEncapsulated() && rows > 0 && cols > 0 &&
-		!isJPEG2000TransferSyntax(transferSyntax) && !isJPEGLosslessTransferSyntax(transferSyntax) {
-		df, err = decodeRawPixelFallback(
-			frames[0].EncapsulatedData.Data,
-			rows, cols, samplesPerPixel, bitsAlloc,
-			hasWindow, wc, ww, slope, intercept, isSigned, photometric,
-		)
-	}
-	if err != nil {
-		return viewerState{}, err
+	// A multi-frame file split into several fragments per frame cannot be mapped
+	// back to frames without the Basic Offset Table, so the navigable count is
+	// whatever the parser delivered; say so rather than silently showing a
+	// different number of images than the header declares.
+	if nFrames > 1 && nFrames != len(frames) {
+		logWarn("%s: declares %d frames but the parser delivered %d — showing %d",
+			filepath.Base(path), nFrames, len(frames), len(frames))
 	}
 
-	ann := extractAnnotationsFromDataset(ds)
-	df.modality = ann.modality
-	df.overlays = extractOverlays(ds)
-
-	// Render the still image (thumbnails, initial view) through the modality's
-	// default colour map so NM/PET overviews appear in colour like the viewer.
-	img := df.render(colorMapByName(defaultColorMapForModality(df.modality)), df.wc, df.ww)
-	b := img.Bounds()
-	label := fmt.Sprintf("%d × %d", b.Dx(), b.Dy())
-	if df.windowable() {
-		label += fmt.Sprintf("   W:%.0f  L:%.0f", df.ww, df.wc)
-		ann.windowStr = fmt.Sprintf("W: %.0f  L: %.0f", df.ww, df.wc)
-	}
-	return viewerState{img: img, frame: df, label: label, ann: ann}, nil
+	return &parsedDicom{
+		frames:          frames,
+		transferSyntax:  transferSyntax,
+		hasWindow:       hasWindow,
+		wc:              wc,
+		ww:              ww,
+		slope:           slope,
+		intercept:       intercept,
+		isSigned:        isSigned,
+		bitsAlloc:       bitsAlloc,
+		rows:            rows,
+		cols:            cols,
+		samplesPerPixel: samplesPerPixel,
+		photometric:     photometric,
+		ann:             extractAnnotationsFromDataset(ds),
+		overlays:        extractOverlays(ds),
+	}, nil
 }
 
 func dicomWindowParams(ds sdicom.Dataset) (center, width float64, ok bool) {
@@ -1283,12 +1436,12 @@ func clampToUint8(v float64) uint8 {
 	return uint8(v)
 }
 
-// seriesThumb bundles a display label, the series modality, and the pre-sorted
-// file paths for one series, used by the study overview window.
+// seriesThumb bundles a display label, the series modality, and the file paths
+// for one series, used by the study overview window.
 type seriesThumb struct {
 	label    string
 	modality string // shown as the thumbnail stand-in when nothing is renderable
-	paths    []string // sorted by InstanceNumber
+	paths    []string
 }
 
 // thumbSide is the square edge of a study-overview thumbnail.
@@ -1323,17 +1476,17 @@ type thumbnailCell struct {
 	widget.BaseWidget
 	preview fyne.CanvasObject
 	lbl     *widget.Label
-	paths   []string
+	slices  []viewerSlice
 	title   string
 	app     fyne.App
 }
 
-func newThumbnailCell(img image.Image, modality, label, title string, paths []string, app fyne.App) *thumbnailCell {
+func newThumbnailCell(img image.Image, modality, label, title string, slices []viewerSlice, app fyne.App) *thumbnailCell {
 	c := &thumbnailCell{
-		lbl:   widget.NewLabelWithStyle(label, fyne.TextAlignCenter, fyne.TextStyle{}),
-		paths: paths,
-		title: title,
-		app:   app,
+		lbl:    widget.NewLabelWithStyle(label, fyne.TextAlignCenter, fyne.TextStyle{}),
+		slices: slices,
+		title:  title,
+		app:    app,
 	}
 	if img != nil {
 		imgObj := canvas.NewImageFromImage(img)
@@ -1350,8 +1503,8 @@ func newThumbnailCell(img image.Image, modality, label, title string, paths []st
 
 // DoubleTapped opens the full series viewer for this thumbnail's files.
 func (c *thumbnailCell) DoubleTapped(_ *fyne.PointEvent) {
-	paths, title, app := c.paths, c.title, c.app
-	go openViewerWindow(app, title, paths, nil)
+	slices, title, app := c.slices, c.title, c.app
+	go openViewerWindow(app, title, slices, nil)
 }
 
 func (c *thumbnailCell) CreateRenderer() fyne.WidgetRenderer {
@@ -1415,8 +1568,12 @@ func showStudyOverviewWindow(a fyne.App, parent fyne.Window, title string, serie
 	busy := showBusyDialog(parent, "Generating study preview",
 		fmt.Sprintf("Loading series previews (0/%d)…", len(series)))
 
-	// Sort and load the middle slice of every series in parallel.
+	// Sort and load the middle slice of every series in parallel. "Middle" is
+	// the middle of the frame list, not of the file list, so a single-file
+	// multi-frame acquisition (NM/SPECT) shows its central slice rather than
+	// its first frame.
 	thumbs := make([]viewerState, len(series))
+	sorted := make([][]viewerSlice, len(series))
 	var loaded atomic.Int32
 	var wg sync.WaitGroup
 	for i, s := range series {
@@ -1425,11 +1582,14 @@ func showStudyOverviewWindow(a fyne.App, parent fyne.Window, title string, serie
 		go func() {
 			defer wg.Done()
 			if len(s.paths) > 0 {
-				sorted := sortDicomByInstance(s.paths)
-				series[i].paths = sorted
-				vs, err := loadDicomImage(sorted[len(sorted)/2])
-				if err == nil {
-					thumbs[i] = vs
+				slices := sortDicomSlices(s.paths)
+				sorted[i] = slices
+				if len(slices) > 0 {
+					mid := slices[len(slices)/2]
+					vs, err := loadDicomFrame(mid.path, mid.frame)
+					if err == nil {
+						thumbs[i] = vs
+					}
 				}
 			}
 			busy.setStatus(fmt.Sprintf("Loading series previews (%d/%d)…", loaded.Add(1), len(series)))
@@ -1445,7 +1605,7 @@ func showStudyOverviewWindow(a fyne.App, parent fyne.Window, title string, serie
 		for i, s := range series {
 			// A nil image (no pixel data, or nothing the built-in decoders can
 			// render) selects the modality placeholder tile.
-			cells[i] = newThumbnailCell(thumbs[i].img, s.modality, s.label, "DICOM Preview — "+s.label, s.paths, a)
+			cells[i] = newThumbnailCell(thumbs[i].img, s.modality, s.label, "DICOM Preview — "+s.label, sorted[i], a)
 		}
 
 		// GridWrap reflows cells top-left to bottom-right as the window is
@@ -1478,9 +1638,9 @@ func showStudyOverviewWindow(a fyne.App, parent fyne.Window, title string, serie
 // Must be called from a non-UI goroutine.
 func showDicomViewer(a fyne.App, parent fyne.Window, folder string) {
 	busy := showBusyDialog(parent, "Generating preview", "Scanning folder for DICOM files…")
-	paths, collectErr := collectDicomFiles(folder)
+	slices, collectErr := collectDicomFiles(folder)
 	busy.hide()
-	openViewerWindow(a, "DICOM Preview — "+filepath.Base(folder), paths, collectErr)
+	openViewerWindow(a, "DICOM Preview — "+filepath.Base(folder), slices, collectErr)
 }
 
 // showDicomViewerPaths opens the DICOM preview window for a specific set of files.
@@ -1500,7 +1660,7 @@ func showDicomViewerPaths(a fyne.App, parent fyne.Window, title string, rawPaths
 	total := len(rawPaths)
 	busy := showBusyDialog(parent, "Generating series preview",
 		fmt.Sprintf("Sorting images (0/%d)…", total))
-	sorted := sortDicomByInstanceProgress(rawPaths, func(done int) {
+	sorted := sortDicomSlicesProgress(rawPaths, func(done int) {
 		// Throttle updates: one per 50 files is smooth enough and avoids
 		// flooding the UI event queue on multi-thousand-image series.
 		if done%50 == 0 || done == total {
@@ -1894,9 +2054,10 @@ func (r *viewportRenderer) Destroy()                     {}
 
 // openViewerWindow creates and shows the interactive DICOM image viewer window.
 // Must be called from a non-UI goroutine; all widget creation is via fyne.Do.
-func openViewerWindow(a fyne.App, title string, paths []string, collectErr error) {
+func openViewerWindow(a fyne.App, title string, slices []viewerSlice, collectErr error) {
 	// Route non-image modalities (SR, KO, AU, PR) to the document viewer.
-	if collectErr == nil && len(paths) > 0 {
+	if collectErr == nil && len(slices) > 0 {
+		paths := slicePaths(slices)
 		if mod := seriesModality(paths); isDocumentModality(mod) {
 			openSRWindow(a, title, paths)
 			return
@@ -1906,7 +2067,7 @@ func openViewerWindow(a fyne.App, title string, paths []string, collectErr error
 	fyne.Do(func() {
 		win := a.NewWindow(title)
 
-		if collectErr != nil || len(paths) == 0 {
+		if collectErr != nil || len(slices) == 0 {
 			msg := "No DICOM files found."
 			if collectErr != nil {
 				msg = collectErr.Error()
@@ -1917,8 +2078,13 @@ func openViewerWindow(a fyne.App, title string, paths []string, collectErr error
 			return
 		}
 
-		total := len(paths)
+		total := len(slices)
 		current := total / 2 // open at the middle slice
+
+		// One parsed file is cached for the lifetime of this window, so
+		// scrolling through a multi-frame acquisition decodes a single frame per
+		// step instead of re-parsing the whole file each time.
+		cache := &dicomFileCache{}
 
 		viewport := newImageViewport()
 		showAnn := a.Preferences().BoolWithFallback("showAnnotations", true)
@@ -1993,7 +2159,7 @@ func openViewerWindow(a fyne.App, title string, paths []string, collectErr error
 		loadAndShow := func(idx int, keepView bool) {
 			counterLbl.SetText(fmt.Sprintf("%d / %d  (loading…)", idx+1, total))
 			go func() {
-				st, err := loadDicomImage(paths[idx])
+				st, err := cache.load(slices[idx].path, slices[idx].frame)
 				fyne.Do(func() {
 					if err != nil {
 						infoLabel.SetText("Error: " + err.Error())

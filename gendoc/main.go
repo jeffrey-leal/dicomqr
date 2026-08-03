@@ -727,7 +727,8 @@ func buildContent(d Formatter) {
 
 	d.H3("8.3.1  Series Viewer")
 	d.P("The series viewer displays one image at a time and opens at the middle slice. It supports interactive window/level, zoom and pan, and slice navigation by mouse or keyboard.")
-	d.P("The bottom bar contains an instance counter (e.g. `45 / 120`), a navigation slider, a Window preset dropdown (see Section 8.3.2), a Colour map dropdown (see Section 8.3.3), an Annotations checkbox (see Section 8.3.5), an Overlays checkbox (see Section 8.3.6, shown only when overlay planes are present), a Reset button, and an info label showing pixel dimensions and the current W/L values.")
+	d.P("Multi-frame files are navigated frame by frame. Most modalities (CT, MR) store one image per file, but nuclear-medicine acquisitions — SPECT reconstructions, projection sets, gated studies — store the whole acquisition as a single multi-frame file. The viewer counts every frame of every file in the series, so a 240-frame SPECT projection set held in one file scrolls as 240 slices, and the counter and slider span the whole acquisition rather than a single image. Scrolling within a multi-frame file re-reads nothing from disk: the file is parsed once and each frame is decoded as it is reached.")
+	d.P("The bottom bar contains an image counter (e.g. `45 / 120`, counting frames), a navigation slider, a Window preset dropdown (see Section 8.3.2), a Colour map dropdown (see Section 8.3.3), an Annotations checkbox (see Section 8.3.5), an Overlays checkbox (see Section 8.3.6, shown only when overlay planes are present), a Reset button, and an info label showing pixel dimensions and the current W/L values.")
 	d.P("Mouse controls:")
 	d.Table([]Row{
 		{"Action", "Effect"},
@@ -774,7 +775,7 @@ func buildContent(d Formatter) {
 	d.P("Colour maps apply only to grayscale (monochrome) images; for images already stored in colour the dropdown is disabled. The maps are faithful renditions of the DICOM standard palettes intended for display and triage.")
 
 	d.H3("8.3.4  Study Overview Grid")
-	d.P("The overview window shows one thumbnail per series — the middle slice of each series rendered in parallel. Thumbnails flow from the top-left, wrapping into as many columns as fit the window, and reflow when the window is resized. Double-click any thumbnail to open that series in the full series viewer.")
+	d.P("The overview window shows one thumbnail per series — the middle slice of each series rendered in parallel; for a series held in a single multi-frame file (typically SPECT/NM) that is the middle frame of the acquisition. Thumbnails flow from the top-left, wrapping into as many columns as fit the window, and reflow when the window is resized. Double-click any thumbnail to open that series in the full series viewer.")
 	d.P("A series with nothing to display — SR, KO, PR and other non-image objects, or pixel data the built-in decoders cannot render — appears as a white tile with its modality in large bold black text instead of an image. Double-clicking the tile still opens the appropriate viewer for the series.")
 	d.P("While the overview is generated, a progress dialog counts the series as they load — studies with thousands of images can take several seconds. Series previews and the folder Preview button show the same dialog while large image sets are scanned and sorted; the application remains responsive throughout.")
 
@@ -902,7 +903,7 @@ func buildContent(d Formatter) {
 	d.H2("12.3  Help Menu")
 	d.Table([]Row{
 		{"Item", "Description"},
-		{"Activity Log…", "Opens the in-app activity log (the last 5000 captured lines). A step-wise level selector scales the view from Errors only, through Errors + warnings and Activity (one line per meaningful operation — the default), up to Everything (full DICOM protocol detail); a filter box narrows the view to lines containing a substring, and a counter shows how many lines each severity holds. Both filters apply to the display only — capture is always complete, so raising the level retroactively reveals the full detail of something that already happened, and dicom.log always records everything. The chosen level persists across sessions. Buttons: Refresh (manual update), Copy Shown (copies the filtered view to the clipboard), Clear. The log auto-refreshes once per second while the dialog is open."},
+		{"Activity Log…", "Opens the in-app activity log (the last 5000 captured lines), always starting at the Errors only view — problems first, verbosity on demand. A step-wise level selector scales the view through Errors + warnings and Activity (one line per meaningful operation) up to Everything (full DICOM protocol detail); a filter box narrows the view to lines containing a substring, and a counter shows how many lines each severity holds. Both filters apply to the display only — capture is always complete, so raising the level retroactively reveals the full detail of something that already happened, and dicom.log always records everything. The list renders only the visible rows, so switching levels is instant even with the ring full; right-click any line to copy it. Buttons: Refresh (manual update), Copy Shown (copies the entire filtered view to the clipboard), Clear. The log auto-refreshes once per second while the dialog is open."},
 		{"About", "Displays the application version, build date, and library credits."},
 		{"Client info…", "Displays the local AE Title, SCP port, and detected IP address."},
 	})
@@ -1054,7 +1055,6 @@ func buildContent(d Formatter) {
 		{"`windowHeight`", "`0`", "Saved window height in pixels."},
 		{"`retrieveStallTimeoutSec`", "`0`", "Abort a retrieve when no progress response and no received file arrives for this many seconds. 0 uses the default (120 s); -1 disables stall detection. Recovers from PACS servers whose C-MOVE agent hangs on non-image objects (SR/PR). Editable in Preferences > SCP & Network."},
 		{"`uiTheme`", "`\"\"`", "Colour theme pack: empty (stock theme), `adwaita`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, or `catppuccin-mocha`."},
-		{"`logViewLevel`", "`\"activity\"`", "Activity Log view filter: `errors`, `warnings`, `activity`, or `everything`. Display-time only — capture and dicom.log always record everything."},
 		{"`italicPrivate`", "`true`", "Render private tags in italic in the View Tags window."},
 		{"`malformedColor`", "`\"E54545FF\"`", "RRGGBBAA colour for tags whose value representation violates the standard."},
 		{"`tagProfiles`", "PHI profile", "Array of tag-highlight profiles (name, colour, enabled, tag list) — see Section 14.2. Wire format matches dicomhdr."},

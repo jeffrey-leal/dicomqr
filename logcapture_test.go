@@ -125,14 +125,18 @@ func TestRenderLogFiltering(t *testing.T) {
 	}
 }
 
-func TestLogViewIndexDefaults(t *testing.T) {
-	if i := logViewIndex(""); logViewOptions[i].key != "activity" {
-		t.Errorf("empty setting resolves to %q, want activity", logViewOptions[i].key)
+func TestLogViewOptionsLadder(t *testing.T) {
+	// The dialog always opens at index 0 — it must be the errors-only view,
+	// and the ladder must escalate strictly so each step is a superset.
+	if logViewOptions[0].max != logLevelError {
+		t.Errorf("option 0 max = %v, want errors-only", logViewOptions[0].max)
 	}
-	if i := logViewIndex("bogus"); logViewOptions[i].key != "activity" {
-		t.Errorf("unknown setting resolves to %q, want activity", logViewOptions[i].key)
+	for i := 1; i < len(logViewOptions); i++ {
+		if logViewOptions[i].max <= logViewOptions[i-1].max {
+			t.Errorf("option %d (%s) does not escalate over option %d", i, logViewOptions[i].label, i-1)
+		}
 	}
-	if i := logViewIndex("errors"); logViewOptions[i].max != logLevelError {
-		t.Errorf("errors setting resolves to max %v", logViewOptions[i].max)
+	if last := logViewOptions[len(logViewOptions)-1].max; last != logLevelProto {
+		t.Errorf("last option max = %v, want everything", last)
 	}
 }
