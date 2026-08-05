@@ -5,7 +5,13 @@ package main
 // identically. Per-file order of operations (matching dicomtool):
 //
 //	parse → ignoretype → ignoremodality → per-modality overrides → fixvr →
-//	remove + noprivate → date shift → dob mask → uid suffix / uid remap → set
+//	remove + noprivate → date shift → dob mask → uid suffix / uid remap → set →
+//	transfer syntax
+//
+// The transfer-syntax conversion is dicomqr's own step, with no dicomtool
+// equivalent, and comes last deliberately: decompressing pixel data rewrites
+// the attributes that describe it (Photometric Interpretation, Planar
+// Configuration), so it must have the final say over them.
 //
 // Files are read from the download folder and written to a separate output
 // folder preserving the relative folder structure; sources are never touched.
@@ -55,6 +61,10 @@ type modifyParams struct {
 	ignoreModalities []string
 	perMod           map[string]modalityOverride
 	remapUIDs        bool
+	// targetTS is the transfer syntax UID every output is written in, or "" to
+	// write each file in the syntax it was stored in. Profile-wide: unlike the
+	// tag rules it is never overridden per modality.
+	targetTS string
 }
 
 // compileModifyParams validates p and parses its tag references (resolving
@@ -74,6 +84,13 @@ func compileModifyParams(p ModProfile, aliases TagConfig) (modifyParams, error) 
 			return mp, fmt.Errorf("shiftdays %q must be an integer", p.ShiftDays)
 		}
 	}
+
+	targetTS, tsOK := modProfileTargetSyntax(p)
+	if !tsOK {
+		return mp, fmt.Errorf("transfersyntax %q: must be %s or %s", p.TransferSyntax,
+			tsPrefExplicitLE, tsPrefImplicitLE)
+	}
+	mp.targetTS = targetTS
 
 	mp.remapUIDs = p.RemapUIDs
 	mp.uidSuffix = strings.TrimSpace(p.UIDSuffix)
@@ -137,13 +154,16 @@ func compileModifyParams(p ModProfile, aliases TagConfig) (modifyParams, error) 
 		mp.perMod = buildModalityOverrides(normalized, aliases)
 	}
 
+	// A transfer syntax alone is actionable: converting a study to an
+	// uncompressed syntax is a legitimate standalone operation, and export is
+	// the only place the application can perform one.
 	hasAction := len(mp.edits) > 0 || len(mp.removals) > 0 ||
 		mp.dobMask != "" || mp.uidSuffix != "" || mp.shiftDays != "" ||
-		mp.removePrivate || mp.fixvrMode != "" ||
+		mp.removePrivate || mp.fixvrMode != "" || mp.targetTS != "" ||
 		len(mp.ignoreTypes) > 0 || len(mp.ignoreModalities) > 0 ||
 		len(mp.perMod) > 0 || mp.remapUIDs
 	if !hasAction {
-		return mp, errors.New("the profile contains no actionable parameter (set, remove, dob, uid, shiftdays, noprivate, fixvr, remapuids)")
+		return mp, errors.New("the profile contains no actionable parameter (set, remove, dob, uid, shiftdays, noprivate, fixvr, remapuids, transfersyntax)")
 	}
 
 	return mp, nil
@@ -222,7 +242,7 @@ type zipSink struct {
 	zw *zip.Writer
 }
 
-func (z *zipSink) write(rel string, ds sdicom.Dataset, fixvrMode string) error {
+func (z *zipSink) write(rel string, ds sdicom.Dataset, opts []sdicom.WriteOption) error {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	w, err := z.zw.Create(filepath.ToSlash(rel))
@@ -230,7 +250,7 @@ func (z *zipSink) write(rel string, ds sdicom.Dataset, fixvrMode string) error {
 		return err
 	}
 	bw := bufio.NewWriterSize(w, 1<<20)
-	if err := sdicom.Write(bw, ds, fixvrWriteOpts(fixvrMode)...); err != nil {
+	if err := sdicom.Write(bw, ds, opts...); err != nil {
 		return err
 	}
 	return bw.Flush()
@@ -325,6 +345,10 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 		jobs = append(jobs, fileJob{f, rel})
 	}
 
+	// Write options are constant for the run; computing them once keeps the
+	// per-file path free of the fixvr/transfer-syntax reasoning.
+	writeOpts := modifyWriteOpts(params)
+
 	// One shared UID remapper for the whole run guarantees that the same source
 	// UID maps to the same replacement everywhere it appears across all files.
 	var uidRemap *uidRemapper
@@ -381,7 +405,7 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 						return
 					}
 					if zsink != nil {
-						if zerr := zsink.write(job.rel, ds, params.fixvrMode); zerr != nil {
+						if zerr := zsink.write(job.rel, ds, writeOpts); zerr != nil {
 							recordFailure(job.path, fmt.Errorf("zip write: %w", zerr))
 						} else {
 							mu.Lock()
@@ -401,7 +425,7 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 						return
 					}
 					bw := bufio.NewWriterSize(f, 1<<20)
-					werr := sdicom.Write(bw, ds, fixvrWriteOpts(params.fixvrMode)...)
+					werr := sdicom.Write(bw, ds, writeOpts...)
 					fherr := bw.Flush()
 					clerr := f.Close()
 					switch {
@@ -494,6 +518,30 @@ func fixvrWriteOpts(mode string) []sdicom.WriteOption {
 		return []sdicom.WriteOption{sdicom.SkipVRVerification(), sdicom.SkipValueTypeVerification()}
 	default:
 		return nil
+	}
+}
+
+// modifyWriteOpts returns the WriteOptions for one run: the fixvr mode's
+// options, relaxed further when the profile converts the transfer syntax.
+//
+// A conversion to Explicit VR makes the writer emit a VR for every element,
+// including ones parsed from an implicit-VR source where the dictionary VR and
+// the stored value may disagree; verification would reject those and fail files
+// that write fine untouched. transcodeDICOMFileToTemp has always passed both
+// skips for exactly this reason. Profiles that leave the syntax as stored keep
+// the stricter behaviour they have today.
+func modifyWriteOpts(p modifyParams) []sdicom.WriteOption {
+	opts := fixvrWriteOpts(p.fixvrMode)
+	if p.targetTS == "" {
+		return opts
+	}
+	switch p.fixvrMode {
+	case "passthrough": // already both
+		return opts
+	case "correct", "skip": // already SkipVRVerification
+		return append(opts, sdicom.SkipValueTypeVerification())
+	default:
+		return []sdicom.WriteOption{sdicom.SkipVRVerification(), sdicom.SkipValueTypeVerification()}
 	}
 }
 
@@ -725,6 +773,16 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 		// only when the tag is absent throughout the dataset.
 		if !replaceInElements(ds.Elements, newElem) {
 			ds.Elements = append(ds.Elements, newElem)
+		}
+	}
+
+	// Transfer syntax last, so the decompression's rewrite of the pixel-
+	// describing attributes is what reaches disk. A source whose pixel data has
+	// no built-in decoder fails the file rather than exporting it in a syntax
+	// the profile did not ask for.
+	if p.targetTS != "" {
+		if _, err := convertDatasetSyntax(&ds, datasetTransferSyntaxUID(&ds), p.targetTS); err != nil {
+			return false, ds, fmt.Errorf("convert to %s: %w", transferSyntaxLabel(p.targetTS), err)
 		}
 	}
 

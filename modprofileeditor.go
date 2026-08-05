@@ -185,6 +185,7 @@ type modProfileEditor struct {
 	privCheck              *widget.Check
 	remapCheck             *widget.Check
 	uidSuffixLabel         *widget.Label
+	tsSelect               *widget.Select
 	zipCheck               *widget.Check
 	ignoreTypesEntry       *widget.Entry
 	ignoreModsEntry        *widget.Entry
@@ -250,6 +251,9 @@ func newModProfileEditor(name string, p ModProfile, cfg ModProfileConfig, aliase
 	e.uidSuffixLabel = widget.NewLabel("UID suffix")
 	e.remapCheck.OnChanged = func(bool) { e.syncUIDSuffixState() }
 	e.syncUIDSuffixState()
+
+	e.tsSelect = widget.NewSelect(modProfileTSLabels, nil)
+	e.tsSelect.SetSelected(transferSyntaxPrefLabel(p.TransferSyntax))
 
 	e.zipCheck = widget.NewCheck("", nil)
 	e.zipCheck.SetChecked(p.Zip)
@@ -331,6 +335,7 @@ func (e *modProfileEditor) validate() (string, ModProfile, error) {
 		// engine rejects the combination.
 		updated.UIDSuffix = ""
 	}
+	updated.TransferSyntax = transferSyntaxPrefFromLabel(e.tsSelect.Selected)
 	updated.Zip = e.zipCheck.Checked
 	// The engine matches these filters against ImageType/Modality components
 	// case-insensitively; casing is stored as typed. CS values cannot contain
@@ -485,6 +490,7 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 		widget.NewFormItem("Remove private tags", ed.privCheck),
 		widget.NewFormItem("Shift dates (days)", ed.shiftDays),
 		widget.NewFormItem("Fix VR", ed.fixvr),
+		widget.NewFormItem("Output transfer syntax", ed.tsSelect),
 		widget.NewFormItem("Zip export", ed.zipCheck))
 
 	filterCaption := widget.NewLabel("Files matching either comma-separated filter are skipped entirely.")
@@ -699,6 +705,9 @@ func perModalityPreservedNote(p ModProfile) fyne.CanvasObject {
 	}
 	if p.Zip {
 		ignored = append(ignored, "zip")
+	}
+	if p.TransferSyntax != "" {
+		ignored = append(ignored, "transfersyntax")
 	}
 	if len(p.IgnoreTypes) > 0 {
 		ignored = append(ignored, "ignoretype")

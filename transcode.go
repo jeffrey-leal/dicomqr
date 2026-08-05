@@ -17,10 +17,12 @@ import (
 // Compressed transfer syntaxes the built-in decoders can convert to the
 // required uncompressed syntax (PS3.5 §10.1).
 const (
-	tsJPEGBaseline = "1.2.840.10008.1.2.4.50"
-	tsJPEGExtended = "1.2.840.10008.1.2.4.51"
-	tsJPEG2000LL   = "1.2.840.10008.1.2.4.90"
-	tsJPEG2000     = "1.2.840.10008.1.2.4.91"
+	tsJPEGBaseline    = "1.2.840.10008.1.2.4.50"
+	tsJPEGExtended    = "1.2.840.10008.1.2.4.51"
+	tsJPEGLossless    = "1.2.840.10008.1.2.4.57"
+	tsJPEGLosslessSV1 = "1.2.840.10008.1.2.4.70"
+	tsJPEG2000LL      = "1.2.840.10008.1.2.4.90"
+	tsJPEG2000        = "1.2.840.10008.1.2.4.91"
 )
 
 // isUncompressedOnDisk reports whether uid is one of the two uncompressed
@@ -31,11 +33,19 @@ func isUncompressedOnDisk(uid string) bool {
 
 // canDecompressSyntax reports whether a built-in decoder exists for uid:
 // JPEG Baseline/Extended via the Go JPEG decoder (the same path the viewer
-// uses), JPEG 2000 via OpenJPEG when built with the openjpeg tag.
+// uses), JPEG 2000 via OpenJPEG when built with the openjpeg tag, JPEG Lossless
+// via libjpeg-turbo when built with the jpeglossless tag.
+//
+// JPEG Lossless is decodable here but is deliberately absent from
+// acceptedSyntaxesFor, so it is never negotiated: this gate is reached for it
+// only by a modification profile converting a file already on disk. A server
+// therefore cannot be induced to send it, and retrieve behaviour is unchanged.
 func canDecompressSyntax(uid string) bool {
 	switch uid {
 	case tsJPEGBaseline, tsJPEGExtended:
 		return true
+	case tsJPEGLossless, tsJPEGLosslessSV1:
+		return jpegLosslessAvailable
 	case tsJPEG2000LL, tsJPEG2000:
 		return jpeg2000Available
 	}
@@ -65,6 +75,101 @@ func acceptedSyntaxesFor(requiredTS string) []string {
 		accepted = append(accepted, tsJPEG2000LL, tsJPEG2000)
 	}
 	return accepted
+}
+
+// checkDecodableSource reports whether a file stored in sourceTS can be
+// converted at all: an uncompressed source only needs a VR re-encode, while a
+// compressed one needs a built-in decoder. The error names the syntax, since
+// that is what tells the user whether the operation can ever succeed.
+func checkDecodableSource(sourceTS string) error {
+	if isUncompressedOnDisk(sourceTS) || canDecompressSyntax(sourceTS) {
+		return nil
+	}
+	name := sourceTS
+	if n, known := unsupportedTransferSyntaxNames[sourceTS]; known {
+		name = n + " (" + sourceTS + ")"
+	}
+	return fmt.Errorf("no built-in decoder for %s", name)
+}
+
+// datasetTransferSyntaxUID reads (0002,0010) from an already-parsed dataset.
+// The file-based fileTransferSyntaxUID cannot serve callers that hold only a
+// dataset — the modification engine parses each file once and never revisits
+// it on disk. Returns "" when the element is absent or not a string.
+func datasetTransferSyntaxUID(ds *sdicom.Dataset) string {
+	elem, err := ds.FindElementByTag(tag.TransferSyntaxUID)
+	if err != nil {
+		return ""
+	}
+	if strs, ok := elem.Value.GetValue().([]string); ok && len(strs) > 0 {
+		return strings.TrimSpace(strs[0])
+	}
+	return ""
+}
+
+// convertDatasetSyntax rewrites an in-memory dataset so its transfer syntax is
+// targetTS — one of the two uncompressed on-disk syntaxes. Encapsulated
+// (compressed) pixel data is decompressed with the viewer's decoders; a dataset
+// already uncompressed in the other VR encoding needs no pixel work at all,
+// since the VR conversion happens when the writer encodes it under the new
+// syntax. Objects without pixel data (e.g. SR documents) likewise just change
+// syntax.
+//
+// Returns (false, nil) when sourceTS already equals targetTS, (true, nil) after
+// a successful conversion, and (false, err) when the source is compressed with
+// no built-in decoder or a frame fails to decode. ds is left partially modified
+// on an error path, so callers must discard it rather than write it out.
+//
+// This is the whole conversion: transcodeDICOMFileToTemp wraps it in file I/O
+// for the receive path, and processFile calls it directly on the dataset it has
+// already transformed.
+func convertDatasetSyntax(ds *sdicom.Dataset, sourceTS, targetTS string) (bool, error) {
+	if sourceTS == "" {
+		return false, errors.New("cannot determine transfer syntax")
+	}
+	if sourceTS == targetTS {
+		return false, nil
+	}
+	// A rewrite is required. An uncompressed source only needs a VR re-encode;
+	// a compressed source must have a built-in decoder or we cannot proceed.
+	if err := checkDecodableSource(sourceTS); err != nil {
+		return false, err
+	}
+
+	// Decompress encapsulated pixel data. Native pixel data and objects without
+	// pixel data carry no encapsulated frames, so they fall straight through to
+	// the re-encode in the target VR.
+	if pdElem, pdErr := ds.FindElementByTag(tag.PixelData); pdErr == nil {
+		info, ok := pdElem.Value.GetValue().(sdicom.PixelDataInfo)
+		if !ok {
+			return false, errors.New("unexpected PixelData value type")
+		}
+		if info.IsEncapsulated {
+			newInfo, colorOut, decErr := decompressPixelData(ds, info, sourceTS)
+			if decErr != nil {
+				return false, decErr
+			}
+			newPD, elemErr := sdicom.NewElement(tag.PixelData, newInfo)
+			if elemErr != nil {
+				return false, elemErr
+			}
+			replaceElement(ds, newPD)
+			if colorOut {
+				// Every decoder emits interleaved RGB for colour frames.
+				if err := setElementValue(ds, tag.PhotometricInterpretation, []string{"RGB"}); err != nil {
+					return false, err
+				}
+				if err := setElementValue(ds, tag.PlanarConfiguration, []int{0}); err != nil {
+					return false, err
+				}
+			}
+		}
+	}
+
+	if err := setElementValue(ds, tag.TransferSyntaxUID, []string{targetTS}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // transcodeDICOMFile rewrites a DICOM file in place so its transfer syntax is
@@ -105,52 +210,20 @@ func transcodeDICOMFileToTemp(path, targetTS, tmpDir string) (string, bool, erro
 	if tsUID == targetTS {
 		return "", false, nil
 	}
-	// A rewrite is required. An uncompressed source only needs a VR re-encode;
-	// a compressed source must have a built-in decoder or we cannot proceed.
-	if !isUncompressedOnDisk(tsUID) && !canDecompressSyntax(tsUID) {
-		name := tsUID
-		if n, known := unsupportedTransferSyntaxNames[tsUID]; known {
-			name = n + " (" + tsUID + ")"
-		}
-		return "", false, fmt.Errorf("no built-in decoder for %s", name)
+	// Reject an undecodable source before parsing it. convertDatasetSyntax
+	// checks this too, but only after the parse: doing it here keeps the cost
+	// off files that cannot be converted anyway, and keeps "no built-in decoder
+	// for JPEG-LS Lossless" as the reported reason rather than whatever the
+	// parse of an unreadable file happens to say first.
+	if err := checkDecodableSource(tsUID); err != nil {
+		return "", false, err
 	}
 
 	ds, err := sdicom.ParseFile(path, nil)
 	if err != nil {
 		return "", false, fmt.Errorf("parse: %w", err)
 	}
-
-	// Decompress encapsulated pixel data. Native pixel data and objects without
-	// pixel data (e.g. SR documents) carry no encapsulated frames, so they fall
-	// straight through to the re-encode below in the target VR.
-	if pdElem, pdErr := ds.FindElementByTag(tag.PixelData); pdErr == nil {
-		info, ok := pdElem.Value.GetValue().(sdicom.PixelDataInfo)
-		if !ok {
-			return "", false, errors.New("unexpected PixelData value type")
-		}
-		if info.IsEncapsulated {
-			newInfo, colorOut, decErr := decompressPixelData(&ds, info, tsUID)
-			if decErr != nil {
-				return "", false, decErr
-			}
-			newPD, elemErr := sdicom.NewElement(tag.PixelData, newInfo)
-			if elemErr != nil {
-				return "", false, elemErr
-			}
-			replaceElement(&ds, newPD)
-			if colorOut {
-				// Both decoders emit interleaved RGB for colour frames.
-				if err := setElementValue(&ds, tag.PhotometricInterpretation, []string{"RGB"}); err != nil {
-					return "", false, err
-				}
-				if err := setElementValue(&ds, tag.PlanarConfiguration, []int{0}); err != nil {
-					return "", false, err
-				}
-			}
-		}
-	}
-
-	if err := setElementValue(&ds, tag.TransferSyntaxUID, []string{targetTS}); err != nil {
+	if _, err := convertDatasetSyntax(&ds, tsUID, targetTS); err != nil {
 		return "", false, err
 	}
 
@@ -218,9 +291,12 @@ func decompressPixelData(ds *sdicom.Dataset, info sdicom.PixelDataInfo, tsUID st
 		var nf frame.INativeFrame
 		var isColor bool
 		var err error
-		if isJPEG2000TransferSyntax(tsUID) {
+		switch {
+		case isJPEG2000TransferSyntax(tsUID):
 			nf, isColor, err = j2kFrameToNative(fr.EncapsulatedData.Data, bitsAlloc)
-		} else {
+		case isJPEGLosslessTransferSyntax(tsUID):
+			nf, isColor, err = jpegLosslessFrameToNative(fr.EncapsulatedData.Data, bitsAlloc)
+		default:
 			nf, isColor, err = jpegFrameToNative(fr, bitsAlloc)
 		}
 		if err != nil {
@@ -241,6 +317,28 @@ func j2kFrameToNative(data []byte, bitsAlloc int) (frame.INativeFrame, bool, err
 	if err != nil {
 		return nil, false, err
 	}
+	return planarSamplesToNative(w, h, nc, bitsAlloc, samples)
+}
+
+// jpegLosslessFrameToNative decodes one JPEG Lossless (SOF3) codestream. The
+// libjpeg-turbo decoder returns planar int32 samples on the same contract as
+// decodeJPEG2000, so the two share planarSamplesToNative.
+//
+// Reachable only from a modification profile converting a file already on disk
+// — JPEG Lossless is never negotiated (see canDecompressSyntax).
+func jpegLosslessFrameToNative(data []byte, bitsAlloc int) (frame.INativeFrame, bool, error) {
+	w, h, nc, _, _, samples, err := decodeJPEGLossless(data)
+	if err != nil {
+		return nil, false, err
+	}
+	return planarSamplesToNative(w, h, nc, bitsAlloc, samples)
+}
+
+// planarSamplesToNative packs planar decoder output into a native frame,
+// interleaving the components of a colour image into RGB triplets. The bool
+// reports colour output, which makes the caller rewrite Photometric
+// Interpretation.
+func planarSamplesToNative(w, h, nc, bitsAlloc int, samples []int32) (frame.INativeFrame, bool, error) {
 	pixels := w * h
 	if pixels <= 0 || len(samples) < pixels*nc {
 		return nil, false, errors.New("decoded sample buffer too small")

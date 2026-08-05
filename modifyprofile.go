@@ -5,10 +5,11 @@ package main
 // (~/.dicomqr/profiles.json) and the tag alias map (~/.dicomqr/tags.json),
 // seeded from embedded defaults on first run and never overwritten, so
 // hand-edits survive upgrades. The JSON format and merge semantics match
-// dicomtool, letting profiles be copied between the two tools, with two
-// deliberate divergences: `zip` is dicomqr-only (dicomtool ignores unknown
-// keys), and dicomtool's `maskrows` is intentionally unsupported here — a
-// dicomtool-authored value is dropped on load and stripped on save.
+// dicomtool, letting profiles be copied between the two tools, with three
+// deliberate divergences: `zip` and `transfersyntax` are dicomqr-only
+// (dicomtool ignores unknown keys), and dicomtool's `maskrows` is intentionally
+// unsupported here — a dicomtool-authored value is dropped on load and stripped
+// on save.
 
 import (
 	_ "embed"
@@ -32,25 +33,96 @@ var defaultModTagsJSON []byte
 // directly to the equivalent dicomtool modify command-line parameters; the
 // JSON keys are identical to dicomtool's Profile so the stores interoperate,
 // except: Zip is dicomqr-only (dicomtool's zip is a CLI-run parameter, not a
-// profile field), and dicomtool's maskrows has no field here by design.
+// profile field), TransferSyntax is dicomqr-only (dicomtool has no equivalent),
+// and dicomtool's maskrows has no field here by design.
 type ModProfile struct {
-	Base             string                `json:"base,omitempty"`
-	Sets             []string              `json:"set,omitempty"`
-	Removes          []string              `json:"remove,omitempty"`
-	Keep             []string              `json:"keep,omitempty"`
-	DOB              string                `json:"dob,omitempty"`
-	UIDSuffix        string                `json:"uid,omitempty"`
-	ShiftDays        string                `json:"shiftdays,omitempty"`
-	RemapUIDs        bool                  `json:"remapuids,omitempty"`
-	Priv             bool                  `json:"noprivate,omitempty"`
-	KeepPrivate      bool                  `json:"keepprivate,omitempty"`
-	Dicomdir         bool                  `json:"dicomdir,omitempty"`
-	Verbose          bool                  `json:"verbose,omitempty"`
-	Zip              bool                  `json:"zip,omitempty"`
-	IgnoreTypes      []string              `json:"ignoretype,omitempty"`
-	IgnoreModalities []string              `json:"ignoremodality,omitempty"`
-	FixVR            string                `json:"fixvr,omitempty"`
-	PerModality      map[string]ModProfile `json:"per-modality,omitempty"`
+	Base             string   `json:"base,omitempty"`
+	Sets             []string `json:"set,omitempty"`
+	Removes          []string `json:"remove,omitempty"`
+	Keep             []string `json:"keep,omitempty"`
+	DOB              string   `json:"dob,omitempty"`
+	UIDSuffix        string   `json:"uid,omitempty"`
+	ShiftDays        string   `json:"shiftdays,omitempty"`
+	RemapUIDs        bool     `json:"remapuids,omitempty"`
+	Priv             bool     `json:"noprivate,omitempty"`
+	KeepPrivate      bool     `json:"keepprivate,omitempty"`
+	Dicomdir         bool     `json:"dicomdir,omitempty"`
+	Verbose          bool     `json:"verbose,omitempty"`
+	Zip              bool     `json:"zip,omitempty"`
+	IgnoreTypes      []string `json:"ignoretype,omitempty"`
+	IgnoreModalities []string `json:"ignoremodality,omitempty"`
+	FixVR            string   `json:"fixvr,omitempty"`
+
+	// TransferSyntax is the syntax every exported file is written in, using the
+	// same tokens as ServerProfile.TransferSyntax: tsPrefAny (empty) writes each
+	// file in the syntax it is stored in, tsPrefExplicitLE or tsPrefImplicitLE
+	// convert it. Compressed pixel data is decompressed on the way out; there
+	// are no encoders, so a compressed syntax can never be a target.
+	//
+	// This is independent of the server profile's requirement, which constrains
+	// what a retrieve is allowed to receive. Requiring nothing there and setting
+	// a syntax here keeps the download folder in the archive's own encoding and
+	// converts only on export.
+	TransferSyntax string `json:"transfersyntax,omitempty"`
+
+	PerModality map[string]ModProfile `json:"per-modality,omitempty"`
+}
+
+// modProfileTargetSyntax resolves a profile's TransferSyntax token to the
+// transfer syntax UID exports must be written in, mirroring ServerProfile's
+// requiredTransferSyntax. An empty token yields ("", true) — write each file as
+// stored. ok is false for a token that is neither, which only a hand-edited
+// profiles.json can produce: compileModifyParams turns that into a visible
+// error rather than silently exporting in the wrong syntax.
+func modProfileTargetSyntax(p ModProfile) (string, bool) {
+	switch strings.TrimSpace(p.TransferSyntax) {
+	case tsPrefAny:
+		return "", true
+	case tsPrefExplicitLE:
+		return tsExplicitVRLE, true
+	case tsPrefImplicitLE:
+		return tsImplicitVRLE, true
+	}
+	return "", false
+}
+
+// Labels for the TransferSyntax choice, shared by the profile editor and the
+// per-run Modification dialog so both name the same thing identically. They
+// differ from the server profile's wording on purpose: there the choice governs
+// what a retrieve may receive, here it governs what an export is written as.
+const (
+	tsExportLabelAny      = "As stored (no conversion)"
+	tsExportLabelExplicit = "Explicit VR Little Endian (uncompressed)"
+	tsExportLabelImplicit = "Implicit VR Little Endian (uncompressed)"
+)
+
+// modProfileTSLabels is the option list, in the order the selects present it.
+var modProfileTSLabels = []string{tsExportLabelAny, tsExportLabelExplicit, tsExportLabelImplicit}
+
+// transferSyntaxPrefLabel maps a stored token to its label. An unrecognised
+// token (only a hand-edited profiles.json can hold one) shows as "as stored",
+// which matches nothing the user then saves — compileModifyParams is what
+// reports it, so the editor need not.
+func transferSyntaxPrefLabel(token string) string {
+	switch strings.TrimSpace(token) {
+	case tsPrefExplicitLE:
+		return tsExportLabelExplicit
+	case tsPrefImplicitLE:
+		return tsExportLabelImplicit
+	}
+	return tsExportLabelAny
+}
+
+// transferSyntaxPrefFromLabel is the inverse, mapping a selected label back to
+// the token stored in the profile.
+func transferSyntaxPrefFromLabel(label string) string {
+	switch label {
+	case tsExportLabelExplicit:
+		return tsPrefExplicitLE
+	case tsExportLabelImplicit:
+		return tsPrefImplicitLE
+	}
+	return tsPrefAny
 }
 
 // ModProfileConfig maps profile names to their definitions.
@@ -111,8 +183,9 @@ func loadModProfileConfig(path string) (ModProfileConfig, error) {
 // file remains copy-compatible between the two tools. Saving normalizes the
 // file's layout (alphabetized profile names, 2-space indent) and drops any
 // JSON keys ModProfile does not declare — notably a dicomtool-authored
-// `maskrows`, which dicomqr deliberately removed. dicomqr's own `zip` key is
-// written but ignored (and dropped on save) by dicomtool.
+// `maskrows`, which dicomqr deliberately removed. dicomqr's own `zip` and
+// `transfersyntax` keys are written but ignored (and dropped on save) by
+// dicomtool.
 func saveModProfileConfig(path string, cfg ModProfileConfig) error {
 	if cfg == nil {
 		cfg = ModProfileConfig{}
@@ -210,6 +283,9 @@ func mergeModProfiles(base, override ModProfile) ModProfile {
 	}
 	if override.FixVR != "" {
 		result.FixVR = override.FixVR
+	}
+	if override.TransferSyntax != "" {
+		result.TransferSyntax = override.TransferSyntax
 	}
 
 	result.Priv = base.Priv || override.Priv

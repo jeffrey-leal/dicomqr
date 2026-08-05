@@ -69,6 +69,15 @@ func TestAcceptedSyntaxesFor(t *testing.T) {
 				t.Errorf("acceptedSyntaxesFor(%s) includes %s with no local decoder", req, uid)
 			}
 		}
+		// JPEG Lossless is decodable (canDecompressSyntax says so, for the
+		// benefit of modification profiles converting files already on disk) but
+		// must stay out of negotiation, so no server can be induced to send it.
+		// Decodable-implies-negotiable is deliberately not the rule here.
+		for _, uid := range got {
+			if uid == tsJPEGLossless || uid == tsJPEGLosslessSV1 {
+				t.Errorf("acceptedSyntaxesFor(%s) negotiates JPEG Lossless (%s) — retrieve paths must not offer it", req, uid)
+			}
+		}
 	}
 }
 

@@ -98,6 +98,7 @@ func TestModProfileEditorRoundTrip(t *testing.T) {
 		IgnoreTypes:      []string{"SECONDARY"},
 		IgnoreModalities: []string{"SR"},
 		FixVR:            "correct",
+		TransferSyntax:   tsPrefImplicitLE,
 		PerModality:      map[string]ModProfile{"CT": {Removes: []string{"0018,1030"}}},
 	}
 	cfg := ModProfileConfig{"full": p}
@@ -131,9 +132,27 @@ func TestModProfileEditorRoundTrip(t *testing.T) {
 		t.Errorf("PerModality changed: %+v", updated.PerModality)
 	}
 	if updated.DOB != "19000101" || updated.UIDSuffix != "99" || updated.ShiftDays != "-30" ||
-		updated.FixVR != "correct" || !updated.Priv || !updated.Zip {
+		updated.FixVR != "correct" || !updated.Priv || !updated.Zip ||
+		updated.TransferSyntax != tsPrefImplicitLE {
 		t.Errorf("unedited controlled fields changed: %+v", updated)
 	}
+
+	// The transfer syntax select stores a token, not the label it displays —
+	// the token is what compileModifyParams and dicomtool interoperability see.
+	ed.tsSelect.SetSelected(tsExportLabelExplicit)
+	if _, edited, verr := ed.validate(); verr != nil {
+		t.Fatalf("validate after syntax change: %v", verr)
+	} else if edited.TransferSyntax != tsPrefExplicitLE {
+		t.Errorf("TransferSyntax = %q, want %q", edited.TransferSyntax, tsPrefExplicitLE)
+	}
+	ed.tsSelect.SetSelected(tsExportLabelAny)
+	if _, edited, verr := ed.validate(); verr != nil {
+		t.Fatalf("validate after clearing the syntax: %v", verr)
+	} else if edited.TransferSyntax != "" {
+		t.Errorf("TransferSyntax = %q, want empty so the key stays out of profiles.json", edited.TransferSyntax)
+	}
+	// The disk round-trip below uses `updated`, captured before those edits, so
+	// it covers a profile that does carry the key.
 
 	path := filepath.Join(t.TempDir(), "profiles.json")
 	out := ModProfileConfig{"full": updated}

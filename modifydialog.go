@@ -175,6 +175,8 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	} else {
 		fixvrSelect.SetSelected(fixvrOffLabel)
 	}
+	tsSelect := widget.NewSelect(modProfileTSLabels, nil)
+	tsSelect.SetSelected(transferSyntaxPrefLabel(resolved.TransferSyntax))
 	optionsForm := widget.NewForm(
 		widget.NewFormItem("Remap UIDs", remapCheck),
 		widget.NewFormItem("Remove private tags", privCheck),
@@ -182,6 +184,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		widget.NewFormItem("UID suffix", uidEntry),
 		widget.NewFormItem("Shift dates (days)", shiftEntry),
 		widget.NewFormItem("Fix VR", fixvrSelect),
+		widget.NewFormItem("Output transfer syntax", tsSelect),
 	)
 
 	// Tags removed — read-only list (already keep-filtered by base resolution).
@@ -403,6 +406,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		} else {
 			edited.FixVR = sel
 		}
+		edited.TransferSyntax = transferSyntaxPrefFromLabel(tsSelect.Selected)
 
 		params, err := compileModifyParams(edited, aliases)
 		if err != nil {
@@ -545,7 +549,17 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 				msg += fmt.Sprintf(", %d skipped", res.Skipped)
 			}
 			if res.Failed > 0 {
-				msg += fmt.Sprintf(", %d failed (see Activity Log)", res.Failed)
+				msg += fmt.Sprintf(", %d failed", res.Failed)
+			}
+			// Failures have to be impossible to walk past: an export missing
+			// files still looks finished, and a transfer-syntax conversion that
+			// could not run is exactly the case where the user must know the
+			// export is incomplete. Replace the progress dialog outright rather
+			// than leaving the count in a status line nobody rereads.
+			if res.Failed > 0 {
+				dlg.Hide()
+				showModificationFailureDialog(w, profileName, msg, res)
+				return
 			}
 			statusLbl.SetText(msg)
 			cancelBtn.SetText("Close")
@@ -555,4 +569,53 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 	}()
 
 	dlg.Show()
+}
+
+// modifyFailureListCap bounds how many failures the warning dialog spells out.
+// Beyond it the list stops being readable and the Activity Log — which holds
+// every one of them — is the better place to look.
+const modifyFailureListCap = 20
+
+// showModificationFailureDialog reports a run that finished with per-file
+// failures. It replaces the progress dialog, so the run cannot be dismissed
+// without the failures having been on screen.
+//
+// Each line names the file and the reason the engine recorded, which for a
+// transfer-syntax conversion is the syntax that has no built-in decoder — the
+// one piece of information that tells the user whether the export can be
+// repeated successfully at all.
+func showModificationFailureDialog(w fyne.Window, profileName, summary string, res modifyResult) {
+	head := widget.NewLabel(summary)
+	head.Wrapping = fyne.TextWrapWord
+
+	lead := widget.NewLabel(fmt.Sprintf("%d file(s) could not be written and are missing from the export:", res.Failed))
+	lead.TextStyle = fyne.TextStyle{Bold: true}
+	lead.Wrapping = fyne.TextWrapWord
+
+	shown := res.Failures
+	if len(shown) > modifyFailureListCap {
+		shown = shown[:modifyFailureListCap]
+	}
+	lines := container.NewVBox()
+	for _, f := range shown {
+		l := widget.NewLabel(fmt.Sprintf("%s — %s", filepath.Base(f.File), f.Error))
+		l.Wrapping = fyne.TextWrapWord
+		lines.Add(l)
+	}
+	if extra := len(res.Failures) - len(shown); extra > 0 {
+		more := widget.NewLabel(fmt.Sprintf("…and %d more.", extra))
+		more.TextStyle = fyne.TextStyle{Italic: true}
+		lines.Add(more)
+	}
+	listHeight := canvas.NewRectangle(color.Transparent)
+	listHeight.SetMinSize(fyne.NewSize(560, 200))
+	listBox := container.NewStack(listHeight, container.NewVScroll(lines))
+
+	tail := widget.NewLabel("The Activity Log holds the full list with timestamps.")
+	tail.TextStyle = fyne.TextStyle{Italic: true}
+	tail.Wrapping = fyne.TextWrapWord
+
+	content := container.NewVBox(head, widget.NewSeparator(), lead, listBox, tail)
+	dialog.ShowCustom("Modification — "+profileName+" — completed with errors",
+		"Close", container.NewPadded(content), w)
 }

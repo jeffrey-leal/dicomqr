@@ -25,13 +25,14 @@ func TestIsUncompressedOnDisk(t *testing.T) {
 
 func TestCanDecompressSyntax(t *testing.T) {
 	for uid, want := range map[string]bool{
-		"1.2.840.10008.1.2.4.50": true,              // JPEG Baseline
-		"1.2.840.10008.1.2.4.51": true,              // JPEG Extended
-		"1.2.840.10008.1.2.4.90": jpeg2000Available, // JPEG 2000 Lossless
-		"1.2.840.10008.1.2.4.91": jpeg2000Available, // JPEG 2000
-		"1.2.840.10008.1.2.4.70": false,             // JPEG Lossless SV1
-		"1.2.840.10008.1.2.5":    false,             // RLE
-		"1.2.840.10008.1.2.1":    false,             // not compressed at all
+		"1.2.840.10008.1.2.4.50": true,                  // JPEG Baseline
+		"1.2.840.10008.1.2.4.51": true,                  // JPEG Extended
+		"1.2.840.10008.1.2.4.90": jpeg2000Available,     // JPEG 2000 Lossless
+		"1.2.840.10008.1.2.4.91": jpeg2000Available,     // JPEG 2000
+		"1.2.840.10008.1.2.4.57": jpegLosslessAvailable, // JPEG Lossless
+		"1.2.840.10008.1.2.4.70": jpegLosslessAvailable, // JPEG Lossless SV1
+		"1.2.840.10008.1.2.5":    false,                 // RLE
+		"1.2.840.10008.1.2.1":    false,                 // not compressed at all
 	} {
 		if got := canDecompressSyntax(uid); got != want {
 			t.Errorf("canDecompressSyntax(%q) = %v, want %v", uid, got, want)
@@ -190,5 +191,78 @@ func TestTranscodeRejectsUndecodableSyntax(t *testing.T) {
 
 	if _, err := transcodeDICOMFile(path, tsExplicitVRLE); err == nil {
 		t.Fatal("JPEG-LS source must be rejected (no built-in decoder)")
+	}
+}
+
+// convertDatasetSyntax is the conversion itself, reached both by the receive
+// path (wrapped in file I/O) and by a modification profile, which holds only a
+// parsed dataset. These assertions are on the dataset contract the second
+// caller depends on.
+func TestConvertDatasetSyntax(t *testing.T) {
+	load := func(t *testing.T) sdicom.Dataset {
+		t.Helper()
+		ds, err := sdicom.ParseFile(writeTestDICOM(t, t.TempDir()), nil)
+		if err != nil {
+			t.Fatalf("parse fixture: %v", err)
+		}
+		return ds
+	}
+
+	t.Run("already in target is a no-op", func(t *testing.T) {
+		ds := load(t)
+		changed, err := convertDatasetSyntax(&ds, tsExplicitVRLE, tsExplicitVRLE)
+		if err != nil {
+			t.Fatalf("convertDatasetSyntax: %v", err)
+		}
+		if changed {
+			t.Error("reported a change converting to the syntax it already has")
+		}
+	})
+
+	t.Run("rewrites the meta transfer syntax", func(t *testing.T) {
+		ds := load(t)
+		changed, err := convertDatasetSyntax(&ds, tsExplicitVRLE, tsImplicitVRLE)
+		if err != nil {
+			t.Fatalf("convertDatasetSyntax: %v", err)
+		}
+		if !changed {
+			t.Error("reported no change converting Explicit -> Implicit")
+		}
+		if got := datasetTransferSyntaxUID(&ds); got != tsImplicitVRLE {
+			t.Errorf("dataset transfer syntax = %q, want %q", got, tsImplicitVRLE)
+		}
+	})
+
+	t.Run("undecodable source is rejected", func(t *testing.T) {
+		ds := load(t)
+		// The gate is on the source syntax and fires before any decode, so the
+		// fixture's actual pixel encoding is irrelevant here.
+		if _, err := convertDatasetSyntax(&ds, "1.2.840.10008.1.2.4.80", tsExplicitVRLE); err == nil {
+			t.Fatal("JPEG-LS source must be rejected (no built-in decoder)")
+		}
+	})
+
+	t.Run("unknown source syntax is rejected", func(t *testing.T) {
+		ds := load(t)
+		if _, err := convertDatasetSyntax(&ds, "", tsExplicitVRLE); err == nil {
+			t.Fatal("an empty source syntax must be an error, not a silent pass-through")
+		}
+	})
+}
+
+// datasetTransferSyntaxUID must agree with the file-based reader, since the
+// modification engine relies on it to decide what a file is being converted
+// from.
+func TestDatasetTransferSyntaxUID(t *testing.T) {
+	path := writeTestDICOM(t, t.TempDir())
+	ds, err := sdicom.ParseFile(path, nil)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got, want := datasetTransferSyntaxUID(&ds), fileTransferSyntaxUID(path); got != want {
+		t.Errorf("datasetTransferSyntaxUID = %q, fileTransferSyntaxUID = %q — must agree", got, want)
+	}
+	if got := datasetTransferSyntaxUID(&sdicom.Dataset{}); got != "" {
+		t.Errorf("empty dataset yielded %q, want \"\"", got)
 	}
 }

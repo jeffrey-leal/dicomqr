@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -81,8 +82,12 @@ func TestCompileModifyParamsValidation(t *testing.T) {
 		{"bad uid charset", ModProfile{UIDSuffix: "10"}, "digits in the set"},
 		{"bad fixvr", ModProfile{FixVR: "maybe"}, "must be correct"},
 		{"bad shiftdays", ModProfile{ShiftDays: "abc"}, "must be an integer"},
+		{"bad transfersyntax", ModProfile{TransferSyntax: "jpeg2000"}, "must be explicit-le"},
 		{"no action", ModProfile{}, "no actionable parameter"},
 		{"zip alone is not an action", ModProfile{Zip: true}, "no actionable parameter"},
+		// Unlike zip, a transfer syntax alone is a real transformation: export is
+		// the only place the application can convert a file.
+		{"transfersyntax only is actionable", ModProfile{TransferSyntax: tsPrefImplicitLE}, ""},
 		{"shiftdays only is actionable", ModProfile{ShiftDays: "-45"}, ""},
 		{"shiftdays zero accepted", ModProfile{ShiftDays: "0"}, ""},
 		{"alias set", ModProfile{Sets: []string{"PatientName=X"}}, ""},
@@ -99,6 +104,66 @@ func TestCompileModifyParamsValidation(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: error = %v, want substring %q", tc.name, err, tc.want)
 		}
+	}
+}
+
+// The transfer syntax inherits down a base chain like the other scalars: a
+// child that names none keeps its base's, and one that names its own wins.
+// This is how the shipped profiles are structured, so a syntax set once on a
+// base has to reach every profile built on it.
+func TestModProfileTransferSyntaxInheritance(t *testing.T) {
+	cfg := ModProfileConfig{
+		"base":     {TransferSyntax: tsPrefImplicitLE, Sets: []string{"0010,0010=ANON"}},
+		"child":    {Base: "base"},
+		"override": {Base: "base", TransferSyntax: tsPrefExplicitLE},
+		"plain":    {Sets: []string{"0010,0010=ANON"}},
+	}
+	for name, want := range map[string]string{
+		"base":     tsPrefImplicitLE,
+		"child":    tsPrefImplicitLE,
+		"override": tsPrefExplicitLE,
+		"plain":    "",
+	} {
+		resolved, err := resolveModProfile(name, cfg)
+		if err != nil {
+			t.Fatalf("resolve %s: %v", name, err)
+		}
+		if resolved.TransferSyntax != want {
+			t.Errorf("%s resolved TransferSyntax = %q, want %q", name, resolved.TransferSyntax, want)
+		}
+	}
+}
+
+// modProfileTargetSyntax is the single mapping from stored token to the UID
+// exports are written in; an unknown token must be reported, never treated as
+// "as stored", or a hand-edited profile would silently skip its conversion.
+func TestModProfileTargetSyntax(t *testing.T) {
+	for token, want := range map[string]string{
+		"":               "",
+		tsPrefExplicitLE: tsExplicitVRLE,
+		tsPrefImplicitLE: tsImplicitVRLE,
+		"  ":             "",
+	} {
+		got, ok := modProfileTargetSyntax(ModProfile{TransferSyntax: token})
+		if !ok || got != want {
+			t.Errorf("modProfileTargetSyntax(%q) = (%q, %v), want (%q, true)", token, got, ok, want)
+		}
+	}
+	if _, ok := modProfileTargetSyntax(ModProfile{TransferSyntax: "jpeg2000"}); ok {
+		t.Error("an unknown token must not resolve — it would silently skip the conversion")
+	}
+}
+
+// The label mapping used by both editors must round-trip, or a profile would
+// change syntax merely by being opened and saved.
+func TestTransferSyntaxPrefLabels(t *testing.T) {
+	for _, token := range []string{"", tsPrefExplicitLE, tsPrefImplicitLE} {
+		if got := transferSyntaxPrefFromLabel(transferSyntaxPrefLabel(token)); got != token {
+			t.Errorf("token %q round-tripped to %q", token, got)
+		}
+	}
+	if got := transferSyntaxPrefLabel("jpeg2000"); got != tsExportLabelAny {
+		t.Errorf("unknown token displayed as %q, want %q", got, tsExportLabelAny)
 	}
 }
 
@@ -355,6 +420,195 @@ func TestRunModificationToZip(t *testing.T) {
 		}
 		t.Errorf("output folder = %v, want only export.zip", names)
 	}
+}
+
+// A profile's transfer syntax converts the export while the de-identification
+// still applies, and the source in the download folder is left in its own
+// syntax — the whole point of converting here rather than on the retrieve.
+func TestRunModificationTransferSyntax(t *testing.T) {
+	_, aliases := embeddedModConfigs(t)
+
+	// The fixture is Explicit VR LE, so Implicit VR LE is a real conversion.
+	params, err := compileModifyParams(ModProfile{
+		Sets:           []string{"PatientName=ANON"},
+		TransferSyntax: tsPrefImplicitLE,
+	}, aliases)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	rootDir, outDir := t.TempDir(), t.TempDir()
+	srcPath := filepath.Join(rootDir, "img1.dcm")
+	writeModifyTestDICOM(t, srcPath)
+
+	res := runModification(context.Background(), []string{srcPath}, rootDir, outDir, params, nil, nil)
+	if res.Failed != 0 || res.Processed != 1 {
+		t.Fatalf("result = %+v, want 1 processed 0 failed", res)
+	}
+
+	outPath := filepath.Join(outDir, "img1.dcm")
+	if got := fileTransferSyntaxUID(outPath); got != tsImplicitVRLE {
+		t.Errorf("exported transfer syntax = %q, want %q", got, tsImplicitVRLE)
+	}
+	if got := fileTransferSyntaxUID(srcPath); got != tsExplicitVRLE {
+		t.Errorf("source transfer syntax = %q, want it untouched at %q", got, tsExplicitVRLE)
+	}
+
+	ds, err := sdicom.ParseFile(outPath, nil)
+	if err != nil {
+		t.Fatalf("parse export: %v", err)
+	}
+	e, err := ds.FindElementByTag(tag.PatientName)
+	if err != nil {
+		t.Fatalf("PatientName missing: %v", err)
+	}
+	if got := strings.TrimSpace(sdicom.MustGetStrings(e.Value)[0]); got != "ANON" {
+		t.Errorf("PatientName = %q, want ANON — the tag rules must survive the conversion", got)
+	}
+	// Uncompressed-to-uncompressed is a re-encode, never a pixel transform.
+	if got := modifyTestPixels(t, &ds); !slices.Equal(got, []uint8{10, 20, 30, 40}) {
+		t.Errorf("pixels = %v, want [10 20 30 40] unchanged by the VR conversion", got)
+	}
+}
+
+// The zip sink writes through the same dataset, so the archived entry has to
+// carry the converted syntax too — it has its own write path.
+func TestRunModificationToZipTransferSyntax(t *testing.T) {
+	_, aliases := embeddedModConfigs(t)
+	params, err := compileModifyParams(ModProfile{TransferSyntax: tsPrefImplicitLE}, aliases)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	rootDir, outDir := t.TempDir(), t.TempDir()
+	srcPath := filepath.Join(rootDir, "img1.dcm")
+	writeModifyTestDICOM(t, srcPath)
+
+	zipPath := filepath.Join(outDir, "export.zip")
+	res := runModificationToZip(context.Background(), []string{srcPath}, rootDir, zipPath, params, nil, nil)
+	if res.Failed != 0 || res.Processed != 1 {
+		t.Fatalf("result = %+v, want 1 processed 0 failed", res)
+	}
+
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		t.Fatalf("open zip: %v", err)
+	}
+	defer zr.Close()
+	if len(zr.File) != 1 {
+		t.Fatalf("zip entries = %d, want 1", len(zr.File))
+	}
+	rc, err := zr.File[0].Open()
+	if err != nil {
+		t.Fatalf("open entry: %v", err)
+	}
+	data, err := io.ReadAll(rc)
+	rc.Close()
+	if err != nil {
+		t.Fatalf("read entry: %v", err)
+	}
+	ds, err := sdicom.Parse(bytes.NewReader(data), int64(len(data)), nil)
+	if err != nil {
+		t.Fatalf("parse entry: %v", err)
+	}
+	if got := datasetTransferSyntaxUID(&ds); got != tsImplicitVRLE {
+		t.Errorf("archived transfer syntax = %q, want %q", got, tsImplicitVRLE)
+	}
+}
+
+// A source whose pixel data has no built-in decoder fails that file rather
+// than exporting it in a syntax the profile did not ask for. The failure has to
+// name the syntax: that is what tells the user the export cannot simply be
+// retried.
+func TestRunModificationTransferSyntaxUndecodable(t *testing.T) {
+	_, aliases := embeddedModConfigs(t)
+	params, err := compileModifyParams(ModProfile{TransferSyntax: tsPrefExplicitLE}, aliases)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	rootDir, outDir := t.TempDir(), t.TempDir()
+	srcPath := filepath.Join(rootDir, "rle.dcm")
+	writeEncapsulatedTestDICOM(t, srcPath, "1.2.840.10008.1.2.5") // RLE — no decoder
+
+	res := runModification(context.Background(), []string{srcPath}, rootDir, outDir, params, nil, nil)
+	if res.Processed != 0 || res.Failed != 1 {
+		t.Fatalf("result = %+v, want 0 processed 1 failed", res)
+	}
+	if len(res.Failures) != 1 || !strings.Contains(res.Failures[0].Error, "RLE Lossless") {
+		t.Errorf("failure = %+v, want one naming RLE Lossless", res.Failures)
+	}
+	// Nothing may be left in the export folder for a file that failed.
+	if entries, rerr := os.ReadDir(outDir); rerr == nil && len(entries) != 0 {
+		t.Errorf("export folder holds %d entries, want none", len(entries))
+	}
+}
+
+// writeEncapsulatedTestDICOM writes a file whose pixel data is encapsulated
+// under transferSyntax. The fragment content is arbitrary: the decoder gate
+// rejects the syntax before anything is decoded, which is what the undecodable
+// path exercises.
+func writeEncapsulatedTestDICOM(t *testing.T, path, transferSyntax string) {
+	t.Helper()
+	pd, err := sdicom.NewElement(tag.PixelData, sdicom.PixelDataInfo{
+		IsEncapsulated: true,
+		Frames: []*frame.Frame{{
+			Encapsulated:     true,
+			EncapsulatedData: frame.EncapsulatedFrame{Data: []byte{0x00, 0x01, 0x02, 0x03}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("NewElement(PixelData): %v", err)
+	}
+	pd.ValueLength = tag.VLUndefinedLength
+	pd.RawValueRepresentation = "OB"
+
+	ds := sdicom.Dataset{Elements: []*sdicom.Element{
+		mustTestElement(t, tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.7"}),
+		mustTestElement(t, tag.MediaStorageSOPInstanceUID, []string{"1.2.3.4.9"}),
+		mustTestElement(t, tag.TransferSyntaxUID, []string{transferSyntax}),
+		mustTestElement(t, tag.SOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.7"}),
+		mustTestElement(t, tag.SOPInstanceUID, []string{"1.2.3.4.9"}),
+		mustTestElement(t, tag.PatientName, []string{"DOE^JANE"}),
+		mustTestElement(t, tag.Modality, []string{"OT"}),
+		mustTestElement(t, tag.PhotometricInterpretation, []string{"MONOCHROME2"}),
+		mustTestElement(t, tag.Rows, []int{2}),
+		mustTestElement(t, tag.Columns, []int{2}),
+		mustTestElement(t, tag.BitsAllocated, []int{8}),
+		mustTestElement(t, tag.BitsStored, []int{8}),
+		mustTestElement(t, tag.HighBit, []int{7}),
+		mustTestElement(t, tag.PixelRepresentation, []int{0}),
+		mustTestElement(t, tag.SamplesPerPixel, []int{1}),
+		pd,
+	}}
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer f.Close()
+	if err := sdicom.Write(f, ds, sdicom.SkipVRVerification(), sdicom.SkipValueTypeVerification()); err != nil {
+		t.Fatalf("write encapsulated fixture: %v", err)
+	}
+}
+
+// modifyTestPixels reads back the 4 native 8-bit samples writeModifyTestDICOM
+// stores, so pixel-preservation assertions read as one line.
+func modifyTestPixels(t *testing.T, ds *sdicom.Dataset) []uint8 {
+	t.Helper()
+	e, err := ds.FindElementByTag(tag.PixelData)
+	if err != nil {
+		t.Fatalf("PixelData missing: %v", err)
+	}
+	info, ok := e.Value.GetValue().(sdicom.PixelDataInfo)
+	if !ok || len(info.Frames) != 1 {
+		t.Fatalf("unexpected PixelData: ok=%v frames=%d", ok, len(info.Frames))
+	}
+	nf, ok := info.Frames[0].NativeData.(*frame.NativeFrame[uint8])
+	if !ok {
+		t.Fatalf("frame is not 8-bit native: %T", info.Frames[0].NativeData)
+	}
+	return nf.RawData
 }
 
 // TestExportRelPaths verifies the PHI-safe export layout: a study-level run
