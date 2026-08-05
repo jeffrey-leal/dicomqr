@@ -42,9 +42,18 @@ type Settings struct {
 	DownloadDir  string          `json:"downloadDir"`
 	Profiles     []ServerProfile `json:"profiles"`
 
-	// Window size persisted across sessions (Phase 5-2B); zero means use default.
+	// Window size persisted across sessions (Phase 5-2B); zero means use
+	// default. These are Fyne's scaled units, the ones Window.Resize takes.
 	WindowWidth  float32 `json:"windowWidth"`
 	WindowHeight float32 `json:"windowHeight"`
+
+	// Window position persisted across sessions, in physical pixels — the
+	// units the Windows API works in, since Fyne cannot position a window at
+	// all (see windowplacement.go). WindowPosSaved distinguishes "never
+	// placed" from a window legitimately sitting at 0,0.
+	WindowX        int32 `json:"windowX"`
+	WindowY        int32 `json:"windowY"`
+	WindowPosSaved bool  `json:"windowPosSaved"`
 
 	// Appearance of selected tree rows (Phase 5-2E). SelectionColor is an
 	// RRGGBBAA hex string; empty means follow the theme's primary colour.

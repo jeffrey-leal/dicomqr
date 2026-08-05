@@ -5,7 +5,10 @@ package main
 // (~/.dicomqr/profiles.json) and the tag alias map (~/.dicomqr/tags.json),
 // seeded from embedded defaults on first run and never overwritten, so
 // hand-edits survive upgrades. The JSON format and merge semantics match
-// dicomtool exactly, letting profiles be copied between the two tools.
+// dicomtool, letting profiles be copied between the two tools, with two
+// deliberate divergences: `zip` is dicomqr-only (dicomtool ignores unknown
+// keys), and dicomtool's `maskrows` is intentionally unsupported here — a
+// dicomtool-authored value is dropped on load and stripped on save.
 
 import (
 	_ "embed"
@@ -27,7 +30,9 @@ var defaultModTagsJSON []byte
 
 // ModProfile holds a named collection of modification parameters. Fields map
 // directly to the equivalent dicomtool modify command-line parameters; the
-// JSON keys are identical to dicomtool's Profile so the stores interoperate.
+// JSON keys are identical to dicomtool's Profile so the stores interoperate,
+// except: Zip is dicomqr-only (dicomtool's zip is a CLI-run parameter, not a
+// profile field), and dicomtool's maskrows has no field here by design.
 type ModProfile struct {
 	Base             string                `json:"base,omitempty"`
 	Sets             []string              `json:"set,omitempty"`
@@ -35,12 +40,13 @@ type ModProfile struct {
 	Keep             []string              `json:"keep,omitempty"`
 	DOB              string                `json:"dob,omitempty"`
 	UIDSuffix        string                `json:"uid,omitempty"`
+	ShiftDays        string                `json:"shiftdays,omitempty"`
 	RemapUIDs        bool                  `json:"remapuids,omitempty"`
 	Priv             bool                  `json:"noprivate,omitempty"`
 	KeepPrivate      bool                  `json:"keepprivate,omitempty"`
 	Dicomdir         bool                  `json:"dicomdir,omitempty"`
 	Verbose          bool                  `json:"verbose,omitempty"`
-	MaskRows         int                   `json:"maskrows,omitempty"`
+	Zip              bool                  `json:"zip,omitempty"`
 	IgnoreTypes      []string              `json:"ignoretype,omitempty"`
 	IgnoreModalities []string              `json:"ignoremodality,omitempty"`
 	FixVR            string                `json:"fixvr,omitempty"`
@@ -101,11 +107,12 @@ func loadModProfileConfig(path string) (ModProfileConfig, error) {
 }
 
 // saveModProfileConfig writes cfg to the profile store at path as indented
-// JSON, atomically. The JSON keys match dicomtool's Profile exactly, so the
-// saved file remains copy-compatible between the two tools. Saving normalizes
-// the file's layout (alphabetized profile names, 2-space indent) and drops any
-// JSON keys ModProfile does not declare — the two tools have full field parity
-// today, so nothing is lost.
+// JSON, atomically. The JSON keys match dicomtool's Profile, so the saved
+// file remains copy-compatible between the two tools. Saving normalizes the
+// file's layout (alphabetized profile names, 2-space indent) and drops any
+// JSON keys ModProfile does not declare — notably a dicomtool-authored
+// `maskrows`, which dicomqr deliberately removed. dicomqr's own `zip` key is
+// written but ignored (and dropped on save) by dicomtool.
 func saveModProfileConfig(path string, cfg ModProfileConfig) error {
 	if cfg == nil {
 		cfg = ModProfileConfig{}
@@ -198,8 +205,8 @@ func mergeModProfiles(base, override ModProfile) ModProfile {
 	if override.UIDSuffix != "" {
 		result.UIDSuffix = override.UIDSuffix
 	}
-	if override.MaskRows > 0 {
-		result.MaskRows = override.MaskRows
+	if override.ShiftDays != "" {
+		result.ShiftDays = override.ShiftDays
 	}
 	if override.FixVR != "" {
 		result.FixVR = override.FixVR
@@ -208,6 +215,7 @@ func mergeModProfiles(base, override ModProfile) ModProfile {
 	result.Priv = base.Priv || override.Priv
 	result.Dicomdir = base.Dicomdir || override.Dicomdir
 	result.Verbose = base.Verbose || override.Verbose
+	result.Zip = base.Zip || override.Zip
 	result.RemapUIDs = base.RemapUIDs || override.RemapUIDs
 
 	// Sets: override wins per tag; base contributes tags not in override.
@@ -325,6 +333,47 @@ func parseTagString(s string) (tag.Tag, error) {
 		return tag.Tag{}, fmt.Errorf("invalid element %q: %w", parts[1], err)
 	}
 	return tag.Tag{Group: uint16(group), Element: uint16(elem)}, nil
+}
+
+// The three scalar profile fields with a validation rule are checked in every
+// place they can be edited (profile editor, per-modality sub-editor, the
+// per-run Modification dialog), so the rules live here rather than in any one
+// dialog. Each validator returns the trimmed value ready for storage.
+
+// validateDOBMask trims s and returns it; a non-empty birth-date mask must be
+// exactly 8 characters (YYYYMMDD).
+func validateDOBMask(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if s != "" && len(s) != 8 {
+		return "", fmt.Errorf("the birth date mask must be exactly 8 characters (YYYYMMDD), got %d", len(s))
+	}
+	return s, nil
+}
+
+// validateUIDSuffix trims s and returns it; only the digits 1-9 are allowed
+// (0 would create ".0"-prefixed UID components, which are invalid).
+func validateUIDSuffix(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	for _, c := range s {
+		if c < '1' || c > '9' {
+			return "", fmt.Errorf("the UID suffix may contain only the digits 1-9")
+		}
+	}
+	return s, nil
+}
+
+// validateShiftDays trims s and returns it; a non-empty date shift must parse
+// as an integer number of days (sign allowed, and zero is accepted to match
+// dicomtool — it is an actionable no-op there).
+func validateShiftDays(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", nil
+	}
+	if _, err := strconv.Atoi(s); err != nil {
+		return "", fmt.Errorf("the date shift must be a whole number of days (e.g. -45)")
+	}
+	return s, nil
 }
 
 // tagDisplayName returns a human-readable name for t: the standard dictionary

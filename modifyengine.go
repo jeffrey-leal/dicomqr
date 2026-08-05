@@ -5,7 +5,7 @@ package main
 // identically. Per-file order of operations (matching dicomtool):
 //
 //	parse → ignoretype → ignoremodality → per-modality overrides → fixvr →
-//	remove + noprivate → dob mask → uid suffix / uid remap → maskrows → set
+//	remove + noprivate → date shift → dob mask → uid suffix / uid remap → set
 //
 // Files are read from the download folder and written to a separate output
 // folder preserving the relative folder structure; sources are never touched.
@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	sdicom "github.com/suyashkumar/dicom"
 	"github.com/suyashkumar/dicom/pkg/tag"
@@ -41,13 +42,15 @@ type tagEdit struct {
 // modifyParams is a fully parsed and validated set of modification parameters,
 // ready for processFile. Built from a ModProfile by compileModifyParams.
 type modifyParams struct {
-	edits            []tagEdit
-	removals         []tag.Tag
-	dobMask          string
-	uidSuffix        string
+	edits     []tagEdit
+	removals  []tag.Tag
+	dobMask   string
+	uidSuffix string
+	// shiftDays stays a string: "" means no shift while "0" is an accepted
+	// (no-op) action, matching dicomtool. Atoi-validated by compileModifyParams.
+	shiftDays        string
 	fixvrMode        string
 	removePrivate    bool
-	maskRows         int
 	ignoreTypes      []string
 	ignoreModalities []string
 	perMod           map[string]modalityOverride
@@ -65,10 +68,12 @@ func compileModifyParams(p ModProfile, aliases TagConfig) (modifyParams, error) 
 		return mp, fmt.Errorf("fixvr %q: must be correct, skip, or passthrough", p.FixVR)
 	}
 
-	if p.MaskRows < 0 {
-		return mp, fmt.Errorf("maskrows %d must not be negative", p.MaskRows)
+	mp.shiftDays = strings.TrimSpace(p.ShiftDays)
+	if mp.shiftDays != "" {
+		if _, err := strconv.Atoi(mp.shiftDays); err != nil {
+			return mp, fmt.Errorf("shiftdays %q must be an integer", p.ShiftDays)
+		}
 	}
-	mp.maskRows = p.MaskRows
 
 	mp.remapUIDs = p.RemapUIDs
 	mp.uidSuffix = strings.TrimSpace(p.UIDSuffix)
@@ -133,12 +138,12 @@ func compileModifyParams(p ModProfile, aliases TagConfig) (modifyParams, error) 
 	}
 
 	hasAction := len(mp.edits) > 0 || len(mp.removals) > 0 ||
-		mp.dobMask != "" || mp.uidSuffix != "" || mp.maskRows > 0 ||
+		mp.dobMask != "" || mp.uidSuffix != "" || mp.shiftDays != "" ||
 		mp.removePrivate || mp.fixvrMode != "" ||
 		len(mp.ignoreTypes) > 0 || len(mp.ignoreModalities) > 0 ||
 		len(mp.perMod) > 0 || mp.remapUIDs
 	if !hasAction {
-		return mp, errors.New("the profile contains no actionable parameter (set, remove, dob, uid, maskrows, noprivate, fixvr, remapuids)")
+		return mp, errors.New("the profile contains no actionable parameter (set, remove, dob, uid, shiftdays, noprivate, fixvr, remapuids)")
 	}
 
 	return mp, nil
@@ -499,8 +504,8 @@ type modalityOverride struct {
 	keep          []tag.Tag
 	dobMask       string
 	uidSuffix     string
+	shiftDays     string
 	fixvrMode     string
-	maskRows      int
 	removePrivate bool
 	keepPrivate   bool
 }
@@ -542,8 +547,8 @@ func buildModalityOverrides(perMod map[string]ModProfile, aliases TagConfig) map
 		}
 		ov.dobMask = p.DOB
 		ov.uidSuffix = p.UIDSuffix
+		ov.shiftDays = p.ShiftDays
 		ov.fixvrMode = p.FixVR
-		ov.maskRows = p.MaskRows
 		ov.removePrivate = p.Priv
 		ov.keepPrivate = p.KeepPrivate
 		result[mod] = ov
@@ -599,9 +604,9 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 	removals := p.removals
 	dobMask := p.dobMask
 	uidSuffix := p.uidSuffix
+	shiftDaysStr := p.shiftDays
 	fixvrMode := p.fixvrMode
 	removePrivate := p.removePrivate
-	maskRows := p.maskRows
 
 	info, err := src.Stat()
 	if err != nil {
@@ -655,11 +660,11 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 					if ov.uidSuffix != "" {
 						uidSuffix = ov.uidSuffix
 					}
+					if ov.shiftDays != "" {
+						shiftDaysStr = ov.shiftDays
+					}
 					if ov.fixvrMode != "" {
 						fixvrMode = ov.fixvrMode
-					}
-					if ov.maskRows > 0 {
-						maskRows = ov.maskRows
 					}
 					if ov.removePrivate {
 						removePrivate = true
@@ -685,6 +690,18 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 		ds.Elements = pruneElements(ds.Elements, removalSet, removePrivate)
 	}
 
+	if shiftDaysStr != "" {
+		// Re-validated defensively: compileModifyParams checks the top-level
+		// value, but a hand-authored per-modality block can carry garbage.
+		// Failing the file (rather than silently skipping the shift) matches
+		// dicomtool and keeps real dates from shipping unnoticed.
+		n, err := strconv.Atoi(shiftDaysStr)
+		if err != nil {
+			return false, ds, fmt.Errorf("shiftdays %q must be an integer", shiftDaysStr)
+		}
+		applyDateShift(ds.Elements, n)
+	}
+
 	if dobMask != "" {
 		if err := applyDOBMask(&ds, dobMask); err != nil {
 			return false, ds, err
@@ -697,10 +714,6 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 
 	if uidRemap != nil {
 		applyUIDRemap(ds.Elements, uidRemap)
-	}
-
-	if maskRows > 0 {
-		applyRowMask(&ds, maskRows)
 	}
 
 	for _, e := range edits {
@@ -892,6 +905,67 @@ func applyUIDRemap(elements []*sdicom.Element, r *uidRemapper) {
 	}
 }
 
+// applyDateShift shifts every DA and DT element's leading YYYYMMDD date
+// component by shiftDays (positive, negative, or zero) at any nesting depth.
+// PatientBirthDate is always left untouched — that field is the dedicated
+// responsibility of the dob mask, independent of shiftdays. Values that don't
+// parse as a full 8-digit date are left unchanged.
+func applyDateShift(elements []*sdicom.Element, shiftDays int) {
+	for _, elem := range elements {
+		if elem.Value != nil && elem.Value.ValueType() == sdicom.Sequences {
+			if seqItems, ok := elem.Value.GetValue().([]*sdicom.SequenceItemValue); ok {
+				for _, item := range seqItems {
+					if itemElems, ok2 := item.GetValue().([]*sdicom.Element); ok2 {
+						applyDateShift(itemElems, shiftDays)
+					}
+				}
+			}
+			continue
+		}
+		vr := elem.RawValueRepresentation
+		if vr != "DA" && vr != "DT" {
+			continue
+		}
+		if elem.Tag == tag.PatientBirthDate {
+			continue
+		}
+		vals, ok := elem.Value.GetValue().([]string)
+		if !ok {
+			continue
+		}
+		changed := false
+		out := make([]string, len(vals))
+		for i, v := range vals {
+			if shifted, ok := shiftDateString(v, shiftDays); ok {
+				out[i] = shifted
+				changed = true
+			} else {
+				out[i] = v
+			}
+		}
+		if changed {
+			if nv, err := sdicom.NewValue(out); err == nil {
+				elem.Value = nv
+			}
+		}
+	}
+}
+
+// shiftDateString shifts the leading YYYYMMDD component of v by shiftDays,
+// preserving any trailing characters unchanged (the time/fraction/timezone
+// suffix of a DT value). Returns ok=false — leave v unchanged — when v is
+// shorter than 8 characters or the date portion fails to parse.
+func shiftDateString(v string, shiftDays int) (string, bool) {
+	if len(v) < 8 {
+		return v, false
+	}
+	t, err := time.Parse("20060102", v[:8])
+	if err != nil {
+		return v, false
+	}
+	return t.AddDate(0, 0, shiftDays).Format("20060102") + v[8:], true
+}
+
 // generateUID returns a globally unique DICOM UID using the ISO 2.25 UUID
 // root, matching dicomtool's UID generation.
 func generateUID() string {
@@ -932,69 +1006,6 @@ func applyDOBMask(ds *sdicom.Dataset, mask string) error {
 	}
 
 	return applyEdit(ds, tagEdit{tag: dobTag, value: string(result)})
-}
-
-// applyRowMask zeros the first numRows pixel rows from the top of each frame
-// in ds. Compressed (encapsulated) images are skipped.
-func applyRowMask(ds *sdicom.Dataset, numRows int) {
-	pixelDataTag := tag.Tag{Group: 0x7FE0, Element: 0x0010}
-	elem, err := ds.FindElementByTag(pixelDataTag)
-	if err != nil {
-		return
-	}
-
-	info, ok := elem.Value.GetValue().(sdicom.PixelDataInfo)
-	if !ok {
-		return
-	}
-	if info.IsEncapsulated {
-		return
-	}
-
-	for _, f := range info.Frames {
-		if f.Encapsulated {
-			continue
-		}
-		native := f.NativeData // frame.INativeFrame
-		if native == nil {
-			continue
-		}
-		rows := native.Rows()
-		cols := native.Cols()
-		spp := native.SamplesPerPixel()
-		if rows == 0 || cols == 0 || spp == 0 {
-			continue
-		}
-		count := numRows
-		if count > rows {
-			count = rows
-		}
-		// Samples to zero = masked rows × pixels-per-row × samples-per-pixel.
-		n := count * cols * spp
-		switch raw := native.RawDataSlice().(type) {
-		case []uint8:
-			if n > len(raw) {
-				n = len(raw)
-			}
-			for i := range raw[:n] {
-				raw[i] = 0
-			}
-		case []uint16:
-			if n > len(raw) {
-				n = len(raw)
-			}
-			for i := range raw[:n] {
-				raw[i] = 0
-			}
-		case []uint32:
-			if n > len(raw) {
-				n = len(raw)
-			}
-			for i := range raw[:n] {
-				raw[i] = 0
-			}
-		}
-	}
 }
 
 // applyFixVR scans ds for elements whose VR does not match the DICOM standard

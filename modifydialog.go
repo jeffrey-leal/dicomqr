@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -156,7 +155,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	}
 
 	// Options — effective profile values; unset fields show the application
-	// defaults (empty masks, zero rows, fixvr off, booleans false).
+	// defaults (empty masks, no date shift, fixvr off, booleans false).
 	remapCheck := widget.NewCheck("", nil)
 	remapCheck.SetChecked(resolved.RemapUIDs)
 	privCheck := widget.NewCheck("", nil)
@@ -167,8 +166,9 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	uidEntry := widget.NewEntry()
 	uidEntry.SetText(resolved.UIDSuffix)
 	uidEntry.SetPlaceHolder("digits 1-9 — empty = none")
-	maskEntry := widget.NewEntry()
-	maskEntry.SetText(strconv.Itoa(resolved.MaskRows))
+	shiftEntry := widget.NewEntry()
+	shiftEntry.SetText(resolved.ShiftDays)
+	shiftEntry.SetPlaceHolder("e.g. -45 — shifts all dates except birth date")
 	fixvrSelect := widget.NewSelect([]string{fixvrOffLabel, "correct", "skip", "passthrough"}, nil)
 	if m := strings.ToLower(strings.TrimSpace(resolved.FixVR)); m != "" {
 		fixvrSelect.SetSelected(m)
@@ -180,7 +180,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		widget.NewFormItem("Remove private tags", privCheck),
 		widget.NewFormItem("Birth date mask", dobEntry),
 		widget.NewFormItem("UID suffix", uidEntry),
-		widget.NewFormItem("Mask top pixel rows", maskEntry),
+		widget.NewFormItem("Shift dates (days)", shiftEntry),
 		widget.NewFormItem("Fix VR", fixvrSelect),
 	)
 
@@ -333,6 +333,9 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		}()
 	})
 	zipCheck := widget.NewCheck("Write a single <export folder name>.zip instead of a folder", nil)
+	// The profile's zip field pre-checks the box; the checkbox remains the
+	// per-run override and is never written back to the profile.
+	zipCheck.SetChecked(resolved.Zip)
 	exportForm := widget.NewForm(
 		widget.NewFormItem("Export folder name", exportNameEntry),
 		widget.NewFormItem("Output folder", container.NewBorder(nil, nil, nil, changeOutDirBtn, outDirLabel)),
@@ -365,30 +368,24 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 			dialog.ShowError(err, w)
 			return
 		}
-		dob := strings.TrimSpace(dobEntry.Text)
-		if dob != "" && len(dob) != 8 {
-			dialog.ShowError(fmt.Errorf("the birth date mask must be exactly 8 characters (YYYYMMDD), got %d", len(dob)), w)
+		dob, err := validateDOBMask(dobEntry.Text)
+		if err != nil {
+			dialog.ShowError(err, w)
 			return
 		}
-		uidSfx := strings.TrimSpace(uidEntry.Text)
-		for _, c := range uidSfx {
-			if c < '1' || c > '9' {
-				dialog.ShowError(fmt.Errorf("the UID suffix may contain only the digits 1-9"), w)
-				return
-			}
+		uidSfx, err := validateUIDSuffix(uidEntry.Text)
+		if err != nil {
+			dialog.ShowError(err, w)
+			return
 		}
 		if remapCheck.Checked && uidSfx != "" {
 			dialog.ShowError(fmt.Errorf("Remap UIDs and a UID suffix cannot be combined — clear one of them"), w)
 			return
 		}
-		maskRows := 0
-		if s := strings.TrimSpace(maskEntry.Text); s != "" {
-			n, err := strconv.Atoi(s)
-			if err != nil || n < 0 {
-				dialog.ShowError(fmt.Errorf("mask top pixel rows must be a whole number ≥ 0"), w)
-				return
-			}
-			maskRows = n
+		shift, err := validateShiftDays(shiftEntry.Text)
+		if err != nil {
+			dialog.ShowError(err, w)
+			return
 		}
 
 		edited := resolved
@@ -398,7 +395,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		}
 		edited.DOB = dob
 		edited.UIDSuffix = uidSfx
-		edited.MaskRows = maskRows
+		edited.ShiftDays = shift
 		edited.RemapUIDs = remapCheck.Checked
 		edited.Priv = privCheck.Checked
 		if sel := fixvrSelect.Selected; sel == "" || sel == fixvrOffLabel {

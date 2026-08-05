@@ -223,7 +223,14 @@ func (r *logRow) TappedSecondary(e *fyne.PointEvent) {
 // instantly (the dialog reads the in-memory ring, never dicom.log). A
 // 1-second ticker updates the view while the dialog is open; the goroutine
 // exits when the Close button is pressed.
-func showLogDialog(w fyne.Window) {
+func showLogDialog(a fyne.App, parent fyne.Window) {
+	if raiseOwnedWindow("activity-log") {
+		return
+	}
+	// w is the log's own window, assigned as it opens at the foot of this
+	// function; the clipboard and right-click menu below belong to it. All of
+	// them run from user interaction, long after the assignment.
+	var w fyne.Window
 	// Rows are compact logRow widgets (canvas.Text in the shared rowLayout —
 	// the results trees' styling) and the List's row separators are hidden,
 	// together restoring the dense line spacing of the old text view.
@@ -349,13 +356,7 @@ func showLogDialog(w fyne.Window) {
 		listBox,
 	)
 
-	dlg := widget.NewModalPopUp(container.NewPadded(content), w.Canvas())
-	dlg.Resize(fyne.NewSize(860, 560))
-
-	closeBtn.OnTapped = func() {
-		cancel()
-		dlg.Hide()
-	}
+	closeBtn.OnTapped = func() { w.Close() }
 
 	go func() {
 		ticker := time.NewTicker(time.Second)
@@ -370,5 +371,17 @@ func showLogDialog(w fyne.Window) {
 		}
 	}()
 
-	dlg.Show()
+	// Deliberately not blocking: the log is for consulting while working, so
+	// the window behind it stays live. OnClosed stops the refresh ticker on
+	// every route out — previously only the Close button did, so dismissing
+	// the panel any other way left the goroutine running for the session.
+	w = openOwnedWindow(a, windowSpec{
+		Key:      "activity-log",
+		Title:    "Activity Log",
+		Size:     fyne.NewSize(880, 580),
+		Parent:   parent,
+		OnClosed: cancel,
+	}, func(fyne.Window) fyne.CanvasObject {
+		return container.NewPadded(content)
+	})
 }

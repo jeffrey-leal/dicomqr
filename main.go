@@ -139,13 +139,27 @@ func main() {
 		cat = nil
 	}
 
-	// Restore the persisted window size, falling back to the default for fresh
-	// installs or implausibly small saved values (Phase 5-2B).
-	if cfg.WindowWidth > 200 && cfg.WindowHeight > 150 {
+	// Restore the persisted window size, falling back for fresh installs or
+	// implausibly small saved values (Phase 5-2B) to a share of the screen —
+	// see placeMainWindow, which also positions the window, something Fyne
+	// itself cannot do. The Resize below still runs in the no-saved-size case
+	// so the window is sensible even if the native placement cannot be made.
+	haveSavedSize := cfg.WindowWidth > 200 && cfg.WindowHeight > 150
+	if haveSavedSize {
 		w.Resize(fyne.NewSize(cfg.WindowWidth, cfg.WindowHeight))
 	} else {
 		w.Resize(fyne.NewSize(900, 650))
 	}
+	// Restore the position the window was last closed at, or place it by the
+	// default rule on a first run. Size is only imposed when the user has not
+	// already chosen one by resizing in an earlier session.
+	var savedPos *winPoint
+	if cfg.WindowPosSaved {
+		savedPos = &winPoint{X: cfg.WindowX, Y: cfg.WindowY}
+	}
+	a.Lifecycle().SetOnStarted(func() {
+		placeMainWindow("dicomqr", savedPos, 0.60, 0.80, !haveSavedSize)
+	})
 
 	currentTheme := newAppTheme(cfg.DarkTheme, cfg.UITheme)
 	if cfg.FontName != "" {
@@ -1555,7 +1569,7 @@ func main() {
 		bd = "unknown"
 	}
 	helpMenu := fyne.NewMenu("Help",
-		fyne.NewMenuItem("Activity Log…", func() { showLogDialog(w) }),
+		fyne.NewMenuItem("Activity Log…", func() { showLogDialog(a, w) }),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("About", func() {
 			iconImg := canvas.NewImageFromResource(appIcon)
@@ -1651,6 +1665,14 @@ func main() {
 		if sz.Width > 200 && sz.Height > 150 {
 			cfg.WindowWidth = sz.Width
 			cfg.WindowHeight = sz.Height
+		}
+		// Remember where the user left the window. Fyne cannot report a
+		// window position, so this comes from Windows; a failure just leaves
+		// the previous value, and the next launch falls back to the default
+		// placement rather than moving the window somewhere wrong.
+		if r, ok := mainWindowRect("dicomqr"); ok {
+			cfg.WindowX, cfg.WindowY = r.Left, r.Top
+			cfg.WindowPosSaved = true
 		}
 		saveSettings(cfg)
 		stopClock()

@@ -211,7 +211,18 @@ func prefSection(title string, content ...fyne.CanvasObject) *fyne.Container {
 // (local SCP identity, download folder, stall timeout, server profiles), User
 // Interface (appearance, external viewer, tag highlights and profiles), and
 // Modification & Export (de-identification profiles and defaults).
-func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Settings, onApply func(Settings)) {
+func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cfg *Settings, onApply func(Settings)) {
+	if raiseOwnedWindow("preferences") {
+		return
+	}
+	// w is the Preferences window itself, assigned as it opens at the foot of
+	// this function. Everything built below — colour pickers, the server and
+	// tag profile editors, confirmations, the modification-profile editor —
+	// parents to w rather than to the window that opened Preferences: a child
+	// parented to the latter would surface behind the blocked Preferences
+	// window with no way to reach it. All such uses sit inside callbacks, so
+	// the late assignment is in place long before any of them can run.
+	var w fyne.Window
 	themeLabel := "Light"
 	if current.isDark {
 		themeLabel = "Dark"
@@ -528,10 +539,13 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 			if p.Base != "" {
 				desc += ", base: " + p.Base
 			}
+			if len(p.PerModality) > 0 {
+				desc += fmt.Sprintf(", %d per-modality", len(p.PerModality))
+			}
 			desc += ")"
 			nameLabel := widget.NewLabel(desc)
 			editBtn := widget.NewButton("Edit", func() {
-				showModProfileEditor(w, n, pendingModProfiles[n], pendingModProfiles,
+				showModProfileEditor(a, w, n, pendingModProfiles[n], pendingModProfiles,
 					func(newName string, updated ModProfile) {
 						if newName != n {
 							delete(pendingModProfiles, n)
@@ -580,7 +594,7 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 	}
 
 	addModProfileBtn := widget.NewButton("Add profile…", func() {
-		showModProfileEditor(w, "", ModProfile{}, pendingModProfiles,
+		showModProfileEditor(a, w, "", ModProfile{}, pendingModProfiles,
 			func(newName string, added ModProfile) {
 				pendingModProfiles[newName] = added
 				buildModProfileList()
@@ -635,8 +649,7 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 		),
 	)
 
-	var d dialog.Dialog
-	cancelBtn := widget.NewButton("Cancel", func() { d.Hide() })
+	cancelBtn := widget.NewButton("Cancel", func() { w.Close() })
 	applyBtn := widget.NewButton("Apply", func() {
 		current.isDark = themeSelect.Selected == "Dark"
 		current.pack = packByLabel[themePackSelect.Selected]
@@ -720,7 +733,7 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 		a.Settings().SetTheme(current)
 		onApply(updated)
 		refreshOpenTagViewers()
-		d.Hide()
+		w.Close()
 	})
 
 	buttonRow := container.NewBorder(
@@ -743,8 +756,21 @@ func showPreferencesDialog(a fyne.App, w fyne.Window, current *appTheme, cfg *Se
 	minSize.SetMinSize(fyne.NewSize(640, 520))
 	content := container.NewStack(minSize,
 		container.NewBorder(nil, buttonRow, nil, nil, tabs))
-	d = dialog.NewCustomWithoutButtons("Preferences", content, w)
-	d.Show()
+	// Preferences owns the modification-profile editors it opens, so closing
+	// it takes them with it; blocking the window behind it preserves what the
+	// dialog gave for free, and matters because Apply writes a whole settings
+	// snapshot back — letting the main window be changed underneath would
+	// silently discard those changes.
+	openOwnedWindow(a, windowSpec{
+		Key:      "preferences",
+		Title:    "Preferences",
+		Size:     fyne.NewSize(720, 640),
+		Parent:   parent,
+		Blocking: true,
+	}, func(win fyne.Window) fyne.CanvasObject {
+		w = win
+		return content
+	})
 }
 
 // showServerProfileEditor opens an edit dialog for a single ServerProfile.

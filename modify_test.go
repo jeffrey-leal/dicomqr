@@ -80,7 +80,11 @@ func TestCompileModifyParamsValidation(t *testing.T) {
 		{"bad dob length", ModProfile{DOB: "1980"}, "8 characters"},
 		{"bad uid charset", ModProfile{UIDSuffix: "10"}, "digits in the set"},
 		{"bad fixvr", ModProfile{FixVR: "maybe"}, "must be correct"},
+		{"bad shiftdays", ModProfile{ShiftDays: "abc"}, "must be an integer"},
 		{"no action", ModProfile{}, "no actionable parameter"},
+		{"zip alone is not an action", ModProfile{Zip: true}, "no actionable parameter"},
+		{"shiftdays only is actionable", ModProfile{ShiftDays: "-45"}, ""},
+		{"shiftdays zero accepted", ModProfile{ShiftDays: "0"}, ""},
 		{"alias set", ModProfile{Sets: []string{"PatientName=X"}}, ""},
 		{"short-form remove", ModProfile{Removes: []string{"8,80"}}, ""},
 	}
@@ -140,6 +144,14 @@ func writeModifyTestDICOM(t *testing.T, path string) (hasPrivate bool) {
 		mustTestElement(t, tag.PatientBirthDate, []string{"19800615"}),
 		mustTestElement(t, tag.AccessionNumber, []string{"ACC42"}),
 		mustTestElement(t, tag.InstitutionName, []string{"GENERAL HOSPITAL"}),
+		mustTestElement(t, tag.Modality, []string{"OT"}),
+		mustTestElement(t, tag.StudyDate, []string{"20240102"}),
+		mustTestElement(t, tag.AcquisitionDateTime, []string{"20240102093000.000000+0000"}),
+		// A sequence carrying a date proves the shift recurses; 0008,1140 is not
+		// touched by the default profiles, so the other end-to-end tests are inert.
+		mustTestElement(t, tag.Tag{Group: 0x0008, Element: 0x1140}, [][]*sdicom.Element{{
+			mustTestElement(t, tag.StudyDate, []string{"20240102"}),
+		}}),
 		mustTestElement(t, tag.StudyInstanceUID, []string{"1.2.3.4"}),
 		mustTestElement(t, tag.SeriesInstanceUID, []string{"1.2.3.4.1"}),
 		mustTestElement(t, tag.PhotometricInterpretation, []string{"MONOCHROME2"}),
@@ -390,6 +402,230 @@ func TestExportRelPaths(t *testing.T) {
 		if strings.Contains(m, patient) || strings.Contains(m, studyA) || strings.Contains(m, studyB) {
 			t.Errorf("mapped path %q leaks a source folder name", m)
 		}
+	}
+}
+
+// TestShiftDateString mirrors dicomtool's table so the two implementations
+// stay provably identical.
+func TestShiftDateString(t *testing.T) {
+	tests := []struct {
+		name      string
+		in        string
+		shiftDays int
+		want      string
+		wantOK    bool
+	}{
+		{"positive shift", "20200115", 10, "20200125", true},
+		{"negative shift", "20200115", -10, "20200105", true},
+		{"month rollover", "20200130", 5, "20200204", true},
+		{"year rollover", "20201228", 10, "20210107", true},
+		{"leap year Feb 29 plus one", "20200229", 1, "20200301", true},
+		{"zero shift is a no-op", "20200115", 0, "20200115", true},
+		{"DT value keeps time/fraction/zone suffix", "20200115120000.000000+0000", -1, "20200114120000.000000+0000", true},
+		{"too short", "2020011", 1, "2020011", false},
+		{"empty", "", 1, "", false},
+		{"non-numeric date portion", "2020AB15", 1, "2020AB15", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := shiftDateString(tc.in, tc.shiftDays)
+			if ok != tc.wantOK {
+				t.Fatalf("shiftDateString(%q, %d) ok = %v, want %v", tc.in, tc.shiftDays, ok, tc.wantOK)
+			}
+			if got != tc.want {
+				t.Fatalf("shiftDateString(%q, %d) = %q, want %q", tc.in, tc.shiftDays, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestApplyDateShift covers the element walk: DA and DT shift (DT keeping its
+// time suffix), PatientBirthDate and non-date elements stay, and the shift
+// recurses into sequence items.
+func TestApplyDateShift(t *testing.T) {
+	findTag := func(elems []*sdicom.Element, tg tag.Tag) *sdicom.Element {
+		for _, e := range elems {
+			if e.Tag == tg {
+				return e
+			}
+		}
+		return nil
+	}
+	strValue := func(e *sdicom.Element) string {
+		if e == nil {
+			return ""
+		}
+		if v, ok := e.Value.GetValue().([]string); ok && len(v) > 0 {
+			return v[0]
+		}
+		return ""
+	}
+
+	seqTag := tag.Tag{Group: 0x0008, Element: 0x1140}
+	nested := []*sdicom.Element{
+		mustTestElement(t, tag.StudyDate, []string{"20200115"}),
+	}
+	elems := []*sdicom.Element{
+		mustTestElement(t, tag.StudyDate, []string{"20200115"}),
+		mustTestElement(t, tag.AcquisitionDateTime, []string{"20200115120000.000000+0000"}),
+		mustTestElement(t, tag.PatientBirthDate, []string{"19800101"}),
+		mustTestElement(t, tag.PatientName, []string{"Doe^Jane"}),
+		mustTestElement(t, seqTag, [][]*sdicom.Element{nested}),
+	}
+
+	applyDateShift(elems, 10)
+
+	if got := strValue(findTag(elems, tag.StudyDate)); got != "20200125" {
+		t.Errorf("StudyDate = %q, want 20200125", got)
+	}
+	if got := strValue(findTag(elems, tag.AcquisitionDateTime)); got != "20200125120000.000000+0000" {
+		t.Errorf("AcquisitionDateTime = %q, want date shifted with time preserved", got)
+	}
+	if got := strValue(findTag(elems, tag.PatientBirthDate)); got != "19800101" {
+		t.Errorf("PatientBirthDate was shifted: %q, want unchanged", got)
+	}
+	if got := strValue(findTag(elems, tag.PatientName)); got != "Doe^Jane" {
+		t.Errorf("PatientName was changed: %q", got)
+	}
+	items, ok := findTag(elems, seqTag).Value.GetValue().([]*sdicom.SequenceItemValue)
+	if !ok || len(items) != 1 {
+		t.Fatalf("sequence element lost its items")
+	}
+	itemElems, ok := items[0].GetValue().([]*sdicom.Element)
+	if !ok {
+		t.Fatalf("sequence item is not []*Element")
+	}
+	if got := strValue(findTag(itemElems, tag.StudyDate)); got != "20200125" {
+		t.Errorf("nested StudyDate = %q, want 20200125 (recursion into sequence failed)", got)
+	}
+}
+
+// TestRunModificationShiftDays runs the engine end-to-end with only a date
+// shift: every DA/DT moves by the offset (including inside sequences), the
+// birth date does not, and the source file is untouched.
+func TestRunModificationShiftDays(t *testing.T) {
+	_, aliases := embeddedModConfigs(t)
+	params, err := compileModifyParams(ModProfile{ShiftDays: "-45"}, aliases)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	rootDir := t.TempDir()
+	outDir := t.TempDir()
+	srcPath := filepath.Join(rootDir, "img1.dcm")
+	writeModifyTestDICOM(t, srcPath)
+
+	res := runModification(context.Background(), []string{srcPath}, rootDir, outDir, params, nil, nil)
+	if res.Failed != 0 || res.Processed != 1 {
+		t.Fatalf("result = %+v, want 1 processed 0 failed", res)
+	}
+
+	ds, err := sdicom.ParseFile(filepath.Join(outDir, "img1.dcm"), nil)
+	if err != nil {
+		t.Fatalf("parse output: %v", err)
+	}
+	getOne := func(tg tag.Tag) string {
+		e, err := ds.FindElementByTag(tg)
+		if err != nil {
+			return ""
+		}
+		v := sdicom.MustGetStrings(e.Value)
+		if len(v) == 0 {
+			return ""
+		}
+		return strings.TrimSpace(v[0])
+	}
+
+	if got := getOne(tag.StudyDate); got != "20231118" {
+		t.Errorf("StudyDate = %q, want 20231118 (20240102 - 45d)", got)
+	}
+	if got := getOne(tag.AcquisitionDateTime); got != "20231118093000.000000+0000" {
+		t.Errorf("AcquisitionDateTime = %q, want shifted date with suffix intact", got)
+	}
+	if got := getOne(tag.PatientBirthDate); got != "19800615" {
+		t.Errorf("PatientBirthDate = %q, want untouched 19800615", got)
+	}
+	seqElem, err := ds.FindElementByTag(tag.Tag{Group: 0x0008, Element: 0x1140})
+	if err != nil {
+		t.Fatalf("sequence missing from output: %v", err)
+	}
+	items, ok := seqElem.Value.GetValue().([]*sdicom.SequenceItemValue)
+	if !ok || len(items) != 1 {
+		t.Fatalf("sequence items lost in output")
+	}
+	itemElems, _ := items[0].GetValue().([]*sdicom.Element)
+	found := ""
+	for _, e := range itemElems {
+		if e.Tag == tag.StudyDate {
+			if v, ok := e.Value.GetValue().([]string); ok && len(v) > 0 {
+				found = strings.TrimSpace(v[0])
+			}
+		}
+	}
+	if found != "20231118" {
+		t.Errorf("nested StudyDate = %q, want 20231118", found)
+	}
+
+	// Source untouched.
+	src, err := sdicom.ParseFile(srcPath, nil)
+	if err != nil {
+		t.Fatalf("re-parse source: %v", err)
+	}
+	if e, err := src.FindElementByTag(tag.StudyDate); err != nil ||
+		strings.TrimSpace(sdicom.MustGetStrings(e.Value)[0]) != "20240102" {
+		t.Errorf("source file was modified")
+	}
+}
+
+// TestRunModificationShiftDaysPerModality proves a per-modality shiftdays
+// override wins for a matching file, and that a garbage override value fails
+// the file (rather than silently shipping unshifted dates) — dicomtool parity.
+func TestRunModificationShiftDaysPerModality(t *testing.T) {
+	_, aliases := embeddedModConfigs(t)
+
+	rootDir := t.TempDir()
+	srcPath := filepath.Join(rootDir, "img1.dcm")
+	writeModifyTestDICOM(t, srcPath) // fixture Modality is OT
+
+	params, err := compileModifyParams(ModProfile{
+		ShiftDays:   "-45",
+		PerModality: map[string]ModProfile{"OT": {ShiftDays: "10"}},
+	}, aliases)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	outDir := t.TempDir()
+	res := runModification(context.Background(), []string{srcPath}, rootDir, outDir, params, nil, nil)
+	if res.Failed != 0 || res.Processed != 1 {
+		t.Fatalf("result = %+v, want 1 processed 0 failed", res)
+	}
+	ds, err := sdicom.ParseFile(filepath.Join(outDir, "img1.dcm"), nil)
+	if err != nil {
+		t.Fatalf("parse output: %v", err)
+	}
+	e, err := ds.FindElementByTag(tag.StudyDate)
+	if err != nil {
+		t.Fatalf("StudyDate missing: %v", err)
+	}
+	if got := strings.TrimSpace(sdicom.MustGetStrings(e.Value)[0]); got != "20240112" {
+		t.Errorf("StudyDate = %q, want 20240112 (override +10 wins over -45)", got)
+	}
+
+	// A hand-authored per-modality block with a garbage shiftdays fails the
+	// file: compileModifyParams only validates the top-level value.
+	params, err = compileModifyParams(ModProfile{
+		Sets:        []string{"0010,0010=X"},
+		PerModality: map[string]ModProfile{"OT": {ShiftDays: "x"}},
+	}, aliases)
+	if err != nil {
+		t.Fatalf("compile with bad override: %v", err)
+	}
+	res = runModification(context.Background(), []string{srcPath}, rootDir, t.TempDir(), params, nil, nil)
+	if res.Failed != 1 || res.Processed != 0 {
+		t.Fatalf("result = %+v, want 0 processed 1 failed", res)
+	}
+	if len(res.Failures) != 1 || !strings.Contains(res.Failures[0].Error, "must be an integer") {
+		t.Errorf("failure = %+v, want a 'must be an integer' entry", res.Failures)
 	}
 }
 
