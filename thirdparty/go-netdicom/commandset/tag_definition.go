@@ -1,6 +1,8 @@
 package commandset
 
 import (
+	"sync"
+
 	"github.com/suyashkumar/dicom/pkg/tag"
 )
 
@@ -226,8 +228,24 @@ var tagInfos = []tag.Info{
 	},
 }
 
+// Local patch: registration runs once, at package initialisation.
+//
+// tag.Add writes the dictionary map that every tag.Find reads, and upstream
+// calls Init lazily — from ServiceProvider.Run and NewServiceUser — so the
+// first association could write that map while another goroutine was reading
+// it. Go makes that a fatal "concurrent map read and map write", killing the
+// process: dicomqr reads the dictionary to populate the tag picker, which the
+// user can open at the moment a connection is being made. Doing the writes in
+// init() puts them before main and therefore before any reader; Init stays
+// exported and callable, and is a no-op after the first time.
+var initOnce sync.Once
+
 func Init() {
-	for _, info := range tagInfos {
-		tag.Add(info, false)
-	}
+	initOnce.Do(func() {
+		for _, info := range tagInfos {
+			tag.Add(info, false)
+		}
+	})
 }
+
+func init() { Init() }
