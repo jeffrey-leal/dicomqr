@@ -108,18 +108,17 @@ func dictionaryTags() []tag.Info {
 	return dictTags
 }
 
-// formatTagRef renders t the way the profile store and tags.json write tags:
-// zero-padded 4-digit uppercase hex. Existing profile entries are never
-// rewritten into this form — see mergeTagSelection — it is only used for tags
-// the picker adds.
+// formatTagRef renders t the way the profile store writes tags: zero-padded
+// 4-digit uppercase hex. This is the one spelling a profile holds — see
+// canonicalTagRef, which every stored reference goes through.
 func formatTagRef(t tag.Tag) string {
 	return fmt.Sprintf("%04X,%04X", t.Group, t.Element)
 }
 
 // tagLineGap separates a stored tag reference from the descriptive name shown
 // beside it in the profile editor's Remove/Keep lists. Two spaces matches the
-// picker's row format and splits back unambiguously: a single space would not,
-// because an alias may contain one ("other patient ids").
+// picker's row format and splits back unambiguously, since dictionary names
+// contain single spaces ("Other Patient IDs").
 const tagLineGap = "  "
 
 // stripTagDecoration returns just the stored reference from a display line,
@@ -149,29 +148,27 @@ func strippedTagLines(text string) []string {
 
 // decorateTagList renders stored entries for display, one per line, as a
 // zero-padded GGGG,EEEE reference with the tag's name appended — the same form
-// the picker shows, so a profile written as "8,80" or as an alias still reads
-// as "0008,0080  Institution Name". A reference that resolves to nothing is
-// shown as written, for validation to report.
+// the picker shows, so a profile hand-written as "8,80" still reads as
+// "0008,0080  Institution Name". A reference that resolves to nothing is shown
+// as written, for validation to report.
 //
-// This is display only. What the profile stores is the reference the user
-// wrote, which checkTagLines restores on save: profile tag lists are compared
-// as literal strings, so rewriting "8,80" would stop a base profile's Keep
-// list cancelling its Removes list. Applying this to already-decorated text is
-// a no-op.
-func decorateTagList(entries []string, aliases TagConfig) string {
+// The name is display only and never reaches the profile: checkTagLines strips
+// it and stores the canonical reference. Applying this to already-decorated
+// text is a no-op.
+func decorateTagList(entries []string) string {
 	lines := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		ref := stripTagDecoration(entry)
 		if ref == "" {
 			continue
 		}
-		t, err := parseTagString(aliases.Resolve(ref))
+		t, err := parseTagString(ref)
 		if err != nil {
 			lines = append(lines, ref)
 			continue
 		}
 		line := formatTagRef(t)
-		if name := tagDisplayName(t, aliases); name != "" {
+		if name := tagDisplayName(t); name != "" {
 			line += tagLineGap + name
 		}
 		lines = append(lines, line)

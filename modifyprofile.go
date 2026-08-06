@@ -1,15 +1,24 @@
 package main
 
 // Modification profiles — named de-identification recipes ported from the
-// dicomtool CLI. dicomqr keeps its own copies of the profile store
-// (~/.dicomqr/profiles.json) and the tag alias map (~/.dicomqr/tags.json),
-// seeded from embedded defaults on first run and never overwritten, so
-// hand-edits survive upgrades. The JSON format and merge semantics match
-// dicomtool, letting profiles be copied between the two tools, with three
+// dicomtool CLI. dicomqr keeps its own copy of the profile store
+// (~/.dicomqr/profiles.json), seeded from embedded defaults on first run and
+// never overwritten, so hand-edits survive upgrades.
+//
+// Every tag reference is stored canonically as zero-padded GGGG,EEEE and
+// canonicalised on load, and profiles are merged by comparing parsed tags
+// rather than the text that spells them. That matters most for the Keep list,
+// which cancels a base profile's Removes: when the comparison was textual, two
+// files disagreeing on "40,275" versus "0040,0275" silently stopped a tag being
+// preserved.
+//
+// The JSON format and merge semantics otherwise follow dicomtool, with these
 // deliberate divergences: `zip` and `transfersyntax` are dicomqr-only
-// (dicomtool ignores unknown keys), and dicomtool's `maskrows` is intentionally
-// unsupported here — a dicomtool-authored value is dropped on load and stripped
-// on save.
+// (dicomtool ignores unknown keys); dicomtool's `maskrows` is unsupported here,
+// dropped on load and stripped on save; and dicomqr no longer resolves
+// dicomtool's tag aliases, so a profile copied from it must use tag numbers.
+// The tag picker names tags from the standard dictionary, which is a better
+// naming authority than a map the user has to maintain.
 
 import (
 	_ "embed"
@@ -19,15 +28,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/suyashkumar/dicom/pkg/tag"
 )
 
 //go:embed defaults/profiles.json
 var defaultModProfilesJSON []byte
-
-//go:embed defaults/tags.json
-var defaultModTagsJSON []byte
 
 // ModProfile holds a named collection of modification parameters. Fields map
 // directly to the equivalent dicomtool modify command-line parameters; the
@@ -64,6 +71,14 @@ type ModProfile struct {
 	// a syntax here keeps the download folder in the archive's own encoding and
 	// converts only on export.
 	TransferSyntax string `json:"transfersyntax,omitempty"`
+
+	// ExportName pre-fills the Modification dialog's export folder name. It may
+	// be a "[GGGG,EEEE]" reference to one of this profile's Set values, which is
+	// how the shipped profile names the export after the new patient name — the
+	// dialog used to do that from hardcoded knowledge of Patient Name. Empty (or
+	// resolving to nothing) leaves the profile-plus-timestamp default. Always
+	// only a default: the name is typed per run and never written back.
+	ExportName string `json:"exportname,omitempty"`
 
 	PerModality map[string]ModProfile `json:"per-modality,omitempty"`
 }
@@ -128,21 +143,6 @@ func transferSyntaxPrefFromLabel(label string) string {
 // ModProfileConfig maps profile names to their definitions.
 type ModProfileConfig map[string]ModProfile
 
-// TagConfig maps user-defined shortcut phrases to DICOM tag strings ("GGGG,EEEE").
-type TagConfig map[string]string
-
-// Resolve returns the tag string for phrase if it exists in the config,
-// otherwise returns phrase unchanged.
-func (c TagConfig) Resolve(phrase string) string {
-	if c == nil {
-		return phrase
-	}
-	if t, ok := c[phrase]; ok {
-		return t
-	}
-	return phrase
-}
-
 // modifyProfilesPath returns ~/.dicomqr/profiles.json.
 func modifyProfilesPath() (string, error) {
 	dir, err := appSettingsDir()
@@ -150,15 +150,6 @@ func modifyProfilesPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "profiles.json"), nil
-}
-
-// modifyTagsPath returns ~/.dicomqr/tags.json.
-func modifyTagsPath() (string, error) {
-	dir, err := appSettingsDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "tags.json"), nil
 }
 
 // loadModProfileConfig reads the profile store at path. A missing file returns
@@ -174,6 +165,12 @@ func loadModProfileConfig(path string) (ModProfileConfig, error) {
 	var cfg ModProfileConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
+	}
+	// Canonicalise on the way in, so every consumer — editor, engine, merge —
+	// sees one spelling per tag and the file the editor writes back holds one
+	// too. An entry that does not parse survives untouched for validation.
+	for name, p := range cfg {
+		cfg[name] = normalizeModProfile(p)
 	}
 	return cfg, nil
 }
@@ -197,26 +194,13 @@ func saveModProfileConfig(path string, cfg ModProfileConfig) error {
 	return atomicWriteJSON(path, data)
 }
 
-// loadTagConfig reads the tag alias map at path. A missing file returns an
-// empty config without error.
-func loadTagConfig(path string) (TagConfig, error) {
-	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return TagConfig{}, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var cfg TagConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, err
-	}
-	return cfg, nil
-}
-
-// ensureDefaultModifyConfigs creates ~/.dicomqr/profiles.json and tags.json
-// with compiled-in defaults if they do not already exist. O_EXCL guarantees an
+// ensureDefaultModifyConfigs creates ~/.dicomqr/profiles.json with the
+// compiled-in defaults if it does not already exist. O_EXCL guarantees an
 // existing (possibly hand-edited) file is never overwritten.
+//
+// A tags.json left behind by a version that had tag aliases is not deleted —
+// removing a user's file is worse than leaving an inert one — but nothing reads
+// it any more.
 func ensureDefaultModifyConfigs() {
 	dir, err := appSettingsDir()
 	if err != nil {
@@ -225,16 +209,12 @@ func ensureDefaultModifyConfigs() {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return
 	}
-	seed := func(name string, content []byte) {
-		f, err := os.OpenFile(filepath.Join(dir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-		if err != nil {
-			return // already exists (or unwritable) — leave it alone
-		}
-		defer f.Close()
-		f.Write(content)
+	f, err := os.OpenFile(filepath.Join(dir, "profiles.json"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return // already exists (or unwritable) — leave it alone
 	}
-	seed("profiles.json", defaultModProfilesJSON)
-	seed("tags.json", defaultModTagsJSON)
+	defer f.Close()
+	f.Write(defaultModProfilesJSON)
 }
 
 // resolveModProfile returns the effective ModProfile for name after fully
@@ -287,6 +267,9 @@ func mergeModProfiles(base, override ModProfile) ModProfile {
 	if override.TransferSyntax != "" {
 		result.TransferSyntax = override.TransferSyntax
 	}
+	if override.ExportName != "" {
+		result.ExportName = override.ExportName
+	}
 
 	result.Priv = base.Priv || override.Priv
 	result.Dicomdir = base.Dicomdir || override.Dicomdir
@@ -294,19 +277,23 @@ func mergeModProfiles(base, override ModProfile) ModProfile {
 	result.Zip = base.Zip || override.Zip
 	result.RemapUIDs = base.RemapUIDs || override.RemapUIDs
 
+	// Every tag comparison below goes through tagMatchKey, which parses the
+	// reference first. Comparing the raw strings would make a profile's Keep
+	// list cancel its base's Removes list only when both files happened to spell
+	// the tag identically — and a Keep that quietly stops cancelling removes a
+	// tag the user asked to preserve.
+
 	// Sets: override wins per tag; base contributes tags not in override.
 	overrideTags := make(map[string]bool, len(override.Sets))
 	for _, s := range override.Sets {
-		if t, _, ok := strings.Cut(s, "="); ok {
-			overrideTags[strings.ToLower(strings.TrimSpace(t))] = true
+		if key, ok := setMatchKey(s); ok {
+			overrideTags[key] = true
 		}
 	}
 	result.Sets = make([]string, 0, len(base.Sets)+len(override.Sets))
 	for _, s := range base.Sets {
-		if t, _, ok := strings.Cut(s, "="); ok {
-			if !overrideTags[strings.ToLower(strings.TrimSpace(t))] {
-				result.Sets = append(result.Sets, s)
-			}
+		if key, ok := setMatchKey(s); ok && !overrideTags[key] {
+			result.Sets = append(result.Sets, s)
 		}
 	}
 	result.Sets = append(result.Sets, override.Sets...)
@@ -315,8 +302,9 @@ func mergeModProfiles(base, override ModProfile) ModProfile {
 	seen := make(map[string]bool, len(base.Removes)+len(override.Removes))
 	result.Removes = nil
 	for _, r := range append(base.Removes, override.Removes...) {
-		if !seen[r] {
-			seen[r] = true
+		key := tagMatchKey(r)
+		if !seen[key] {
+			seen[key] = true
 			result.Removes = append(result.Removes, r)
 		}
 	}
@@ -325,8 +313,9 @@ func mergeModProfiles(base, override ModProfile) ModProfile {
 	seenK := make(map[string]bool, len(base.Keep)+len(override.Keep))
 	result.Keep = nil
 	for _, k := range append(base.Keep, override.Keep...) {
-		if !seenK[k] {
-			seenK[k] = true
+		key := tagMatchKey(k)
+		if !seenK[key] {
+			seenK[key] = true
 			result.Keep = append(result.Keep, k)
 		}
 	}
@@ -339,11 +328,11 @@ func mergeModProfiles(base, override ModProfile) ModProfile {
 	if len(override.Keep) > 0 {
 		keepSet := make(map[string]bool, len(override.Keep))
 		for _, k := range override.Keep {
-			keepSet[strings.ToLower(strings.TrimSpace(k))] = true
+			keepSet[tagMatchKey(k)] = true
 		}
 		filtered := make([]string, 0, len(result.Removes))
 		for _, r := range result.Removes {
-			if !keepSet[strings.ToLower(strings.TrimSpace(r))] {
+			if !keepSet[tagMatchKey(r)] {
 				filtered = append(filtered, r)
 			}
 		}
@@ -411,6 +400,96 @@ func parseTagString(s string) (tag.Tag, error) {
 	return tag.Tag{Group: uint16(group), Element: uint16(elem)}, nil
 }
 
+// canonicalTagRef rewrites a tag reference into the single spelling the profile
+// store uses: zero-padded uppercase GGGG,EEEE. ok is false when s does not
+// parse, and the caller must then keep s verbatim — silently dropping a line
+// from a de-identification profile is the one failure this code must not have,
+// so an unparsable entry survives to be reported by validation instead.
+func canonicalTagRef(s string) (string, bool) {
+	t, err := parseTagString(strings.TrimSpace(s))
+	if err != nil {
+		return strings.TrimSpace(s), false
+	}
+	return formatTagRef(t), true
+}
+
+// canonicalTagRefs canonicalises a tag list, preserving order and any entry
+// that does not parse.
+func canonicalTagRefs(refs []string) []string {
+	if refs == nil {
+		return nil
+	}
+	out := make([]string, 0, len(refs))
+	for _, r := range refs {
+		ref, _ := canonicalTagRef(r)
+		if ref != "" {
+			out = append(out, ref)
+		}
+	}
+	return out
+}
+
+// canonicalSetRefs canonicalises the tag half of each TAG=VALUE entry, leaving
+// the value — which may itself contain "=" — exactly as written.
+func canonicalSetRefs(sets []string) []string {
+	if sets == nil {
+		return nil
+	}
+	out := make([]string, 0, len(sets))
+	for _, s := range sets {
+		tagStr, value, ok := strings.Cut(s, "=")
+		if !ok {
+			out = append(out, strings.TrimSpace(s)) // malformed; validation reports it
+			continue
+		}
+		ref, _ := canonicalTagRef(tagStr)
+		out = append(out, ref+"="+value)
+	}
+	return out
+}
+
+// normalizeModProfile returns p with every tag reference canonicalised, at any
+// depth. Applied on load so the store holds one spelling per tag, which is what
+// lets a profile and the base it inherits from be compared by eye as well as by
+// code. mergeModProfiles does not depend on this having run — it compares
+// parsed tags — but a canonical file is what the editor writes back.
+func normalizeModProfile(p ModProfile) ModProfile {
+	p.Sets = canonicalSetRefs(p.Sets)
+	p.Removes = canonicalTagRefs(p.Removes)
+	p.Keep = canonicalTagRefs(p.Keep)
+	if len(p.PerModality) > 0 {
+		norm := make(map[string]ModProfile, len(p.PerModality))
+		for k, v := range p.PerModality {
+			norm[k] = normalizeModProfile(v)
+		}
+		p.PerModality = norm
+	}
+	return p
+}
+
+// tagMatchKey is the identity two tag references are compared by when merging a
+// profile with its base. Parsing first means "40,275", "0040,0275" and
+// "0040,275" are one tag rather than three strings, which is what makes a Keep
+// list reliably cancel the Removes list it was written against. A reference
+// that does not parse falls back to its own text, so unparsable entries still
+// deduplicate against themselves instead of collapsing together.
+func tagMatchKey(ref string) string {
+	if t, err := parseTagString(strings.TrimSpace(ref)); err == nil {
+		return formatTagRef(t)
+	}
+	return strings.ToLower(strings.TrimSpace(ref))
+}
+
+// setMatchKey is tagMatchKey for a TAG=VALUE entry, keyed on the tag alone so
+// an override replaces the base's value for that tag.
+func setMatchKey(entry string) (string, bool) {
+	tagStr, _, ok := strings.Cut(entry, "=")
+	if !ok {
+		return "", false
+	}
+	return tagMatchKey(tagStr), true
+}
+
 // The three scalar profile fields with a validation rule are checked in every
 // place they can be edited (profile editor, per-modality sub-editor, the
 // per-run Modification dialog), so the rules live here rather than in any one
@@ -438,6 +517,275 @@ func validateUIDSuffix(s string) (string, error) {
 	return s, nil
 }
 
+// A Set value of exactly "[GGGG,EEEE]" is a reference: it means "whatever this
+// same profile sets that tag to". It exists so a profile can state a
+// relationship it used to be given — the Modification dialog hardcoded Patient
+// Name → Patient ID and kept it alive by guessing whether the field had been
+// touched, which was invisible when it went wrong.
+//
+// A reference reaches only the profile's own Set values, never the value in the
+// file being modified. That limit is the whole safety of the feature: in a
+// de-identification profile, a reference that could read the source would copy
+// the real patient name forward into whatever field named it, once per file and
+// with nothing on screen to show it had happened.
+//
+// The whole value is the reference or none of it is (no substring templating),
+// so there is nothing to escape and no ambiguity about a value that happens to
+// contain a bracket.
+func setValueReference(value string) (tag.Tag, bool) {
+	value = strings.TrimSpace(value)
+	if len(value) < 3 || value[0] != '[' || value[len(value)-1] != ']' {
+		return tag.Tag{}, false
+	}
+	t, err := parseTagString(value[1 : len(value)-1])
+	if err != nil {
+		return tag.Tag{}, false
+	}
+	return t, true
+}
+
+// splitSetEntry breaks a "TAG=VALUE" entry into its parsed tag and its value.
+// Everything after the first "=" is the value, so a value containing "="
+// survives intact.
+func splitSetEntry(entry string) (t tag.Tag, value string, ok bool) {
+	tagStr, value, hasEq := strings.Cut(entry, "=")
+	if !hasEq {
+		return tag.Tag{}, "", false
+	}
+	t, err := parseTagString(strings.TrimSpace(tagStr))
+	if err != nil {
+		return tag.Tag{}, "", false
+	}
+	return t, value, true
+}
+
+// resolveSetReferences replaces every reference with the value of the entry it
+// names, returning the Set list the engine should apply. Entries that are not
+// references, and entries whose tag does not parse, pass through untouched —
+// the latter are reported by compileModifyParams, which is where an unparsable
+// tag belongs.
+//
+// References resolve one level only: a reference whose target is itself a
+// reference is an error rather than a chain to follow, which makes cycles
+// impossible by construction instead of something to detect.
+func resolveSetReferences(sets []string) ([]string, error) {
+	if len(sets) == 0 {
+		return sets, nil
+	}
+	// Index the literal value of every entry, so a reference can be answered
+	// without caring where in the list its target sits.
+	values := make(map[tag.Tag]string, len(sets))
+	for _, s := range sets {
+		if t, v, ok := splitSetEntry(s); ok {
+			if _, dup := values[t]; !dup {
+				values[t] = v
+			}
+		}
+	}
+
+	out := make([]string, 0, len(sets))
+	for _, s := range sets {
+		t, v, ok := splitSetEntry(s)
+		if !ok {
+			out = append(out, s)
+			continue
+		}
+		target, isRef := setValueReference(v)
+		if !isRef {
+			out = append(out, s)
+			continue
+		}
+		if target == t {
+			return nil, fmt.Errorf("set value for %s refers to itself", formatTagRef(t))
+		}
+		targetValue, present := values[target]
+		if !present {
+			return nil, fmt.Errorf("set value for %s refers to %s, which this profile does not set",
+				formatTagRef(t), formatTagRef(target))
+		}
+		if _, chained := setValueReference(targetValue); chained {
+			return nil, fmt.Errorf("set value for %s refers to %s, which is itself a reference — references cannot be chained",
+				formatTagRef(t), formatTagRef(target))
+		}
+		out = append(out, formatTagRef(t)+"="+targetValue)
+	}
+	return out, nil
+}
+
+// setValueFollowers maps each referenced tag to the tags referring to it, so
+// the Modification dialog can propagate a value as it is typed. Pure, so the
+// relationship is testable without a canvas; the dialog only does the wiring.
+func setValueFollowers(sets []string) map[tag.Tag][]tag.Tag {
+	var followers map[tag.Tag][]tag.Tag
+	for _, s := range sets {
+		t, v, ok := splitSetEntry(s)
+		if !ok {
+			continue
+		}
+		target, isRef := setValueReference(v)
+		if !isRef || target == t {
+			continue
+		}
+		if followers == nil {
+			followers = map[tag.Tag][]tag.Tag{}
+		}
+		followers[target] = append(followers[target], t)
+	}
+	return followers
+}
+
+// maxValueLengths bounds the string VRs whose limit is worth enforcing
+// (PS3.5 Table 6.2-1). Only VRs a user plausibly types into a Set value are
+// listed; anything absent is accepted at any length.
+var maxValueLengths = map[string]int{
+	"AE": 16, "AS": 4, "CS": 16, "DS": 16, "IS": 12,
+	"LO": 64, "PN": 64, "SH": 16, "UI": 64,
+}
+
+// validateSetValue checks a Set value against the value representation of the
+// tag it will be written to. It exists because the engine does not: buildElement
+// coerces the numeric VRs and rejects a bad number, but every string VR — dates
+// included — falls through to a plain string, so setting a DA tag to "ANON"
+// used to be accepted by the editor, the dialog and the engine alike, and wrote
+// a malformed date into every exported file.
+//
+// An empty value is always valid: it blanks the element, which is exactly what
+// the shipped base-deident profile does with Accession Number. A tag the
+// dictionary does not know, or a VR not listed here, accepts anything — this
+// check must never be the reason a legitimate edit is refused.
+func validateSetValue(t tag.Tag, value string) error {
+	if value == "" {
+		return nil
+	}
+	// A reference is a placeholder, not a literal: what it resolves to is what
+	// gets checked. Without this, "[0010,0010]" in a date field would be
+	// rejected as a malformed date.
+	if _, ok := setValueReference(value); ok {
+		return nil
+	}
+	info, err := tag.Find(t)
+	if err != nil || len(info.VRs) == 0 {
+		return nil
+	}
+	vr := strings.ToUpper(info.VRs[0])
+	name := tagDisplayName(t)
+	if name == "" {
+		name = formatTagRef(t)
+	}
+	bad := func(want string) error {
+		return fmt.Errorf("%s is a %s value — %s (got %q)", name, vr, want, value)
+	}
+
+	if max, ok := maxValueLengths[vr]; ok && len(value) > max {
+		return fmt.Errorf("%s is a %s value — at most %d characters (got %d)", name, vr, max, len(value))
+	}
+
+	switch vr {
+	case "DA":
+		if _, err := time.Parse("20060102", value); err != nil {
+			return bad("a date as YYYYMMDD")
+		}
+	case "TM":
+		// HHMMSS with optional fractional seconds; hours alone are legal too.
+		if !isDICOMTime(value) {
+			return bad("a time as HHMMSS or HHMMSS.FFFFFF")
+		}
+	case "DT":
+		if !isDICOMDateTime(value) {
+			return bad("a date-time as YYYYMMDDHHMMSS with an optional fraction and UTC offset")
+		}
+	case "UI":
+		if !isDICOMUID(value) {
+			return bad("a UID: digits separated by dots")
+		}
+	case "IS":
+		if _, err := strconv.Atoi(strings.TrimSpace(value)); err != nil {
+			return bad("a whole number")
+		}
+	case "DS":
+		if _, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err != nil {
+			return bad("a decimal number")
+		}
+	case "US", "UL", "SS", "SL":
+		if _, err := strconv.Atoi(strings.TrimSpace(value)); err != nil {
+			return bad("a whole number")
+		}
+	case "FL", "FD":
+		if _, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err != nil {
+			return bad("a decimal number")
+		}
+	case "AS":
+		// nnnD, nnnW, nnnM or nnnY.
+		if len(value) != 4 || !isAllDigits(value[:3]) || !strings.ContainsRune("DWMY", rune(value[3])) {
+			return bad("an age as nnnD, nnnW, nnnM or nnnY")
+		}
+	}
+	return nil
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// isDICOMTime accepts HH, HHMM, HHMMSS, optionally with a fractional part.
+func isDICOMTime(s string) bool {
+	whole, frac, hasFrac := strings.Cut(s, ".")
+	if hasFrac && (frac == "" || len(frac) > 6 || !isAllDigits(frac)) {
+		return false
+	}
+	switch len(whole) {
+	case 2, 4, 6:
+	default:
+		return false
+	}
+	if !isAllDigits(whole) {
+		return false
+	}
+	layouts := map[int]string{2: "15", 4: "1504", 6: "150405"}
+	_, err := time.Parse(layouts[len(whole)], whole)
+	return err == nil
+}
+
+// isDICOMDateTime accepts YYYYMMDD optionally followed by a time, a fraction
+// and a ±HHMM UTC offset.
+func isDICOMDateTime(s string) bool {
+	if i := strings.IndexAny(s, "+-"); i >= 0 {
+		off := s[i+1:]
+		if len(off) != 4 || !isAllDigits(off) {
+			return false
+		}
+		s = s[:i]
+	}
+	if len(s) < 8 {
+		return false
+	}
+	if _, err := time.Parse("20060102", s[:8]); err != nil {
+		return false
+	}
+	if len(s) == 8 {
+		return true
+	}
+	return isDICOMTime(s[8:])
+}
+
+// isDICOMUID accepts dot-separated numeric components (PS3.5 §9.1).
+func isDICOMUID(s string) bool {
+	for _, part := range strings.Split(s, ".") {
+		if !isAllDigits(part) {
+			return false
+		}
+	}
+	return true
+}
+
 // validateShiftDays trims s and returns it; a non-empty date shift must parse
 // as an integer number of days (sign allowed, and zero is accepted to match
 // dicomtool — it is an actionable no-op there).
@@ -452,16 +800,14 @@ func validateShiftDays(s string) (string, error) {
 	return s, nil
 }
 
-// tagDisplayName returns a human-readable name for t: the standard dictionary
-// name when known, else the alias-map name pointing at t, else "".
-func tagDisplayName(t tag.Tag, aliases TagConfig) string {
-	if info, err := tag.Find(t); err == nil && info.Name != "" {
+// tagDisplayName returns the standard dictionary name for t, or "" for a tag
+// the dictionary does not list (the shipped base-deident profile removes three).
+// The dictionary is the only naming authority: user-defined aliases were a
+// second one, and a tag whose name depended on which of them a user had edited
+// was not a name worth showing.
+func tagDisplayName(t tag.Tag) string {
+	if info, err := tag.Find(t); err == nil {
 		return info.Name
-	}
-	for name, tagStr := range aliases {
-		if at, err := parseTagString(tagStr); err == nil && at == t {
-			return name
-		}
 	}
 	return ""
 }

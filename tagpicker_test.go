@@ -1,9 +1,10 @@
 package main
 
 // Tests for the tag dictionary enumeration and the picker's selection merge.
-// The merge tests are the important ones: profile tag lists are compared as
-// literal strings by mergeModProfiles, so a picker that "helpfully" rewrote
-// entries into a canonical form would silently break keep/remove cancellation.
+// The merge tests are the important ones: what the picker writes back into a
+// profile's Remove or Keep list is what mergeModProfiles then matches a base
+// profile against, and a Keep entry that stops cancelling its base's Removes
+// deletes a tag the user asked to preserve.
 
 import (
 	"os"
@@ -140,9 +141,8 @@ func TestTagMatchesQuery(t *testing.T) {
 }
 
 func TestTagSelectionFromLines(t *testing.T) {
-	aliases := TagConfig{"PatientName": "0010,0010"}
-	// A zero-stripped reference, an alias, and an unresolvable line.
-	got := tagSelectionFromLines([]string{"8,80", "PatientName", "garbage"}, aliases)
+	// A zero-stripped reference, a padded one, and an unresolvable line.
+	got := tagSelectionFromLines([]string{"8,80", "0010,0010", "garbage"})
 	want := map[tag.Tag]bool{
 		{Group: 0x0008, Element: 0x0080}: true,
 		{Group: 0x0010, Element: 0x0010}: true,
@@ -152,38 +152,37 @@ func TestTagSelectionFromLines(t *testing.T) {
 	}
 }
 
-// TestMergeTagSelectionPreservesSpelling is the guard against the failure this
-// feature could most easily introduce: rewriting "8,80" as "0008,0080" leaves
-// the profile working but stops a base profile's Keep list cancelling its
-// Removes list, because mergeModProfiles compares those strings literally.
-func TestMergeTagSelectionPreservesSpelling(t *testing.T) {
-	aliases := TagConfig{"PatientName": "0010,0010"}
-	existing := []string{"8,80", "PatientName", "0018,1030"}
+// The picker used to preserve each surviving line's spelling, because
+// mergeModProfiles compared tag references as literal strings and rewriting
+// "8,80" as "0008,0080" would stop a Keep list cancelling its base's Removes.
+// That comparison now parses the reference, so the picker canonicalises
+// instead — and this test is the guard that it does, since a half-canonical
+// file is what the old fragility fed on.
+func TestMergeTagSelectionCanonicalises(t *testing.T) {
+	existing := []string{"8,80", "10,10", "0018,1030"}
 	selected := map[tag.Tag]bool{
-		{Group: 0x0008, Element: 0x0080}: true,  // kept, zero-stripped spelling
-		{Group: 0x0010, Element: 0x0010}: true,  // kept, alias spelling
+		{Group: 0x0008, Element: 0x0080}: true,  // kept, rewritten canonically
+		{Group: 0x0010, Element: 0x0010}: true,  // kept, rewritten canonically
 		{Group: 0x0018, Element: 0x1030}: false, // unchecked — dropped
 		{Group: 0x0010, Element: 0x1000}: true,  // newly added
 	}
-	got := mergeTagSelection(existing, selected, aliases)
-	want := []string{"8,80", "PatientName", "0010,1000"}
+	got := mergeTagSelection(existing, selected)
+	want := []string{"0008,0080", "0010,0010", "0010,1000"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("merged = %v, want %v", got, want)
 	}
 }
 
 func TestMergeTagSelectionEdgeCases(t *testing.T) {
-	aliases := TagConfig{}
-
 	t.Run("unresolvable lines survive for validation", func(t *testing.T) {
-		got := mergeTagSelection([]string{"notatag"}, map[tag.Tag]bool{}, aliases)
+		got := mergeTagSelection([]string{"notatag"}, map[tag.Tag]bool{})
 		if !reflect.DeepEqual(got, []string{"notatag"}) {
 			t.Errorf("merged = %v, want [notatag] preserved", got)
 		}
 	})
 
 	t.Run("empty selection clears resolvable lines", func(t *testing.T) {
-		if got := mergeTagSelection([]string{"8,80"}, map[tag.Tag]bool{}, aliases); got != nil {
+		if got := mergeTagSelection([]string{"8,80"}, map[tag.Tag]bool{}); got != nil {
 			t.Errorf("merged = %v, want nil", got)
 		}
 	})
@@ -195,22 +194,22 @@ func TestMergeTagSelectionEdgeCases(t *testing.T) {
 			{Group: 0x0008, Element: 0x0020}: true,
 		}
 		want := []string{"0008,0020", "0008,0080", "0018,1030"}
-		if got := mergeTagSelection(nil, selected, aliases); !reflect.DeepEqual(got, want) {
+		if got := mergeTagSelection(nil, selected); !reflect.DeepEqual(got, want) {
 			t.Errorf("merged = %v, want %v", got, want)
 		}
 	})
 
-	t.Run("duplicate spellings collapse to the first", func(t *testing.T) {
+	t.Run("two spellings of one tag collapse to one canonical entry", func(t *testing.T) {
 		selected := map[tag.Tag]bool{{Group: 0x0008, Element: 0x0080}: true}
-		got := mergeTagSelection([]string{"8,80", "0008,0080"}, selected, aliases)
-		if !reflect.DeepEqual(got, []string{"8,80"}) {
-			t.Errorf("merged = %v, want [8,80]", got)
+		got := mergeTagSelection([]string{"8,80", "0008,0080"}, selected)
+		if !reflect.DeepEqual(got, []string{"0008,0080"}) {
+			t.Errorf("merged = %v, want [0008,0080]", got)
 		}
 	})
 
 	t.Run("false entries are not treated as selected", func(t *testing.T) {
 		selected := map[tag.Tag]bool{{Group: 0x0008, Element: 0x0080}: false}
-		if got := mergeTagSelection(nil, selected, aliases); got != nil {
+		if got := mergeTagSelection(nil, selected); got != nil {
 			t.Errorf("merged = %v, want nil", got)
 		}
 	})
@@ -219,14 +218,13 @@ func TestMergeTagSelectionEdgeCases(t *testing.T) {
 // TestMergeTagSelectionRoundTripsThroughValidation proves the picker's output
 // is accepted by the editor's own tag-list validation.
 func TestMergeTagSelectionRoundTripsThroughValidation(t *testing.T) {
-	aliases := TagConfig{"PatientName": "0010,0010"}
-	merged := mergeTagSelection([]string{"8,80", "PatientName"},
+	merged := mergeTagSelection([]string{"8,80", "10,10"},
 		map[tag.Tag]bool{
 			{Group: 0x0008, Element: 0x0080}: true,
 			{Group: 0x0010, Element: 0x0010}: true,
 			{Group: 0x0010, Element: 0x1000}: true,
-		}, aliases)
-	lines, err := checkTagLines("Remove tags", strings.Join(merged, "\n"), nil, aliases)
+		})
+	lines, err := checkTagLines("Remove tags", strings.Join(merged, "\n"))
 	if err != nil {
 		t.Fatalf("picker output rejected by checkTagLines: %v", err)
 	}
@@ -239,7 +237,7 @@ func TestMergeTagSelectionRoundTripsThroughValidation(t *testing.T) {
 // profile's existing Remove list must arrive checked, be countable per group,
 // and be reachable without opening 76 collapsed groups by hand.
 func TestTagPickerOpensOnCurrentEntries(t *testing.T) {
-	profiles, _ := embeddedModConfigs(t)
+	profiles := embeddedModConfigs(t)
 	base, err := resolveModProfile("base-deident", profiles)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
@@ -250,7 +248,7 @@ func TestTagPickerOpensOnCurrentEntries(t *testing.T) {
 
 	// Exactly what the Choose… button does with the field's text.
 	field := strings.Join(base.Removes, "\n")
-	m := newTagPickerModel(tagSelectionFromLines(splitProfileLines(field), TagConfig{}))
+	m := newTagPickerModel(tagSelectionFromLines(splitProfileLines(field)))
 
 	if got := m.selectedCount(); got != len(base.Removes) {
 		t.Errorf("pre-selected %d tags, want all %d profile entries", got, len(base.Removes))
@@ -300,8 +298,10 @@ func TestTagPickerOpensOnCurrentEntries(t *testing.T) {
 		}
 	}
 
-	// Applying without touching anything must leave the profile byte-identical.
-	merged := mergeTagSelection(splitProfileLines(field), m.selected, TagConfig{})
+	// Applying without touching anything must leave the profile unchanged. The
+	// shipped defaults are already canonical, so this is now a byte-identical
+	// round trip rather than a spelling-preserving one.
+	merged := mergeTagSelection(splitProfileLines(field), m.selected)
 	if !reflect.DeepEqual(merged, base.Removes) {
 		t.Errorf("round-trip through the picker changed the entries:\n got %v\nwant %v", merged, base.Removes)
 	}
@@ -344,13 +344,12 @@ func TestTagPickerSelectionTally(t *testing.T) {
 }
 
 // TestDecorateTagList covers the display/storage split for the editor's tag
-// lists: names are appended for readability, the stored reference keeps its
-// exact spelling, and unresolvable entries are shown bare.
+// lists: names are appended for readability and stripped again on save, and
+// unresolvable entries are shown bare.
 func TestDecorateTagList(t *testing.T) {
-	aliases := TagConfig{"PatientName": "0010,0010"}
 	// Every resolvable entry displays as a zero-padded GGGG,EEEE reference,
 	// whatever spelling the profile stores; an unresolvable one shows as-is.
-	got := decorateTagList([]string{"8,80", "0010,1000", "PatientName", "notatag"}, aliases)
+	got := decorateTagList([]string{"8,80", "0010,1000", "10,10", "notatag"})
 	want := strings.Join([]string{
 		"0008,0080  Institution Name",
 		"0010,1000  Other Patient IDs",
@@ -362,24 +361,17 @@ func TestDecorateTagList(t *testing.T) {
 	}
 
 	// Decorating already-decorated text must not append the name twice.
-	if again := decorateTagList(strippedTagLines(got), aliases); again != want {
+	if again := decorateTagList(strippedTagLines(got)); again != want {
 		t.Errorf("re-decorating changed the text:\n%s", again)
 	}
 }
 
-// TestTagListDecorationNeverReachesStorage is the guard for this display
-// convenience: a name shown in the editor must never be written to
-// profiles.json, and stripping must return the original spelling untouched.
+// The name shown beside a tag is display only and must never reach
+// profiles.json; what is stored is the canonical reference.
 func TestTagListDecorationNeverReachesStorage(t *testing.T) {
-	aliases := TagConfig{"PatientName": "0010,0010"}
-	// "other patient ids" is an alias containing single spaces — the delimiter
-	// is two spaces precisely so an entry like this survives the round trip.
-	aliases["other patient ids"] = "0010,1000"
-	stored := []string{"8,80", "PatientName", "other patient ids"}
+	stored := []string{"8,80", "10,10", "0010,1000"}
 
-	displayed := decorateTagList(stored, aliases)
-	// The display normalises to padded numeric form regardless of how the
-	// profile spells each entry.
+	displayed := decorateTagList(stored)
 	for _, wantLine := range []string{
 		"0008,0080  Institution Name",
 		"0010,0010  Patient's Name",
@@ -390,29 +382,19 @@ func TestTagListDecorationNeverReachesStorage(t *testing.T) {
 		}
 	}
 
-	// Saving must restore every original spelling — the padded numeric form
-	// the user sees must not reach profiles.json.
-	lines, err := checkTagLines("Remove tags", displayed, stored, aliases)
+	// Saving strips the names and canonicalises the references.
+	lines, err := checkTagLines("Remove tags", displayed)
 	if err != nil {
 		t.Fatalf("checkTagLines rejected decorated text: %v", err)
 	}
-	if !reflect.DeepEqual(lines, stored) {
-		t.Errorf("saved lines = %v, want the original spellings %v", lines, stored)
-	}
-
-	// A tag the profile did not already list is stored as the line reads.
-	added := displayed + "\n0008,0020  Study Date"
-	lines, err = checkTagLines("Remove tags", added, stored, aliases)
-	if err != nil {
-		t.Fatalf("checkTagLines: %v", err)
-	}
-	if want := append(append([]string{}, stored...), "0008,0020"); !reflect.DeepEqual(lines, want) {
+	want := []string{"0008,0080", "0010,0010", "0010,1000"}
+	if !reflect.DeepEqual(lines, want) {
 		t.Errorf("saved lines = %v, want %v", lines, want)
 	}
 
 	// A decorated line whose reference is bad is still reported, and the error
 	// names the reference rather than the appended description.
-	if _, err := checkTagLines("Remove tags", "notatag  Something", nil, aliases); err == nil {
+	if _, err := checkTagLines("Remove tags", "notatag  Something"); err == nil {
 		t.Errorf("unresolvable decorated line accepted")
 	} else if !strings.Contains(err.Error(), `"notatag"`) {
 		t.Errorf("error names the wrong text: %v", err)
@@ -423,14 +405,14 @@ func TestTagListDecorationNeverReachesStorage(t *testing.T) {
 // opens with names shown and saves byte-identical when nothing is edited.
 func TestFieldSetRoundTripsDecoratedLists(t *testing.T) {
 	test.NewApp()
-	// The real alias map: base-deident's Set values reference PatientName.
-	profiles, aliases := embeddedModConfigs(t)
+	// The shipped defaults, which are canonical on disk.
+	profiles := embeddedModConfigs(t)
 	base, err := resolveModProfile("base-deident", profiles)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
 	cfg := ModProfileConfig{"p": base}
-	ed := newModProfileEditor("p", base, cfg, aliases)
+	ed := newModProfileEditor("p", base, cfg)
 
 	// The profile stores "8,80"; the field must show it zero-padded with its
 	// name, and every displayed reference must be 4+4 digits.
@@ -470,7 +452,7 @@ func TestTagPickerWindow(t *testing.T) {
 	editor := a.NewWindow("editor")
 	editor.SetContent(widget.NewLabel("editor"))
 
-	showTagPicker(a, editor, "Choose tags to remove", "8,80", TagConfig{}, func([]string) {
+	showTagPicker(a, editor, "Choose tags to remove", "8,80", func([]string) {
 		t.Fatal("onApply ran without Apply being pressed")
 	})
 

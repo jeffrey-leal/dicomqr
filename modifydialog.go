@@ -86,26 +86,18 @@ func showModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabel
 			return
 		}
 	}
-	aliases := TagConfig{}
-	if tagsPath, err := modifyTagsPath(); err == nil {
-		var lerr error
-		if aliases, lerr = loadTagConfig(tagsPath); lerr != nil {
-			dialog.ShowError(fmt.Errorf("loading tags.json: %w", lerr), w)
-			return
-		}
-	}
 	resolved, err := resolveModProfile(profileName, profCfg)
 	if err != nil {
 		dialog.ShowError(err, w)
 		return
 	}
-	buildModificationDialog(w, cfg, profileName, nodeLabel, files, rootDir, studyLevel, resolved, aliases)
+	buildModificationDialog(w, cfg, profileName, nodeLabel, files, rootDir, studyLevel, resolved)
 }
 
 // buildModificationDialog constructs and shows the confirmation dialog for an
 // already-resolved profile.
 func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabel string,
-	files []string, rootDir string, studyLevel bool, resolved ModProfile, aliases TagConfig) {
+	files []string, rootDir string, studyLevel bool, resolved ModProfile) {
 
 	header := widget.NewLabel(fmt.Sprintf("Profile %q — %d file(s) from %s",
 		profileName, len(files), nodeLabel))
@@ -114,27 +106,34 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	// tagLabel renders a tag reference as "Name (GGGG,EEEE)" where resolvable.
 	tagLabel := func(ref string) string {
 		ref = strings.TrimSpace(ref)
-		t, err := parseTagString(aliases.Resolve(ref))
+		t, err := parseTagString(ref)
 		if err != nil {
 			return ref
 		}
-		if name := tagDisplayName(t, aliases); name != "" {
+		if name := tagDisplayName(t); name != "" {
 			return fmt.Sprintf("%s (%04X,%04X)", name, t.Group, t.Element)
 		}
 		return fmt.Sprintf("%04X,%04X", t.Group, t.Element)
 	}
 
-	// Set values — one editable row per effective "TAG=VALUE" entry.
-	// The Patient Name and Patient ID rows are remembered so entering a
-	// Patient Name can auto-populate the Patient ID and export folder name.
+	// Set values — one editable row per effective "TAG=VALUE" entry. A value
+	// that is a "[GGGG,EEEE]" reference shows what it resolves to rather than
+	// the syntax, and keeps following its target as that is typed (wired below).
 	type setRow struct {
 		tagStr string
+		t      tag.Tag
+		parsed bool
 		entry  *widget.Entry
 	}
 	var setRows []setRow
-	var patNameEntry, patIDEntry *widget.Entry
+	entryByTag := map[tag.Tag]*widget.Entry{}
+	resolvedSets, refErr := resolveSetReferences(resolved.Sets)
+	if refErr != nil {
+		dialog.ShowError(fmt.Errorf("profile %q: %w", profileName, refErr), w)
+		return
+	}
 	setForm := widget.NewForm()
-	for _, s := range resolved.Sets {
+	for i, s := range resolvedSets {
 		tagStr, value, ok := strings.Cut(s, "=")
 		if !ok || strings.TrimSpace(tagStr) == "" {
 			logWarn("modify: ignoring malformed set entry %q in profile %q", s, profileName)
@@ -142,16 +141,17 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		}
 		entry := widget.NewEntry()
 		entry.SetText(value)
-		setForm.Append(tagLabel(tagStr), entry)
-		setRows = append(setRows, setRow{tagStr: strings.TrimSpace(tagStr), entry: entry})
-		if t, terr := parseTagString(aliases.Resolve(strings.TrimSpace(tagStr))); terr == nil {
-			switch {
-			case t == tag.PatientName && patNameEntry == nil:
-				patNameEntry = entry
-			case t == tag.PatientID && patIDEntry == nil:
-				patIDEntry = entry
+		// Label from the profile's own entry, so an unparsable tag still reads
+		// as the user wrote it; resolvedSets carries the canonical form.
+		setForm.Append(tagLabel(strings.SplitN(resolved.Sets[i], "=", 2)[0]), entry)
+		row := setRow{tagStr: strings.TrimSpace(tagStr), entry: entry}
+		if t, terr := parseTagString(row.tagStr); terr == nil {
+			row.t, row.parsed = t, true
+			if _, dup := entryByTag[t]; !dup {
+				entryByTag[t] = entry
 			}
 		}
+		setRows = append(setRows, row)
 	}
 
 	// Options — effective profile values; unset fields show the application
@@ -177,11 +177,23 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	}
 	tsSelect := widget.NewSelect(modProfileTSLabels, nil)
 	tsSelect.SetSelected(transferSyntaxPrefLabel(resolved.TransferSyntax))
+
+	// Remap UIDs and the UID suffix share a row and grey out together, through
+	// the same helpers the profile editor uses — the exclusion is visible
+	// rather than a message on confirm.
+	uidSuffixLabel := widget.NewLabel("UID suffix")
+	syncUIDSuffixEnabled(remapCheck, uidSuffixLabel, uidEntry)
+	uidRow := uidSuffixRow(remapCheck, uidSuffixLabel, uidEntry)
+
+	// Row order is the profile editor's, deliberately — the two Options blocks
+	// show the same fields and are read against each other, so they must not be
+	// ordered differently. The one field the editor has here and this dialog
+	// does not is Zip export: it lives in Export below, where the user is
+	// naming the output and can see what the checkbox changes.
 	optionsForm := widget.NewForm(
-		widget.NewFormItem("Remap UIDs", remapCheck),
-		widget.NewFormItem("Remove private tags", privCheck),
 		widget.NewFormItem("Birth date mask", dobEntry),
-		widget.NewFormItem("UID suffix", uidEntry),
+		widget.NewFormItem("Remap UIDs", uidRow),
+		widget.NewFormItem("Remove private tags", privCheck),
 		widget.NewFormItem("Shift dates (days)", shiftEntry),
 		widget.NewFormItem("Fix VR", fixvrSelect),
 		widget.NewFormItem("Output transfer syntax", tsSelect),
@@ -191,8 +203,8 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	removeLines := make([]string, 0, len(resolved.Removes))
 	for _, r := range resolved.Removes {
 		line := strings.TrimSpace(r)
-		if t, err := parseTagString(aliases.Resolve(line)); err == nil {
-			if name := tagDisplayName(t, aliases); name != "" {
+		if t, err := parseTagString(line); err == nil {
+			if name := tagDisplayName(t); name != "" {
 				line = fmt.Sprintf("%04X,%04X — %s", t.Group, t.Element, name)
 			} else {
 				line = fmt.Sprintf("%04X,%04X", t.Group, t.Element)
@@ -209,13 +221,16 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	listHeight.SetMinSize(fyne.NewSize(0, 180))
 	removeBox := container.NewStack(listHeight, removeList)
 
+	// Sections are built with prefSection, the same header/separator block the
+	// profile editor and Preferences use, so the two Options blocks are framed
+	// identically as well as ordered identically.
 	sections := []fyne.CanvasObject{header}
 	if len(setRows) > 0 {
-		sections = append(sections, boldLabel("Set values"), widget.NewSeparator(), setForm)
+		sections = append(sections, prefSection("Set values", setForm))
 	}
 	sections = append(sections,
-		boldLabel("Options"), widget.NewSeparator(), optionsForm,
-		boldLabel(fmt.Sprintf("Tags removed (%d)", len(removeLines))), widget.NewSeparator(), removeBox,
+		prefSection("Options", optionsForm),
+		prefSection(fmt.Sprintf("Tags removed (%d)", len(removeLines)), removeBox),
 	)
 
 	// Settings applied as-is without dialog controls.
@@ -244,36 +259,82 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	// Export destination. The output folder is the persisted default
 	// (cfg.ModifyOutputDir) so no picker appears on routine runs; Change…
 	// overrides it for this run only. The export folder name is always typed
-	// by the user (default: profile + timestamp) and replaces the original
-	// patient/study folder names in the output, which often contain PHI.
+	// by the user and replaces the original patient/study folder names in the
+	// output, which often contain PHI. Its default is the profile's exportname
+	// — usually a reference to the new patient name — falling back to profile
+	// plus timestamp when that is unset or resolves to nothing.
 	exportNameEntry := widget.NewEntry()
-	exportNameEntry.SetText(sanitize(profileName) + "-" + time.Now().Format("20060102-150405"))
-
-	// Entering a Patient Name auto-populates the Patient ID and the export
-	// folder name with the same value, since all three usually carry the new
-	// anonymized identity. Each target follows only while the user has not
-	// edited it directly: once Patient ID or the export name diverges from the
-	// last auto-filled value, later Patient Name edits leave that field alone.
-	// Clearing the Patient Name restores the profile-plus-timestamp export
-	// default rather than leaving an empty (invalid) folder name.
-	if patNameEntry != nil {
-		defaultExportName := exportNameEntry.Text
-		lastAutoID := ""
-		if patIDEntry != nil {
-			lastAutoID = patIDEntry.Text
+	defaultExportName := sanitize(profileName) + "-" + time.Now().Format("20060102-150405")
+	exportNameFrom := func(v string) string {
+		if name := strings.TrimRight(sanitize(strings.TrimSpace(v)), ". "); name != "" {
+			return name
 		}
-		lastAutoExport := defaultExportName
-		patNameEntry.OnChanged = func(v string) {
-			v = strings.TrimSpace(v)
-			if patIDEntry != nil && patIDEntry.Text == lastAutoID {
-				lastAutoID = v
-				patIDEntry.SetText(v)
+		return defaultExportName
+	}
+	exportRefTag, exportIsRef := setValueReference(resolved.ExportName)
+	switch {
+	case exportIsRef:
+		if e, ok := entryByTag[exportRefTag]; ok {
+			exportNameEntry.SetText(exportNameFrom(e.Text))
+		} else {
+			exportNameEntry.SetText(defaultExportName)
+		}
+	case strings.TrimSpace(resolved.ExportName) != "":
+		exportNameEntry.SetText(exportNameFrom(resolved.ExportName))
+	default:
+		exportNameEntry.SetText(defaultExportName)
+	}
+
+	// Live propagation. A field that declares itself a copy of another follows
+	// that other field as it is typed — the relationship comes from the profile
+	// rather than from hardcoded knowledge of which tags are related, which is
+	// what made the old Patient Name → Patient ID link invisible when it failed.
+	//
+	// A target stops being followed once its own field is edited directly: each
+	// follower remembers the last value written into it, and a field holding
+	// anything else is the user's, not ours.
+	lastAuto := map[*widget.Entry]string{}
+	for _, e := range entryByTag {
+		lastAuto[e] = e.Text
+	}
+	lastAutoExport := exportNameEntry.Text
+	targets := setValueFollowers(resolved.Sets)
+	if exportIsRef {
+		// The export name may reference a tag no Set value does, and it still
+		// has to follow it — so make sure that tag is wired even with no
+		// followers of its own.
+		if _, ok := targets[exportRefTag]; !ok {
+			if targets == nil {
+				targets = map[tag.Tag][]tag.Tag{}
 			}
-			if exportNameEntry.Text == lastAutoExport {
-				name := strings.TrimRight(sanitize(v), ". ")
-				if name == "" {
-					name = defaultExportName
+			targets[exportRefTag] = nil
+		}
+	}
+	for target, referrers := range targets {
+		source, ok := entryByTag[target]
+		if !ok {
+			continue
+		}
+		followers := make([]*widget.Entry, 0, len(referrers))
+		for _, r := range referrers {
+			if e, ok := entryByTag[r]; ok {
+				followers = append(followers, e)
+			}
+		}
+		alsoExport := exportIsRef && exportRefTag == target
+		if len(followers) == 0 && !alsoExport {
+			continue
+		}
+		source.OnChanged = func(v string) {
+			v = strings.TrimSpace(v)
+			for _, e := range followers {
+				if e.Text == lastAuto[e] {
+					lastAuto[e] = v
+					e.SetText(v)
 				}
+			}
+			if alsoExport && exportNameEntry.Text == lastAutoExport {
+				name := exportNameFrom(v)
 				lastAutoExport = name
 				exportNameEntry.SetText(name)
 			}
@@ -349,7 +410,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		"The original patient and study folder names are never reused — they often contain PHI.")
 	exportNote.TextStyle = fyne.TextStyle{Italic: true}
 	exportNote.Wrapping = fyne.TextWrapWord
-	sections = append(sections, boldLabel("Export"), widget.NewSeparator(), exportForm, exportNote)
+	sections = append(sections, prefSection("Export", exportForm, exportNote))
 
 	var dlg dialog.Dialog
 	cancelBtn := widget.NewButton("Cancel", func() { dlg.Hide() })
@@ -381,9 +442,12 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 			dialog.ShowError(err, w)
 			return
 		}
-		if remapCheck.Checked && uidSfx != "" {
-			dialog.ShowError(fmt.Errorf("Remap UIDs and a UID suffix cannot be combined — clear one of them"), w)
-			return
+		if remapCheck.Checked {
+			// The suffix entry is disabled while Remap UIDs is checked, so text
+			// left in it is inert and must not reach the run — the engine
+			// rejects the combination, and refusing here would be a dead end
+			// because the field cannot be cleared while it is disabled.
+			uidSfx = ""
 		}
 		shift, err := validateShiftDays(shiftEntry.Text)
 		if err != nil {
@@ -391,9 +455,18 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 			return
 		}
 
+		// The rows hold resolved literals, so each value can be checked against
+		// its tag's value representation here — the last place a per-run edit
+		// can put a word into a date field before it reaches every output file.
 		edited := resolved
 		edited.Sets = make([]string, 0, len(setRows))
 		for _, row := range setRows {
+			if row.parsed {
+				if verr := validateSetValue(row.t, row.entry.Text); verr != nil {
+					dialog.ShowError(fmt.Errorf("Set values: %w", verr), w)
+					return
+				}
+			}
 			edited.Sets = append(edited.Sets, row.tagStr+"="+row.entry.Text)
 		}
 		edited.DOB = dob
@@ -408,7 +481,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		}
 		edited.TransferSyntax = transferSyntaxPrefFromLabel(tsSelect.Selected)
 
-		params, err := compileModifyParams(edited, aliases)
+		params, err := compileModifyParams(edited)
 		if err != nil {
 			dialog.ShowError(err, w)
 			return

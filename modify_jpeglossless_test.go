@@ -17,8 +17,7 @@ import (
 )
 
 func TestRunModificationConvertsJPEGLossless(t *testing.T) {
-	_, aliases := embeddedModConfigs(t)
-	params, err := compileModifyParams(ModProfile{TransferSyntax: tsPrefExplicitLE}, aliases)
+	params, err := compileModifyParams(ModProfile{TransferSyntax: tsPrefExplicitLE})
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}

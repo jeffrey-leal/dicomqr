@@ -67,10 +67,9 @@ type modifyParams struct {
 	targetTS string
 }
 
-// compileModifyParams validates p and parses its tag references (resolving
-// aliases) into a modifyParams. The validation rules match dicomtool's modify
-// command exactly.
-func compileModifyParams(p ModProfile, aliases TagConfig) (modifyParams, error) {
+// compileModifyParams validates p and parses its tag references into a
+// modifyParams. The validation rules match dicomtool's modify command exactly.
+func compileModifyParams(p ModProfile) (modifyParams, error) {
 	var mp modifyParams
 
 	mp.fixvrMode = strings.ToLower(strings.TrimSpace(p.FixVR))
@@ -113,20 +112,28 @@ func compileModifyParams(p ModProfile, aliases TagConfig) (modifyParams, error) 
 	// array shared across concurrent workers.
 	mp.removals = make([]tag.Tag, 0, len(p.Removes))
 	for _, r := range p.Removes {
-		t, err := parseTagString(aliases.Resolve(strings.TrimSpace(r)))
+		t, err := parseTagString(strings.TrimSpace(r))
 		if err != nil {
 			return mp, fmt.Errorf("invalid remove tag %q: %w", r, err)
 		}
 		mp.removals = append(mp.removals, t)
 	}
 
-	mp.edits = make([]tagEdit, 0, len(p.Sets))
-	for _, s := range p.Sets {
+	// Resolve set-value references first, so nothing downstream — buildElement
+	// least of all — ever sees a "[GGGG,EEEE]" placeholder, whichever path
+	// reached here.
+	sets, err := resolveSetReferences(p.Sets)
+	if err != nil {
+		return mp, err
+	}
+
+	mp.edits = make([]tagEdit, 0, len(sets))
+	for _, s := range sets {
 		tagStr, value, ok := strings.Cut(s, "=")
 		if !ok || tagStr == "" {
 			return mp, fmt.Errorf("invalid set value %q: expected <tag>=<value>", s)
 		}
-		t, err := parseTagString(aliases.Resolve(strings.TrimSpace(tagStr)))
+		t, err := parseTagString(strings.TrimSpace(tagStr))
 		if err != nil {
 			return mp, fmt.Errorf("invalid tag %q: %w", tagStr, err)
 		}
@@ -151,7 +158,7 @@ func compileModifyParams(p ModProfile, aliases TagConfig) (modifyParams, error) 
 		for k, v := range p.PerModality {
 			normalized[strings.ToUpper(k)] = v
 		}
-		mp.perMod = buildModalityOverrides(normalized, aliases)
+		mp.perMod = buildModalityOverrides(normalized)
 	}
 
 	// A transfer syntax alone is actionable: converting a study to an
@@ -561,7 +568,7 @@ type modalityOverride struct {
 // buildModalityOverrides converts the per-modality profile map (already keyed
 // in uppercase) into pre-parsed modalityOverride values ready for runtime use.
 // Entries with unparsable tags are silently dropped, matching dicomtool.
-func buildModalityOverrides(perMod map[string]ModProfile, aliases TagConfig) map[string]modalityOverride {
+func buildModalityOverrides(perMod map[string]ModProfile) map[string]modalityOverride {
 	if len(perMod) == 0 {
 		return nil
 	}
@@ -573,21 +580,21 @@ func buildModalityOverrides(perMod map[string]ModProfile, aliases TagConfig) map
 			if !ok || tagStr == "" {
 				continue
 			}
-			t, err := parseTagString(aliases.Resolve(tagStr))
+			t, err := parseTagString(tagStr)
 			if err != nil {
 				continue
 			}
 			ov.edits = append(ov.edits, tagEdit{tag: t, value: value})
 		}
 		for _, r := range p.Removes {
-			t, err := parseTagString(aliases.Resolve(r))
+			t, err := parseTagString(r)
 			if err != nil {
 				continue
 			}
 			ov.removals = append(ov.removals, t)
 		}
 		for _, k := range p.Keep {
-			t, err := parseTagString(aliases.Resolve(k))
+			t, err := parseTagString(k)
 			if err != nil {
 				continue
 			}

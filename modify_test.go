@@ -17,22 +17,18 @@ import (
 	"github.com/suyashkumar/dicom/pkg/tag"
 )
 
-// embeddedModConfigs unmarshals the compiled-in default profiles and aliases.
-func embeddedModConfigs(t *testing.T) (ModProfileConfig, TagConfig) {
+// embeddedModConfigs unmarshals the compiled-in default profiles.
+func embeddedModConfigs(t *testing.T) ModProfileConfig {
 	t.Helper()
 	var profiles ModProfileConfig
 	if err := json.Unmarshal(defaultModProfilesJSON, &profiles); err != nil {
 		t.Fatalf("unmarshal embedded profiles.json: %v", err)
 	}
-	var aliases TagConfig
-	if err := json.Unmarshal(defaultModTagsJSON, &aliases); err != nil {
-		t.Fatalf("unmarshal embedded tags.json: %v", err)
-	}
-	return profiles, aliases
+	return profiles
 }
 
 func TestResolveModProfileEmbeddedDefaults(t *testing.T) {
-	profiles, _ := embeddedModConfigs(t)
+	profiles := embeddedModConfigs(t)
 
 	base, err := resolveModProfile("base-deident", profiles)
 	if err != nil {
@@ -70,7 +66,6 @@ func TestResolveModProfileEmbeddedDefaults(t *testing.T) {
 }
 
 func TestCompileModifyParamsValidation(t *testing.T) {
-	_, aliases := embeddedModConfigs(t)
 
 	cases := []struct {
 		name string
@@ -90,11 +85,15 @@ func TestCompileModifyParamsValidation(t *testing.T) {
 		{"transfersyntax only is actionable", ModProfile{TransferSyntax: tsPrefImplicitLE}, ""},
 		{"shiftdays only is actionable", ModProfile{ShiftDays: "-45"}, ""},
 		{"shiftdays zero accepted", ModProfile{ShiftDays: "0"}, ""},
-		{"alias set", ModProfile{Sets: []string{"PatientName=X"}}, ""},
+		// A bare keyword used to resolve through tags.json. With aliases gone it
+		// is simply not a tag, and must be reported rather than quietly matching
+		// nothing.
+		{"keyword is no longer a tag", ModProfile{Sets: []string{"PatientName=X"}}, "invalid tag"},
+		{"canonical set", ModProfile{Sets: []string{"0010,0010=X"}}, ""},
 		{"short-form remove", ModProfile{Removes: []string{"8,80"}}, ""},
 	}
 	for _, tc := range cases {
-		_, err := compileModifyParams(tc.p, aliases)
+		_, err := compileModifyParams(tc.p)
 		if tc.want == "" {
 			if err != nil {
 				t.Errorf("%s: unexpected error %v", tc.name, err)
@@ -247,12 +246,12 @@ func writeModifyTestDICOM(t *testing.T, path string) (hasPrivate bool) {
 }
 
 func TestRunModificationBaseDeident(t *testing.T) {
-	profiles, aliases := embeddedModConfigs(t)
+	profiles := embeddedModConfigs(t)
 	resolved, err := resolveModProfile("base-deident", profiles)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	params, err := compileModifyParams(resolved, aliases)
+	params, err := compileModifyParams(resolved)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -349,12 +348,12 @@ func TestRunModificationBaseDeident(t *testing.T) {
 }
 
 func TestRunModificationToZip(t *testing.T) {
-	profiles, aliases := embeddedModConfigs(t)
+	profiles := embeddedModConfigs(t)
 	resolved, err := resolveModProfile("base-deident", profiles)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	params, err := compileModifyParams(resolved, aliases)
+	params, err := compileModifyParams(resolved)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -426,13 +425,12 @@ func TestRunModificationToZip(t *testing.T) {
 // still applies, and the source in the download folder is left in its own
 // syntax — the whole point of converting here rather than on the retrieve.
 func TestRunModificationTransferSyntax(t *testing.T) {
-	_, aliases := embeddedModConfigs(t)
 
 	// The fixture is Explicit VR LE, so Implicit VR LE is a real conversion.
 	params, err := compileModifyParams(ModProfile{
-		Sets:           []string{"PatientName=ANON"},
+		Sets:           []string{"0010,0010=ANON"},
 		TransferSyntax: tsPrefImplicitLE,
-	}, aliases)
+	})
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -474,8 +472,7 @@ func TestRunModificationTransferSyntax(t *testing.T) {
 // The zip sink writes through the same dataset, so the archived entry has to
 // carry the converted syntax too — it has its own write path.
 func TestRunModificationToZipTransferSyntax(t *testing.T) {
-	_, aliases := embeddedModConfigs(t)
-	params, err := compileModifyParams(ModProfile{TransferSyntax: tsPrefImplicitLE}, aliases)
+	params, err := compileModifyParams(ModProfile{TransferSyntax: tsPrefImplicitLE})
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -521,8 +518,7 @@ func TestRunModificationToZipTransferSyntax(t *testing.T) {
 // name the syntax: that is what tells the user the export cannot simply be
 // retried.
 func TestRunModificationTransferSyntaxUndecodable(t *testing.T) {
-	_, aliases := embeddedModConfigs(t)
-	params, err := compileModifyParams(ModProfile{TransferSyntax: tsPrefExplicitLE}, aliases)
+	params, err := compileModifyParams(ModProfile{TransferSyntax: tsPrefExplicitLE})
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -758,8 +754,7 @@ func TestApplyDateShift(t *testing.T) {
 // shift: every DA/DT moves by the offset (including inside sequences), the
 // birth date does not, and the source file is untouched.
 func TestRunModificationShiftDays(t *testing.T) {
-	_, aliases := embeddedModConfigs(t)
-	params, err := compileModifyParams(ModProfile{ShiftDays: "-45"}, aliases)
+	params, err := compileModifyParams(ModProfile{ShiftDays: "-45"})
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -835,7 +830,6 @@ func TestRunModificationShiftDays(t *testing.T) {
 // override wins for a matching file, and that a garbage override value fails
 // the file (rather than silently shipping unshifted dates) — dicomtool parity.
 func TestRunModificationShiftDaysPerModality(t *testing.T) {
-	_, aliases := embeddedModConfigs(t)
 
 	rootDir := t.TempDir()
 	srcPath := filepath.Join(rootDir, "img1.dcm")
@@ -844,7 +838,7 @@ func TestRunModificationShiftDaysPerModality(t *testing.T) {
 	params, err := compileModifyParams(ModProfile{
 		ShiftDays:   "-45",
 		PerModality: map[string]ModProfile{"OT": {ShiftDays: "10"}},
-	}, aliases)
+	})
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -870,7 +864,7 @@ func TestRunModificationShiftDaysPerModality(t *testing.T) {
 	params, err = compileModifyParams(ModProfile{
 		Sets:        []string{"0010,0010=X"},
 		PerModality: map[string]ModProfile{"OT": {ShiftDays: "x"}},
-	}, aliases)
+	})
 	if err != nil {
 		t.Fatalf("compile with bad override: %v", err)
 	}

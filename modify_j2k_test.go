@@ -21,7 +21,6 @@ import (
 )
 
 func TestRunModificationConvertsJ2K(t *testing.T) {
-	_, aliases := embeddedModConfigs(t)
 
 	for _, target := range []struct {
 		pref string
@@ -32,9 +31,9 @@ func TestRunModificationConvertsJ2K(t *testing.T) {
 	} {
 		t.Run(transferSyntaxLabel(target.uid), func(t *testing.T) {
 			params, err := compileModifyParams(ModProfile{
-				Sets:           []string{"PatientName=ANON"},
+				Sets:           []string{"0010,0010=ANON"},
 				TransferSyntax: target.pref,
-			}, aliases)
+			})
 			if err != nil {
 				t.Fatalf("compile: %v", err)
 			}
@@ -91,8 +90,7 @@ func TestRunModificationConvertsJ2K(t *testing.T) {
 // export is byte-identical to a plain copy apart from the tag edits, and the
 // pixel data stays encapsulated.
 func TestRunModificationKeepsJ2KWhenAsStored(t *testing.T) {
-	_, aliases := embeddedModConfigs(t)
-	params, err := compileModifyParams(ModProfile{Sets: []string{"PatientName=ANON"}}, aliases)
+	params, err := compileModifyParams(ModProfile{Sets: []string{"0010,0010=ANON"}})
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}

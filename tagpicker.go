@@ -5,23 +5,19 @@ package main
 // dictionary as a tree of groups, each opening to its tags with a checkbox,
 // plus a search box over tag names, keywords and numbers.
 //
-// Two deliberate design constraints:
+// One deliberate design constraint: checkboxes are on tags only, never on
+// groups. The profile format has no group wildcard (removals are individual
+// tags; noprivate is the only wildcard the engine knows), so a group checkbox
+// would expand into hundreds of literal entries — group 0018 alone holds 895
+// tags — and removing a whole group is nearly always wrong: 0028 carries Rows,
+// Columns and BitsAllocated, 0008 carries the SOP UIDs. Bulk selection is
+// offered only over an active search, where the user has stated the scope.
 //
-//   - Checkboxes are on tags only, never on groups. The profile format has no
-//     group wildcard (removals are individual tags; noprivate is the only
-//     wildcard the engine knows), so a group checkbox would expand into
-//     hundreds of literal entries — group 0018 alone holds 895 tags — and
-//     removing a whole group is nearly always wrong: 0028 carries Rows,
-//     Columns and BitsAllocated, 0008 carries the SOP UIDs. Bulk selection is
-//     offered only over an active search, where the user has stated the scope.
-//
-//   - Existing entries are merged, never regenerated. Profile tag lists are
-//     compared as literal strings by mergeModProfiles (a Keep entry cancels a
-//     Removes entry only when the two spellings match exactly), and the
-//     shipped defaults use zero-stripped hex such as "8,80" while a user may
-//     equally have typed a tags.json alias. Rewriting the field canonically
-//     would silently break keep/remove cancellation, so every surviving line
-//     keeps the spelling it already had.
+// Entries used to be merged rather than regenerated, to protect the spellings
+// mergeModProfiles compared as literal strings. That comparison now parses the
+// reference, so the picker writes every surviving tag canonically; only a line
+// that does not parse at all is preserved verbatim, so a typo is reported by
+// validation rather than silently deleted.
 
 import (
 	"fmt"
@@ -37,27 +33,27 @@ import (
 	"github.com/suyashkumar/dicom/pkg/tag"
 )
 
-// tagSelectionFromLines resolves each profile tag-list line (a GGGG,EEEE
-// reference or a tags.json alias) to the tag it names, so the picker can open
-// with the profile's current entries already checked. Lines that do not
-// resolve are ignored here and preserved by mergeTagSelection.
-func tagSelectionFromLines(lines []string, aliases TagConfig) map[tag.Tag]bool {
+// tagSelectionFromLines resolves each profile tag-list line to the tag it
+// names, so the picker can open with the profile's current entries already
+// checked. Lines that do not resolve are ignored here and preserved by
+// mergeTagSelection.
+func tagSelectionFromLines(lines []string) map[tag.Tag]bool {
 	selected := make(map[tag.Tag]bool, len(lines))
 	for _, line := range lines {
-		if t, err := parseTagString(aliases.Resolve(strings.TrimSpace(line))); err == nil {
+		if t, err := parseTagString(strings.TrimSpace(line)); err == nil {
 			selected[t] = true
 		}
 	}
 	return selected
 }
 
-// mergeTagSelection reconciles the picker's selection with the lines already
-// in the field. A line whose tag is still selected survives verbatim — its
-// alias or zero-stripped spelling intact — a line whose tag was unchecked is
-// dropped, and a line that resolves to nothing is kept untouched so a typo is
-// reported by validation rather than silently deleted. Newly checked tags are
-// appended in dictionary order in the canonical GGGG,EEEE form.
-func mergeTagSelection(existing []string, selected map[tag.Tag]bool, aliases TagConfig) []string {
+// mergeTagSelection reconciles the picker's selection with the lines already in
+// the field. A line whose tag is still selected is rewritten canonically and
+// keeps its position, a line whose tag was unchecked is dropped, and a line
+// that resolves to nothing is kept untouched so a typo is reported by
+// validation rather than silently deleted. Newly checked tags are appended in
+// dictionary order.
+func mergeTagSelection(existing []string, selected map[tag.Tag]bool) []string {
 	var out []string
 	seen := make(map[tag.Tag]bool, len(selected))
 	for _, line := range existing {
@@ -65,7 +61,7 @@ func mergeTagSelection(existing []string, selected map[tag.Tag]bool, aliases Tag
 		if line == "" {
 			continue
 		}
-		t, err := parseTagString(aliases.Resolve(line))
+		t, err := parseTagString(line)
 		if err != nil {
 			out = append(out, line) // unresolvable — leave it for validation
 			continue
@@ -74,10 +70,10 @@ func mergeTagSelection(existing []string, selected map[tag.Tag]bool, aliases Tag
 			continue // unchecked in the picker
 		}
 		if seen[t] {
-			continue // duplicate spelling of a tag already kept
+			continue // a tag already kept
 		}
 		seen[t] = true
-		out = append(out, line)
+		out = append(out, formatTagRef(t))
 	}
 
 	added := make([]tag.Tag, 0, len(selected))
@@ -260,9 +256,9 @@ func (m *tagPickerModel) selectedUnknown() int {
 // receives the merged list of stored references, for the caller to render
 // however it displays them.
 func showTagPicker(a fyne.App, parent fyne.Window, title, current string,
-	aliases TagConfig, onApply func([]string)) {
+	onApply func([]string)) {
 	existing := strippedTagLines(current)
-	m := newTagPickerModel(tagSelectionFromLines(existing, aliases))
+	m := newTagPickerModel(tagSelectionFromLines(existing))
 
 	countLabel := widget.NewLabel("")
 	var tree *widget.Tree
@@ -410,7 +406,7 @@ func showTagPicker(a fyne.App, parent fyne.Window, title, current string,
 		container.NewBorder(top, bottom, nil, nil, tree))
 
 	applyBtn.OnTapped = func() {
-		merged := mergeTagSelection(existing, m.selected, aliases)
+		merged := mergeTagSelection(existing, m.selected)
 		win.Close()
 		onApply(merged)
 	}
@@ -439,12 +435,11 @@ func showTagPicker(a fyne.App, parent fyne.Window, title, current string,
 // tagListField pairs a tag-list entry with the Choose… button that opens the
 // picker over it. Used for both Remove tags and Keep tags, in the top-level
 // editor and the per-modality sub-editor alike.
-func tagListField(a fyne.App, parent fyne.Window, entry *widget.Entry, title string,
-	aliases TagConfig) fyne.CanvasObject {
+func tagListField(a fyne.App, parent fyne.Window, entry *widget.Entry, title string) fyne.CanvasObject {
 
 	btn := widget.NewButton("Choose…", func() {
-		showTagPicker(a, parent, title, entry.Text, aliases, func(entries []string) {
-			entry.SetText(decorateTagList(entries, aliases))
+		showTagPicker(a, parent, title, entry.Text, func(entries []string) {
+			entry.SetText(decorateTagList(entries))
 		})
 	})
 	// NewVBox keeps the button at its natural height beside the multi-line

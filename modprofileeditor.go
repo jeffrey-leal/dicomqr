@@ -30,7 +30,6 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/widget"
-	"github.com/suyashkumar/dicom/pkg/tag"
 )
 
 // modProfileNoBaseLabel is the Base select option meaning "no base profile".
@@ -60,41 +59,56 @@ func splitCommaList(s string) []string {
 	return out
 }
 
-// checkTagLines validates a tag-list entry (one tag or alias per line) and
-// returns the references to store; field names the entry in error messages.
+// checkTagLines validates a tag-list entry (one tag per line) and returns the
+// canonical references to store; field names the entry in error messages.
 //
-// The editor displays every entry as a zero-padded GGGG,EEEE reference with
-// the tag's name appended, so neither is what should be stored. The names are
-// stripped, and any tag orig already listed is written back in orig's own
-// spelling — a profile written as "8,80" or as a tags.json alias keeps that
-// form, because mergeModProfiles cancels Keep against Removes by literal
-// string equality. Tags not in orig are stored as the line reads.
-func checkTagLines(field, text string, orig []string, aliases TagConfig) ([]string, error) {
-	spelling := make(map[tag.Tag]string, len(orig))
-	for _, o := range orig {
-		o = strings.TrimSpace(o)
-		t, err := parseTagString(aliases.Resolve(o))
-		if err != nil {
-			continue
-		}
-		if _, dup := spelling[t]; !dup {
-			spelling[t] = o // first spelling wins, matching the stored order
-		}
-	}
-
+// The editor displays each entry as a zero-padded GGGG,EEEE reference with the
+// tag's name appended; the name is display only and stripped here. What is
+// stored is always the canonical form, whatever the user typed — mergeModProfiles
+// compares parsed tags, so no spelling needs preserving.
+func checkTagLines(field, text string) ([]string, error) {
 	var out []string
 	for _, line := range strippedTagLines(text) {
-		t, err := parseTagString(aliases.Resolve(line))
-		if err != nil {
-			return nil, fmt.Errorf("%s: %q is neither a GGGG,EEEE tag nor a tags.json alias", field, line)
+		ref, ok := canonicalTagRef(line)
+		if !ok {
+			return nil, fmt.Errorf("%s: %q is not a GGGG,EEEE tag", field, line)
 		}
-		if stored, ok := spelling[t]; ok {
-			out = append(out, stored)
-			continue
-		}
-		out = append(out, line)
+		out = append(out, ref)
 	}
 	return out, nil
+}
+
+// Remap UIDs and a UID suffix are mutually exclusive, and both the profile
+// editor and the Modification dialog present the pair. These two helpers are
+// what they share: the behaviour existed in the editor alone for a while, and
+// the dialog's Options block silently lacked it, so there is one implementation
+// now rather than two that can drift.
+//
+// Split into wiring and layout because the editor installs the wiring when its
+// controls are built — which is what its tests drive — but lays them out later,
+// inside the window-build callback.
+
+// syncUIDSuffixEnabled makes the suffix entry and its label follow the remap
+// checkbox, and applies the current state immediately.
+func syncUIDSuffixEnabled(remap *widget.Check, label *widget.Label, suffix *widget.Entry) {
+	apply := func() {
+		if remap.Checked {
+			suffix.Disable()
+			label.Importance = widget.LowImportance
+		} else {
+			suffix.Enable()
+			label.Importance = widget.MediumImportance
+		}
+		label.Refresh()
+	}
+	remap.OnChanged = func(bool) { apply() }
+	apply()
+}
+
+// uidSuffixRow lays the pair out on one line: the checkbox, then the suffix
+// label and entry that grey out with it.
+func uidSuffixRow(remap *widget.Check, label *widget.Label, suffix *widget.Entry) fyne.CanvasObject {
+	return container.NewBorder(nil, nil, container.NewHBox(remap, label), nil, suffix)
 }
 
 // modProfileFieldSet groups the three tag-list controls — the only ModProfile
@@ -104,32 +118,24 @@ func checkTagLines(field, text string, orig []string, aliases TagConfig) ([]stri
 // editor alone. Layout is left to the caller; the set owns construction,
 // seeding, validation and write-back.
 type modProfileFieldSet struct {
-	sets, removes, keep *widget.Entry // multiline
-	// The profile's stored tag lists, kept so an entry that was already there
-	// is saved in its original spelling — the fields themselves display a
-	// normalised, zero-padded form that must not reach the profile.
-	origRemoves, origKeep []string
+	sets          *setValueList
+	removes, keep *widget.Entry // multiline
 }
 
 // newModProfileFieldSet builds the tag-list controls. The Remove and Keep
 // lists are seeded with each tag's name appended for readability; the names
 // are display only and stripped again on save.
-func newModProfileFieldSet(p ModProfile, aliases TagConfig) *modProfileFieldSet {
-	f := &modProfileFieldSet{origRemoves: p.Removes, origKeep: p.Keep}
-
-	f.sets = widget.NewMultiLineEntry()
-	f.sets.SetMinRowsVisible(5)
-	f.sets.SetText(strings.Join(p.Sets, "\n"))
-	f.sets.SetPlaceHolder("One TAG=VALUE per line, e.g.\npatient name=ANONYMOUS\n0010,0020=ID0000")
+func newModProfileFieldSet(p ModProfile) *modProfileFieldSet {
+	f := &modProfileFieldSet{sets: newSetValueList(p.Sets)}
 
 	f.removes = widget.NewMultiLineEntry()
 	f.removes.SetMinRowsVisible(5)
-	f.removes.SetText(decorateTagList(p.Removes, aliases))
-	f.removes.SetPlaceHolder("One tag or alias per line, e.g.\nother patient ids\n0010,1000")
+	f.removes.SetText(decorateTagList(p.Removes))
+	f.removes.SetPlaceHolder("One GGGG,EEEE tag per line, e.g.\n0010,1000")
 
 	f.keep = widget.NewMultiLineEntry()
 	f.keep.SetMinRowsVisible(3)
-	f.keep.SetText(decorateTagList(p.Keep, aliases))
+	f.keep.SetText(decorateTagList(p.Keep))
 	f.keep.SetPlaceHolder("Tags to keep even when the base profile removes them")
 
 	return f
@@ -139,25 +145,18 @@ func newModProfileFieldSet(p ModProfile, aliases TagConfig) *modProfileFieldSet 
 // corresponding fields of dst; on error dst is untouched and the message is
 // user-ready. The engine silently drops unparsable per-modality tag lines, so
 // rejecting them here is the user's only feedback.
-func (f *modProfileFieldSet) applyValidated(dst *ModProfile, aliases TagConfig) error {
-	removes, err := checkTagLines("Remove tags", f.removes.Text, f.origRemoves, aliases)
+func (f *modProfileFieldSet) applyValidated(dst *ModProfile) error {
+	removes, err := checkTagLines("Remove tags", f.removes.Text)
 	if err != nil {
 		return err
 	}
-	keeps, err := checkTagLines("Keep tags", f.keep.Text, f.origKeep, aliases)
+	keeps, err := checkTagLines("Keep tags", f.keep.Text)
 	if err != nil {
 		return err
 	}
-	sets := splitProfileLines(f.sets.Text)
-	for _, s := range sets {
-		tagStr, _, ok := strings.Cut(s, "=")
-		tagStr = strings.TrimSpace(tagStr)
-		if !ok || tagStr == "" {
-			return fmt.Errorf("Set values: %q is not of the form TAG=VALUE", s)
-		}
-		if _, err := parseTagString(aliases.Resolve(tagStr)); err != nil {
-			return fmt.Errorf("Set values: tag %q is neither a GGGG,EEEE tag nor a tags.json alias", tagStr)
-		}
+	sets, err := f.sets.entries()
+	if err != nil {
+		return err
 	}
 
 	dst.Sets = sets
@@ -173,7 +172,6 @@ type modProfileEditor struct {
 	origName string
 	orig     ModProfile
 	cfg      ModProfileConfig
-	aliases  TagConfig
 
 	nameEntry  *widget.Entry
 	baseSelect *widget.Select
@@ -196,8 +194,8 @@ type modProfileEditor struct {
 	perMod map[string]ModProfile
 }
 
-func newModProfileEditor(name string, p ModProfile, cfg ModProfileConfig, aliases TagConfig) *modProfileEditor {
-	e := &modProfileEditor{origName: name, orig: p, cfg: cfg, aliases: aliases}
+func newModProfileEditor(name string, p ModProfile, cfg ModProfileConfig) *modProfileEditor {
+	e := &modProfileEditor{origName: name, orig: p, cfg: cfg}
 
 	e.nameEntry = widget.NewEntry()
 	e.nameEntry.SetText(name)
@@ -219,7 +217,7 @@ func newModProfileEditor(name string, p ModProfile, cfg ModProfileConfig, aliase
 		e.baseSelect.SetSelected(modProfileNoBaseLabel)
 	}
 
-	e.fields = newModProfileFieldSet(p, aliases)
+	e.fields = newModProfileFieldSet(p)
 
 	e.dob = widget.NewEntry()
 	e.dob.SetText(p.DOB)
@@ -249,8 +247,7 @@ func newModProfileEditor(name string, p ModProfile, cfg ModProfileConfig, aliase
 	e.remapCheck = widget.NewCheck("", nil)
 	e.remapCheck.SetChecked(p.RemapUIDs)
 	e.uidSuffixLabel = widget.NewLabel("UID suffix")
-	e.remapCheck.OnChanged = func(bool) { e.syncUIDSuffixState() }
-	e.syncUIDSuffixState()
+	syncUIDSuffixEnabled(e.remapCheck, e.uidSuffixLabel, e.uidSfx)
 
 	e.tsSelect = widget.NewSelect(modProfileTSLabels, nil)
 	e.tsSelect.SetSelected(transferSyntaxPrefLabel(p.TransferSyntax))
@@ -270,20 +267,6 @@ func newModProfileEditor(name string, p ModProfile, cfg ModProfileConfig, aliase
 	return e
 }
 
-// syncUIDSuffixState enables or disables the UID suffix entry and greys its
-// label to follow the Remap UIDs checkbox — the two options are mutually
-// exclusive, so the suffix is editable only while remap is unchecked.
-func (e *modProfileEditor) syncUIDSuffixState() {
-	if e.remapCheck.Checked {
-		e.uidSfx.Disable()
-		e.uidSuffixLabel.Importance = widget.LowImportance
-	} else {
-		e.uidSfx.Enable()
-		e.uidSuffixLabel.Importance = widget.MediumImportance
-	}
-	e.uidSuffixLabel.Refresh()
-}
-
 // validate checks every control and returns the (possibly renamed) profile to
 // save. updated starts as the original, so fields without controls (dicomdir,
 // verbose, top-level keepprivate) carry through untouched.
@@ -299,7 +282,7 @@ func (e *modProfileEditor) validate() (string, ModProfile, error) {
 	}
 
 	updated := e.orig
-	if err := e.fields.applyValidated(&updated, e.aliases); err != nil {
+	if err := e.fields.applyValidated(&updated); err != nil {
 		return "", ModProfile{}, err
 	}
 	dob, err := validateDOBMask(e.dob.Text)
@@ -416,6 +399,13 @@ func otherCodes(perMod map[string]ModProfile, exclude string) []string {
 // overwrite the first one's save.
 func modProfileEditorKey(name string) string { return "modprofile:" + name }
 
+// modEditorMargin is the inset between this window's controls and its frame.
+// A Fyne dialog is drawn with an inner padding of its own — which is why the
+// Modification dialog's controls sit inside a frame while these, in a plain
+// window, ran flush to the edge. The value is chosen to read the same as that
+// dialog's inset (theme inner padding plus the padding container it adds).
+const modEditorMargin = 12
+
 // showModProfileEditor opens an editor window for the modification profile
 // named name (empty for a new profile). cfg supplies the other profiles for
 // the Base select and the rename-collision and base-cycle checks; it is not
@@ -431,15 +421,6 @@ func showModProfileEditor(a fyne.App, parent fyne.Window, name string, p ModProf
 		return
 	}
 
-	// Tag aliases let Removes/Keep/Sets reference tags by phrase ("patient
-	// name") instead of GGGG,EEEE — needed to validate those fields.
-	aliases := TagConfig{}
-	if tagsPath, err := modifyTagsPath(); err == nil {
-		if loaded, lerr := loadTagConfig(tagsPath); lerr == nil {
-			aliases = loaded
-		}
-	}
-
 	// Warm the dictionary probe off the UI goroutine so the first Choose…
 	// opens instantly; sync.Once makes a concurrent picker open harmless.
 	go dictionaryTags()
@@ -449,7 +430,7 @@ func showModProfileEditor(a fyne.App, parent fyne.Window, name string, p ModProf
 		title = "Edit Modification Profile — " + name
 	}
 
-	ed := newModProfileEditor(name, p, cfg, aliases)
+	ed := newModProfileEditor(name, p, cfg)
 
 	openOwnedWindow(a, windowSpec{
 		Key:      modProfileEditorKey(name),
@@ -458,7 +439,7 @@ func showModProfileEditor(a fyne.App, parent fyne.Window, name string, p ModProf
 		Parent:   parent,
 		Blocking: true,
 	}, func(win fyne.Window) fyne.CanvasObject {
-		return buildModProfileEditorContent(a, win, ed, p, aliases, onSave)
+		return buildModProfileEditorContent(a, win, ed, p, onSave)
 	})
 }
 
@@ -467,23 +448,24 @@ func showModProfileEditor(a fyne.App, parent fyne.Window, name string, p ModProf
 // — the tag picker, the per-modality sub-editor, validation errors — must be
 // parented to that window rather than to whatever is behind it.
 func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEditor, p ModProfile,
-	aliases TagConfig, onSave func(newName string, updated ModProfile)) fyne.CanvasObject {
+	onSave func(newName string, updated ModProfile)) fyne.CanvasObject {
+
+	// The Set values list needs the window the picker is parented to, which does
+	// not exist until openOwnedWindow calls this.
+	ed.fields.sets.attach(a, win)
 
 	topRow := widget.NewForm(
 		widget.NewFormItem("Profile name", ed.nameEntry),
 		widget.NewFormItem("Base profile", ed.baseSelect))
 
 	tagSection := prefSection("Tag rules", widget.NewForm(
-		widget.NewFormItem("Set values", ed.fields.sets),
+		widget.NewFormItem("Set values", ed.fields.sets.canvasObject()),
 		widget.NewFormItem("Remove tags",
-			tagListField(a, win, ed.fields.removes, "Choose tags to remove", aliases)),
+			tagListField(a, win, ed.fields.removes, "Choose tags to remove")),
 		widget.NewFormItem("Keep tags",
-			tagListField(a, win, ed.fields.keep, "Choose tags to keep", aliases))))
+			tagListField(a, win, ed.fields.keep, "Choose tags to keep"))))
 
-	// Remap UIDs and UID suffix share one row: checkbox, then the suffix
-	// label + entry, which grey out while remap is checked.
-	uidRow := container.NewBorder(nil, nil,
-		container.NewHBox(ed.remapCheck, ed.uidSuffixLabel), nil, ed.uidSfx)
+	uidRow := uidSuffixRow(ed.remapCheck, ed.uidSuffixLabel, ed.uidSfx)
 	optionsForm := widget.NewForm(
 		widget.NewFormItem("Birth date mask", ed.dob),
 		widget.NewFormItem("Remap UIDs", uidRow),
@@ -517,7 +499,7 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 		for i, c := range codes {
 			c := c
 			editBtn := widget.NewButton("Edit", func() {
-				showPerModalityEditor(a, win, c, ed.perMod[c], otherCodes(ed.perMod, c), aliases,
+				showPerModalityEditor(a, win, c, ed.perMod[c], otherCodes(ed.perMod, c),
 					func(newCode string, updated ModProfile) {
 						if newCode != c {
 							delete(ed.perMod, c)
@@ -540,7 +522,7 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 	rebuildPerModList()
 
 	addOverrideBtn := widget.NewButton("Add modality override…", func() {
-		showPerModalityEditor(a, win, "", ModProfile{}, otherCodes(ed.perMod, ""), aliases,
+		showPerModalityEditor(a, win, "", ModProfile{}, otherCodes(ed.perMod, ""),
 			func(newCode string, updated ModProfile) {
 				if ed.perMod == nil {
 					ed.perMod = map[string]ModProfile{}
@@ -580,7 +562,9 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 	saveBtn.Importance = widget.HighImportance
 	buttonRow := container.NewBorder(
 		widget.NewSeparator(), nil, nil, nil,
-		container.NewPadded(container.NewHBox(layout.NewSpacer(), cancelBtn, saveBtn)),
+		container.New(
+			layout.NewCustomPaddedLayout(modEditorMargin, modEditorMargin, modEditorMargin, modEditorMargin),
+			container.NewHBox(layout.NewSpacer(), cancelBtn, saveBtn)),
 	)
 
 	// A modest scroll floor rather than the full content height: it is what
@@ -588,7 +572,13 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 	// the vertical resizing this window exists to allow. The width floor only
 	// has to hold one column now, so it is well below what the two-column
 	// layout needed.
-	bodyScroll := container.NewVScroll(container.NewVBox(sections...))
+	//
+	// The margin goes inside the scroll rather than around it so the scrollbar
+	// still tracks the window edge; a window has none of the inset a dialog
+	// gets for free, which is what left these controls flush against the frame.
+	bodyScroll := container.NewVScroll(container.New(
+		layout.NewCustomPaddedLayout(modEditorMargin, modEditorMargin, modEditorMargin, modEditorMargin),
+		container.NewVBox(sections...)))
 	bodyScroll.SetMinSize(fyne.NewSize(0, 240))
 	minWidth := canvas.NewRectangle(color.Transparent)
 	minWidth.SetMinSize(fyne.NewSize(560, 0))
@@ -619,21 +609,20 @@ type perModalityEditor struct {
 	origCode string
 	orig     ModProfile
 	taken    []string // the other override codes (uppercase) — collision check
-	aliases  TagConfig
 
 	codeEntry     *widget.Entry
 	fields        *modProfileFieldSet
 	keepPrivCheck *widget.Check
 }
 
-func newPerModalityEditor(code string, p ModProfile, taken []string, aliases TagConfig) *perModalityEditor {
-	e := &perModalityEditor{origCode: code, orig: p, taken: taken, aliases: aliases}
+func newPerModalityEditor(code string, p ModProfile, taken []string) *perModalityEditor {
+	e := &perModalityEditor{origCode: code, orig: p, taken: taken}
 
 	e.codeEntry = widget.NewEntry()
 	e.codeEntry.SetText(code)
 	e.codeEntry.SetPlaceHolder("e.g. CT, US, MR")
 
-	e.fields = newModProfileFieldSet(p, aliases)
+	e.fields = newModProfileFieldSet(p)
 	e.fields.keep.SetPlaceHolder("Tags to keep even when the profile removes them")
 
 	e.keepPrivCheck = widget.NewCheck("", nil)
@@ -656,7 +645,7 @@ func (e *perModalityEditor) validate() (string, ModProfile, error) {
 		return "", ModProfile{}, fmt.Errorf("an override for modality %q already exists", newCode)
 	}
 	updated := e.orig
-	if err := e.fields.applyValidated(&updated, e.aliases); err != nil {
+	if err := e.fields.applyValidated(&updated); err != nil {
 		return "", ModProfile{}, err
 	}
 	updated.KeepPrivate = e.keepPrivCheck.Checked
@@ -745,17 +734,18 @@ func perModalityPreservedNote(p ModProfile) fyne.CanvasObject {
 // codes for the collision check. onSave receives the validated block under
 // its (possibly renamed) uppercase modality code.
 func showPerModalityEditor(a fyne.App, w fyne.Window, code string, p ModProfile, taken []string,
-	aliases TagConfig, onSave func(newCode string, updated ModProfile)) {
+	onSave func(newCode string, updated ModProfile)) {
 
-	ed := newPerModalityEditor(code, p, taken, aliases)
+	ed := newPerModalityEditor(code, p, taken)
+	ed.fields.sets.attach(a, w)
 
 	form := widget.NewForm(
 		widget.NewFormItem("Modality", ed.codeEntry),
-		widget.NewFormItem("Set values", ed.fields.sets),
+		widget.NewFormItem("Set values", ed.fields.sets.canvasObject()),
 		widget.NewFormItem("Remove tags",
-			tagListField(a, w, ed.fields.removes, "Choose tags to remove", aliases)),
+			tagListField(a, w, ed.fields.removes, "Choose tags to remove")),
 		widget.NewFormItem("Keep tags",
-			tagListField(a, w, ed.fields.keep, "Choose tags to keep", aliases)),
+			tagListField(a, w, ed.fields.keep, "Choose tags to keep")),
 		widget.NewFormItem("Keep private tags", ed.keepPrivCheck),
 	)
 
