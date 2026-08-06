@@ -29,6 +29,29 @@ type pixelSample interface {
 	~uint8 | ~uint16 | ~uint32 | ~int
 }
 
+// maskingApplies reports whether any region resolves to a rectangle for this
+// file, judged from the header alone — before a single frame is decoded.
+//
+// It exists purely to spare files that nothing applies to the cost of being
+// decompressed and rewritten uncompressed, which for a profile masking a
+// handful of images is nearly every file in the study. It is deliberately
+// generous: anything it cannot settle from Rows and Columns returns true, and
+// the authoritative per-frame resolution inside applyPixelMask decides. A file
+// that cannot be masked at all also returns true, so the failure is reported
+// from the one place that reports it rather than being quietly skipped here.
+func maskingApplies(ds *sdicom.Dataset, regions []MaskRegion, src maskSource) bool {
+	cols := datasetInt(ds, tag.Columns, 0)
+	rows := datasetInt(ds, tag.Rows, 0)
+	if cols <= 0 || rows <= 0 {
+		return true
+	}
+	res, err := maskRects(src, regions, cols, rows)
+	if err != nil {
+		return true
+	}
+	return len(res.rects) > 0
+}
+
 // maskOutcome reports what masking one file did.
 type maskOutcome struct {
 	masked bool // at least one pixel was written

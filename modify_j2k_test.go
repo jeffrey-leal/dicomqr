@@ -170,3 +170,73 @@ func TestRunModificationMasksJ2KByDecompressing(t *testing.T) {
 		t.Errorf("exported pixels = %v, want the ramp with rows 0-1 masked %v", got, want)
 	}
 }
+
+// A compressed file that no region applies to must keep its compression.
+//
+// Masking forces a decompression, and the engine used to force it on every
+// compressed file the moment a profile carried any region at all — so a profile
+// masking one analysis screen decompressed and re-encoded the entire study.
+// Measured on a 177-file echo study: 23 of every 25 files decompressed for
+// nothing, a tenfold export, and minutes of CPU spent reproducing pixels that
+// were already on disk. Only the files a region actually resolves against are
+// touched now, which is what keeps an export the size of its source.
+func TestRunModificationLeavesUnmaskedFilesCompressed(t *testing.T) {
+	rootDir, outDir := t.TempDir(), t.TempDir()
+
+	// Three compressed files with distinct identities; the rectangle names one.
+	uids := []string{"1.2.3.4.101", "1.2.3.4.102", "1.2.3.4.103"}
+	paths := make([]string, len(uids))
+	base := writeJ2KTestDICOM(t, rootDir)
+	for i, uid := range uids {
+		ds, err := sdicom.ParseFile(base, nil)
+		if err != nil {
+			t.Fatalf("parse fixture: %v", err)
+		}
+		if err := setElementValue(&ds, tag.SOPInstanceUID, []string{uid}); err != nil {
+			t.Fatalf("set SOP Instance UID: %v", err)
+		}
+		paths[i] = filepath.Join(rootDir, uid+".dcm")
+		f, err := os.Create(paths[i])
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		werr := sdicom.Write(f, ds, sdicom.SkipVRVerification(), sdicom.SkipValueTypeVerification())
+		f.Close()
+		if werr != nil {
+			t.Fatalf("write fixture: %v", werr)
+		}
+	}
+	if err := os.Remove(base); err != nil {
+		t.Fatalf("remove base fixture: %v", err)
+	}
+
+	params, err := compileModifyParams(ModProfile{
+		MaskRegions: []MaskRegion{
+			{Mode: maskModeRect, W: 1, H: 0.25, AppliesTo: &MaskScope{SOPInstanceUID: uids[1]}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	res := runModification(context.Background(), paths, rootDir, outDir, params, nil, nil)
+	if res.Processed != 3 || res.Failed != 0 {
+		t.Fatalf("result = %+v (%v), want 3 processed", res, res.Failures)
+	}
+	if res.MaskDecompressed != 1 {
+		t.Errorf("MaskDecompressed = %d, want 1 — only the named image needs decompressing",
+			res.MaskDecompressed)
+	}
+
+	for i, uid := range uids {
+		outPath := filepath.Join(outDir, uid+".dcm")
+		got := fileTransferSyntaxUID(outPath)
+		want := tsJPEG2000LL
+		if i == 1 {
+			want = tsExplicitVRLE // the masked one had to be written out uncompressed
+		}
+		if got != want {
+			t.Errorf("%s exported as %s, want %s", uid, transferSyntaxLabel(got), transferSyntaxLabel(want))
+		}
+	}
+}

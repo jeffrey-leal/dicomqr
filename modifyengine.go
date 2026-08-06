@@ -882,12 +882,20 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 	// produces. It writes no attribute, so the conversion still has the final
 	// say over everything describing the pixels.
 	//
-	// Masking a compressed file therefore forces a decompression even when the
-	// profile asked for none — there are no encoders, so the alternative is to
-	// fail every compressed file. The file is written as Explicit VR Little
-	// Endian and the run reports how many files this happened to, so an export
-	// whose encoding changed never does so silently.
-	if len(maskRegions) > 0 {
+	// Masking a compressed file forces a decompression even when the profile
+	// asked for none — there are no encoders, so the alternative is to fail
+	// every compressed file. The file is written as Explicit VR Little Endian
+	// and the run reports how many files this happened to, so an export whose
+	// encoding changed never does so silently.
+	//
+	// Which is why the regions are resolved against the header FIRST, before a
+	// single frame is decoded. A profile whose rectangles are scoped to a few
+	// images would otherwise decompress and re-encode every other file for
+	// nothing: measured on a 177-file echo study with one image-scoped
+	// rectangle, that was 23 of every 25 files decompressed, a tenfold export
+	// and minutes of CPU spent producing pixels identical to the ones already
+	// on disk.
+	if len(maskRegions) > 0 && maskingApplies(&ds, maskRegions, maskSrc) {
 		if encapsulatedPixelData(&ds) {
 			if _, err := convertDatasetSyntax(&ds, datasetTransferSyntaxUID(&ds), tsExplicitVRLE); err != nil {
 				return false, ds, notes, fmt.Errorf("decompress for pixel masking: %w", err)
