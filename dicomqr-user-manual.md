@@ -1,8 +1,8 @@
 # dicomqr
 
-**User Manual  v1.12.0**
+**User Manual  v1.13.0**
 
-August 5, 2026
+August 6, 2026
 
 A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.
 
@@ -707,8 +707,8 @@ Profile editor fields:
 |---|---|
 | Profile name | The name shown in the Modification submenu and used as the base reference by inheriting profiles. |
 | Base profile | Another profile whose settings this one inherits and overrides: override wins for scalar values, removals are a union, and this profile's Keep entries subtract from the merged removal list. |
-| Set values | One TAG=VALUE per line. TAG is a GGGG,EEEE tag or a tags.json alias (e.g. patient name). |
-| Remove tags | Tags deleted from every file — one tag or alias per line, each shown with its name (0008,0080  Institution Name). Choose… opens the tag picker (see below) instead of typing tag numbers. |
+| Set values | The tags whose values are replaced, one row each: the tag on the left, the value on the right, ordered by group and element. Choose tags… opens the tag picker to add rows (and, by unchecking, remove them). An empty value blanks the element rather than setting it. A value of [GGGG,EEEE] copies whatever this profile sets that tag to — see below. Values are checked against the tag's DICOM value representation on save, so a date field will not accept a word. |
+| Remove tags | Tags deleted from every file — one per line, each shown with its name (0008,0080  Institution Name). Choose… opens the tag picker (see below) instead of typing tag numbers. |
 | Keep tags | Tags retained even when the base profile removes them, shown in the same way. Choose… opens the tag picker. |
 | Birth date mask | 8-character positional pattern applied to Patient Birth Date: digit positions replace, any other character preserves the original digit (e.g. YYYY0101 keeps the year and sets January 1st). Empty = no masking. |
 | Remap UIDs | Replace every site-generated UID with a fresh consistent value — the same source UID always maps to the same replacement within a run, keeping cross-references intact. Standard and structural UIDs are never touched. While checked, the UID suffix control on the same row is disabled and a suffix left in it is cleared on save — the two options are mutually exclusive. |
@@ -727,13 +727,17 @@ Tag picker — the Choose… button beside Remove tags and Keep tags opens the w
 
 The field's current tags open already checked. Because a selection scattered through 5,000-odd tags would be invisible behind collapsed groups, a field that already has entries opens with Show selected only ticked, listing just those tags; clear that box to browse the full dictionary and add more. Every group header also carries its own tally — "0010  Patient  (72, 3 selected)" — so a collapsed group still shows that part of the selection is inside it. Unticking a tag in Show selected only leaves its row in place until the view is rebuilt, so a mis-click can be undone without searching for the tag again.
 
-The Remove tags and Keep tags lists show every entry in one consistent form — a zero-padded four-digit group and element with the tag's name beside it, "0008,0080  Institution Name" — matching the tag picker, whatever form the profile itself uses.
+The Remove tags and Keep tags lists show every entry in one consistent form — a zero-padded four-digit group and element with the tag's name beside it, "0008,0080  Institution Name" — matching the tag picker. The name is shown for readability and is not stored; saving keeps the tag number alone.
 
-That display is a convenience, not what is stored. Saving writes each entry back exactly as the profile had it, so a tag written in short form such as 8,80, or as a tags.json alias, keeps that spelling even though the editor showed it padded; only tags newly added are written in the padded form. This matters because a profile's Keep list cancels its base profile's Remove list by exact text match, so silently renormalising the file would break inheritance. Typing a bare tag number is still perfectly valid — it is padded and named the next time the profile is opened.
+Tags may be typed in any form — 8,80 and 0008,0080 are the same tag — and are stored in the padded form. This is safe because a profile's Keep list cancels its base profile's Remove list by comparing the tags themselves rather than the text spelling them, so the two files do not have to agree on how a tag is written for the inheritance to work.
 
 A profile may name tags the application's DICOM dictionary does not list — the shipped base-deident profile names three. Those have no row to tick, so the counter reports them separately and they are written back exactly as they appear in the field.
 
-Two things the picker deliberately does not do. Checkboxes are on individual tags only, never on a group: the profile format has no group wildcard, so checking a group would expand into hundreds of separate entries — group 0018 alone holds 895 tags — and removing an entire group is nearly always wrong, since group 0028 carries Rows, Columns and Bits Allocated and group 0008 carries the SOP Instance UIDs. Bulk selection is offered only over an active search, where the scope has been stated. And the picker never rewrites entries that are already in the field: a tag written as an alias or in short form such as 8,80 keeps that exact spelling, because a base profile's Keep list cancels its Removes list only when the two spellings match character for character. Only newly checked tags are appended, in the full GGGG,EEEE form.
+One thing the picker deliberately does not do: checkboxes are on individual tags only, never on a group. The profile format has no group wildcard, so checking a group would expand into hundreds of separate entries — group 0018 alone holds 895 tags — and removing an entire group is nearly always wrong, since group 0028 carries Rows, Columns and Bits Allocated and group 0008 carries the SOP Instance UIDs. Bulk selection is offered only over an active search, where the scope has been stated.
+
+Linking one set value to another. A set value written as a tag in square brackets — [0010,0010] — takes whatever this same profile sets that tag to. The shipped base-deident profile uses it to tie Patient ID to Patient Name: enter a new name in the Modification dialog and the ID follows it as you type, until you edit the ID directly, after which it is yours. Any field can reference any other this way, and several fields may reference the same one.
+
+A reference only ever reads values this profile sets. It cannot read the value in the file being modified — that would copy the real patient name forward into whichever field referenced it, once per file and invisibly, which is the opposite of what a de-identification profile is for. References also do not chain: pointing at a field that is itself a reference is reported as an error rather than followed.
 
 The dicomdir and verbose flags, and any other hand-authored settings without a control, are preserved unchanged so dicomtool-authored profiles survive a round-trip through the editor. Both editors list such values in an italic note rather than hiding them: in an override the note distinguishes settings the modification engine ignores inside a per-modality block from profile-wide options that a hand-authored block still applies.
 
@@ -744,9 +748,9 @@ Defaults:
 | Default output folder | Where modification exports are written. When set, the Modification dialog uses it directly — no folder picker appears; the dialog's Change… button overrides it for a single run. When empty, the dialog asks on the first run and saves that choice here. Must be outside the download folder — modified files are never mixed into the local index. |
 | Default export format | The file type listed first in the View Tags Export Tags… save dialog, and the format used when the typed filename has no extension (Section 8.8). |
 
-Running a modification (Local Browse right-click > Modification > profile) writes the export to <output folder>\<export folder name>. The export folder name is entered in the confirmation dialog — a profile-name-plus-timestamp suggestion is pre-filled, and typing a value into the dialog's Patient Name set field auto-fills the Patient ID set field and the export folder name with the same value, since all three usually carry the new anonymized identity; a field stops following the moment it is edited directly, so the auto-filled values can simply be overtyped. The original patient and study folder names are never reused, because they often contain PHI (patient name, MRN, study description, dates). Inside the export folder a study-level run keeps only the series subfolders, and a patient-level run replaces each study folder with a generic study-01, study-02, … in sorted order.
+Running a modification (Local Browse right-click > Modification > profile) writes the export to <output folder>\<export folder name>. The export folder name is entered in the confirmation dialog. Its default comes from the profile: base-deident names the export after the new patient name, so typing a name into the Patient Name set field fills the Patient ID and the export folder name with it as you type. A profile that names no export default falls back to a profile-name-plus-timestamp suggestion. Any of these fields stops following the moment it is edited directly, so a suggested value can simply be overtyped. The original patient and study folder names are never reused, because they often contain PHI (patient name, MRN, study description, dates). Inside the export folder a study-level run keeps only the series subfolders, and a patient-level run replaces each study folder with a generic study-01, study-02, … in sorted order.
 
-The dialog's Options section shows the effective settings and lets any of them be changed for this run only — nothing typed there is written back to the profile. That includes Output transfer syntax, so an export can be converted (or left as stored) without editing the profile it came from.
+The dialog's Options section shows the effective settings and lets any of them be changed for this run only — nothing typed there is written back to the profile. It presents the same controls in the same order as the profile editor's Options section, Remap UIDs and its UID suffix included: they share a row and the suffix greys out while remap is checked. That includes Output transfer syntax, so an export can be converted (or left as stored) without editing the profile it came from. The one control positioned differently is Zip export, which sits in this dialog's Export section beside the output folder and export folder name it changes.
 
 Converting on export, rather than on retrieve. A transfer syntax can be required in two independent places, and they answer different questions. The server profile's Transfer syntax (Section 4.1) constrains what a retrieve is allowed to receive, and converts on the way in; the modification profile's Output transfer syntax converts on the way out, when files are exported. Setting the server profile to 'As stored' and the modification profile to an uncompressed syntax keeps the download folder in the archive's own encoding — the original bytes, retrieved once — and pays the conversion cost only for the files actually exported. A file that will not convert is then one reported failure in an export that otherwise completes, instead of an object dropped during a retrieve. The trade-off is that only the retrieve side can stop a PACS sending something the application cannot read at all (JPEG-LS, RLE, MPEG); with no requirement in the server profile, such files can reach the download folder, where they can be neither displayed nor converted on export.
 
@@ -761,7 +765,7 @@ The status bar at the bottom of the window provides real-time feedback. A colour
 
 | Situation | Status bar text |
 |---|---|
-| Application started, not connected | `v1.12.0` |
+| Application started, not connected | `v1.13.0` |
 | Connecting to server | `Connecting…` |
 | Connected | `Connected: <AE>@<host>:<port>` |
 | Connection cancelled | `Connection cancelled` |
