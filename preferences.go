@@ -545,7 +545,7 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 			desc += ")"
 			nameLabel := widget.NewLabel(desc)
 			editBtn := widget.NewButton("Edit", func() {
-				showModProfileEditor(a, w, n, pendingModProfiles[n], pendingModProfiles,
+				showModProfileEditor(a, w, n, pendingModProfiles[n], pendingModProfiles, cfg.DownloadDir,
 					func(newName string, updated ModProfile) {
 						if newName != n {
 							delete(pendingModProfiles, n)
@@ -594,7 +594,7 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 	}
 
 	addModProfileBtn := widget.NewButton("Add profile…", func() {
-		showModProfileEditor(a, w, "", ModProfile{}, pendingModProfiles,
+		showModProfileEditor(a, w, "", ModProfile{}, pendingModProfiles, cfg.DownloadDir,
 			func(newName string, added ModProfile) {
 				pendingModProfiles[newName] = added
 				buildModProfileList()

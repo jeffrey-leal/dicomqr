@@ -120,13 +120,20 @@ func uidSuffixRow(remap *widget.Check, label *widget.Label, suffix *widget.Entry
 type modProfileFieldSet struct {
 	sets          *setValueList
 	removes, keep *widget.Entry // multiline
+	// masks is here rather than on the top-level editor because where an image
+	// prints its banner is a property of the modality and the vendor — the
+	// definition of what a per-modality override may vary.
+	masks *maskRegionList
 }
 
 // newModProfileFieldSet builds the tag-list controls. The Remove and Keep
 // lists are seeded with each tag's name appended for readability; the names
 // are display only and stripped again on save.
 func newModProfileFieldSet(p ModProfile) *modProfileFieldSet {
-	f := &modProfileFieldSet{sets: newSetValueList(p.Sets)}
+	f := &modProfileFieldSet{
+		sets:  newSetValueList(p.Sets),
+		masks: newMaskRegionList(p.MaskRegions),
+	}
 
 	f.removes = widget.NewMultiLineEntry()
 	f.removes.SetMinRowsVisible(5)
@@ -158,10 +165,15 @@ func (f *modProfileFieldSet) applyValidated(dst *ModProfile) error {
 	if err != nil {
 		return err
 	}
+	masks, err := f.masks.regions()
+	if err != nil {
+		return err
+	}
 
 	dst.Sets = sets
 	dst.Removes = removes
 	dst.Keep = keeps
+	dst.MaskRegions = masks
 	return nil
 }
 
@@ -357,6 +369,9 @@ func perModalitySummary(code string, p ModProfile) string {
 	if n := len(p.Keep); n > 0 {
 		parts = append(parts, fmt.Sprintf("%d keep", n))
 	}
+	if n := len(p.MaskRegions); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d mask", n))
+	}
 	if p.DOB != "" {
 		parts = append(parts, "dob")
 	}
@@ -414,8 +429,12 @@ const modEditorMargin = 12
 // blocks while open and which takes the editor with it when it closes: an
 // editor outliving Preferences would save into a pending-profile map that is
 // no longer going anywhere.
+// imageStartDir is where the mask picker's file chooser opens — the download
+// folder, since the images a profile is written against are the ones already
+// retrieved. Empty is fine: the chooser then starts wherever Windows last left
+// it.
 func showModProfileEditor(a fyne.App, parent fyne.Window, name string, p ModProfile, cfg ModProfileConfig,
-	onSave func(newName string, updated ModProfile)) {
+	imageStartDir string, onSave func(newName string, updated ModProfile)) {
 
 	if raiseOwnedWindow(modProfileEditorKey(name)) {
 		return
@@ -439,7 +458,7 @@ func showModProfileEditor(a fyne.App, parent fyne.Window, name string, p ModProf
 		Parent:   parent,
 		Blocking: true,
 	}, func(win fyne.Window) fyne.CanvasObject {
-		return buildModProfileEditorContent(a, win, ed, p, onSave)
+		return buildModProfileEditorContent(a, win, ed, p, imageStartDir, onSave)
 	})
 }
 
@@ -448,11 +467,13 @@ func showModProfileEditor(a fyne.App, parent fyne.Window, name string, p ModProf
 // — the tag picker, the per-modality sub-editor, validation errors — must be
 // parented to that window rather than to whatever is behind it.
 func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEditor, p ModProfile,
-	onSave func(newName string, updated ModProfile)) fyne.CanvasObject {
+	imageStartDir string, onSave func(newName string, updated ModProfile)) fyne.CanvasObject {
 
-	// The Set values list needs the window the picker is parented to, which does
-	// not exist until openOwnedWindow calls this.
+	// The Set values list and the mask list both open windows of their own, and
+	// need the window they parent to — which does not exist until
+	// openOwnedWindow calls this.
 	ed.fields.sets.attach(a, win)
+	ed.fields.masks.attach(a, win, imageStartDir)
 
 	topRow := widget.NewForm(
 		widget.NewFormItem("Profile name", ed.nameEntry),
@@ -485,6 +506,19 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 	optionsSection := prefSection("Options", optionsForm)
 	filtersSection := prefSection("File filters", filterCaption, filtersForm)
 
+	// Pixel masking gets its own section rather than a row in Options: it is
+	// the only setting that alters the image rather than the header, and the
+	// consequences below are ones the user has to read before using it.
+	maskCaption := widget.NewLabel("Areas of the image blanked permanently in the export, as percentages of " +
+		"each image's width and height — so one profile covers a study whose series differ in size. " +
+		"Outside ultrasound region takes its geometry from the file's own region calibration instead, " +
+		"which is what generalises across vendors. Masking writes pixels, so a compressed file is " +
+		"decompressed on export whatever Output transfer syntax says, and a file that cannot be masked " +
+		"fails rather than exporting with the annotation intact.")
+	maskCaption.TextStyle = fyne.TextStyle{Italic: true}
+	maskCaption.Wrapping = fyne.TextWrapWord
+	maskSection := prefSection("Pixel masking", maskCaption, ed.fields.masks.canvasObject())
+
 	// Per-modality override list — the same rebuild-a-VBox pattern as the
 	// profile list in Preferences.
 	perModList := container.NewVBox()
@@ -499,7 +533,7 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 		for i, c := range codes {
 			c := c
 			editBtn := widget.NewButton("Edit", func() {
-				showPerModalityEditor(a, win, c, ed.perMod[c], otherCodes(ed.perMod, c),
+				showPerModalityEditor(a, win, c, ed.perMod[c], otherCodes(ed.perMod, c), imageStartDir,
 					func(newCode string, updated ModProfile) {
 						if newCode != c {
 							delete(ed.perMod, c)
@@ -522,7 +556,7 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 	rebuildPerModList()
 
 	addOverrideBtn := widget.NewButton("Add modality override…", func() {
-		showPerModalityEditor(a, win, "", ModProfile{}, otherCodes(ed.perMod, ""),
+		showPerModalityEditor(a, win, "", ModProfile{}, otherCodes(ed.perMod, ""), imageStartDir,
 			func(newCode string, updated ModProfile) {
 				if ed.perMod == nil {
 					ed.perMod = map[string]ModProfile{}
@@ -536,7 +570,7 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 	perModCaption.Wrapping = fyne.TextWrapWord
 	perModSection := prefSection("Per-modality overrides", perModCaption, perModList, addOverrideBtn)
 
-	sections := []fyne.CanvasObject{topRow, tagSection, optionsSection, filtersSection, perModSection}
+	sections := []fyne.CanvasObject{topRow, tagSection, optionsSection, maskSection, filtersSection, perModSection}
 	var preserved []string
 	if p.KeepPrivate {
 		preserved = append(preserved, "keepprivate (honored only inside per-modality overrides)")
@@ -734,10 +768,11 @@ func perModalityPreservedNote(p ModProfile) fyne.CanvasObject {
 // codes for the collision check. onSave receives the validated block under
 // its (possibly renamed) uppercase modality code.
 func showPerModalityEditor(a fyne.App, w fyne.Window, code string, p ModProfile, taken []string,
-	onSave func(newCode string, updated ModProfile)) {
+	imageStartDir string, onSave func(newCode string, updated ModProfile)) {
 
 	ed := newPerModalityEditor(code, p, taken)
 	ed.fields.sets.attach(a, w)
+	ed.fields.masks.attach(a, w, imageStartDir)
 
 	form := widget.NewForm(
 		widget.NewFormItem("Modality", ed.codeEntry),
@@ -747,6 +782,10 @@ func showPerModalityEditor(a fyne.App, w fyne.Window, code string, p ModProfile,
 		widget.NewFormItem("Keep tags",
 			tagListField(a, w, ed.fields.keep, "Choose tags to keep")),
 		widget.NewFormItem("Keep private tags", ed.keepPrivCheck),
+		// Regions here replace the profile's rather than adding to them: this
+		// modality's images have their own layout, which is the whole reason
+		// for stating them separately.
+		widget.NewFormItem("Mask regions", ed.fields.masks.canvasObject()),
 	)
 
 	sections := []fyne.CanvasObject{form}

@@ -80,6 +80,18 @@ type ModProfile struct {
 	// only a default: the name is typed per run and never written back.
 	ExportName string `json:"exportname,omitempty"`
 
+	// MaskRegions blanks rectangles of burned-in pixels in the exported copy —
+	// the patient banner an ultrasound or secondary capture prints into the
+	// image itself, which no tag rule can reach. dicomqr-only (dicomtool
+	// ignores `maskregions` and drops it when it saves), and the replacement
+	// for dicomtool's `maskrows`, which could only blank whole rows from the
+	// top of the image.
+	//
+	// Masking writes pixels, and there are no encoders, so a masked file always
+	// leaves uncompressed: a compressed source is decompressed on the way out
+	// even when the profile asks for no conversion. See processFile.
+	MaskRegions []MaskRegion `json:"maskregions,omitempty"`
+
 	PerModality map[string]ModProfile `json:"per-modality,omitempty"`
 }
 
@@ -269,6 +281,13 @@ func mergeModProfiles(base, override ModProfile) ModProfile {
 	}
 	if override.ExportName != "" {
 		result.ExportName = override.ExportName
+	}
+	// Mask regions replace rather than accumulate. Geometry describes one
+	// vendor's screen layout, so a derived profile (or a per-modality block)
+	// that states its own regions means "here is where the banner is on these
+	// images", not "and also blank whatever the base profile blanked".
+	if len(override.MaskRegions) > 0 {
+		result.MaskRegions = override.MaskRegions
 	}
 
 	result.Priv = base.Priv || override.Priv

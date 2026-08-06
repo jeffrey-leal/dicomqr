@@ -397,7 +397,7 @@ func TestModProfileEditorWindowLifecycle(t *testing.T) {
 	cfg := ModProfileConfig{"a": {Sets: []string{"0010,0010=X"}}, "b": {}}
 	noSave := func(string, ModProfile) { t.Fatal("onSave called unexpectedly") }
 
-	showModProfileEditor(a, prefs, "a", cfg["a"], cfg, noSave)
+	showModProfileEditor(a, prefs, "a", cfg["a"], cfg, "", noSave)
 	if got := ownedChildCount(prefs); got != 1 {
 		t.Fatalf("editors open = %d, want 1", got)
 	}
@@ -408,13 +408,13 @@ func TestModProfileEditorWindowLifecycle(t *testing.T) {
 	}
 
 	// Re-opening the same profile must raise the window, not duplicate it.
-	showModProfileEditor(a, prefs, "a", cfg["a"], cfg, noSave)
+	showModProfileEditor(a, prefs, "a", cfg["a"], cfg, "", noSave)
 	if got := ownedChildCount(prefs); got != 1 {
 		t.Errorf("editors open = %d after re-opening the same profile, want 1", got)
 	}
 
 	// A different profile is a different window.
-	showModProfileEditor(a, prefs, "b", cfg["b"], cfg, noSave)
+	showModProfileEditor(a, prefs, "b", cfg["b"], cfg, "", noSave)
 	if got := ownedChildCount(prefs); got != 2 {
 		t.Errorf("editors open = %d with two profiles, want 2", got)
 	}
@@ -562,5 +562,194 @@ func TestModProfileEditorPerModalityFlow(t *testing.T) {
 	}
 	if updated.PerModality != nil {
 		t.Errorf("empty PerModality should normalize to nil, got %+v", updated.PerModality)
+	}
+}
+
+// Mask geometry is entered as percentages and stored as fractions. The
+// round-trip has to be exact, or every Apply rewrites profiles.json with
+// slightly different numbers.
+func TestMaskRegionListPercentRoundTrip(t *testing.T) {
+	test.NewApp()
+	stored := []MaskRegion{
+		{Mode: maskModeRect, X: 0, Y: 0, W: 1, H: 0.08},
+		{Mode: maskModeRect, X: 0.25, Y: 0.29, W: 0.5, H: 0.125},
+		{Mode: maskModeOutsideUS},
+	}
+	l := newMaskRegionList(stored)
+
+	// What the user sees: percentages, free of float noise (0.29 × 100 is
+	// 28.999999999999996 before rounding).
+	if got, want := l.rows[1].y.Text, "29"; got != want {
+		t.Errorf("y displayed as %q, want %q", got, want)
+	}
+	if got, want := l.rows[0].h.Text, "8"; got != want {
+		t.Errorf("h displayed as %q, want %q", got, want)
+	}
+	// The ultrasound row has no geometry to show and its fields are inert.
+	if l.rows[2].x.Text != "" || !l.rows[2].x.Disabled() {
+		t.Errorf("ultrasound row geometry = %q, disabled=%v; want empty and disabled",
+			l.rows[2].x.Text, l.rows[2].x.Disabled())
+	}
+
+	got, err := l.regions()
+	if err != nil {
+		t.Fatalf("regions: %v", err)
+	}
+	if !reflect.DeepEqual(got, stored) {
+		t.Errorf("round-trip changed the regions:\nstored: %+v\ngot:    %+v", stored, got)
+	}
+}
+
+// A scoped region — one the review window produced — has no controls in this
+// editor, and must ride through a save untouched. Dropping the scope would
+// widen a rectangle drawn on one screen to every image in the study.
+func TestMaskRegionListPreservesScope(t *testing.T) {
+	test.NewApp()
+	stored := []MaskRegion{
+		{Mode: maskModeRect, W: 1, H: 0.08},
+		{Mode: maskModeRect, X: 0.1, Y: 0.1, W: 0.5, H: 0.2,
+			AppliesTo: &MaskScope{SOPInstanceUID: "1.2.3.4.5"}},
+		{Mode: maskModeNone, AppliesTo: &MaskScope{SOPInstanceUID: "1.2.3.4.6"}},
+		{Mode: maskModeOutsideUS,
+			AppliesTo: &MaskScope{Modality: "US", Cols: 800, Rows: 600, USRegion: usRegionDeclared}},
+	}
+	got, err := newMaskRegionList(stored).regions()
+	if err != nil {
+		t.Fatalf("regions: %v", err)
+	}
+	if !reflect.DeepEqual(got, stored) {
+		t.Errorf("round-trip changed the regions:\nstored: %+v\ngot:    %+v", stored, got)
+	}
+}
+
+// An empty list must return nil, not an empty slice: Preferences compares with
+// DeepEqual and would rewrite profiles.json on every Apply otherwise.
+func TestMaskRegionListEmptyIsNil(t *testing.T) {
+	test.NewApp()
+	got, err := newMaskRegionList(nil).regions()
+	if err != nil {
+		t.Fatalf("regions: %v", err)
+	}
+	if got != nil {
+		t.Errorf("regions = %#v, want nil", got)
+	}
+}
+
+func TestMaskRegionListValidation(t *testing.T) {
+	test.NewApp()
+	cases := []struct {
+		name             string
+		x, y, w, h, want string
+	}{
+		{"blank row", "", "", "", "", "greater than 0"},
+		{"not a number", "0", "0", "wide", "10", `"wide" is not a number`},
+		{"over 100 percent", "0", "0", "150", "10", "between 0 and 1"},
+		{"off the edge", "80", "0", "40", "10", "past the image"},
+		{"index reported", "0", "0", "100", "8", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newMaskRegionList([]MaskRegion{{Mode: maskModeRect}})
+			l.rows[0].x.SetText(tc.x)
+			l.rows[0].y.SetText(tc.y)
+			l.rows[0].w.SetText(tc.w)
+			l.rows[0].h.SetText(tc.h)
+
+			_, err := l.regions()
+			switch {
+			case tc.want == "" && err != nil:
+				t.Fatalf("rejected a valid row: %v", err)
+			case tc.want == "":
+				return
+			case err == nil:
+				t.Fatalf("accepted an invalid row, want error containing %q", tc.want)
+			case !strings.Contains(err.Error(), tc.want):
+				t.Errorf("error = %q, want it to contain %q", err, tc.want)
+			case !strings.Contains(err.Error(), "region 1"):
+				t.Errorf("error = %q, want it to name the offending row", err)
+			}
+		})
+	}
+}
+
+// A trailing % is accepted, because a field showing "8" invites typing "8%".
+func TestMaskRegionListAcceptsPercentSign(t *testing.T) {
+	test.NewApp()
+	l := newMaskRegionList([]MaskRegion{{Mode: maskModeRect}})
+	l.rows[0].w.SetText("100%")
+	l.rows[0].h.SetText(" 8 % ")
+	got, err := l.regions()
+	if err != nil {
+		t.Fatalf("regions: %v", err)
+	}
+	if len(got) != 1 || got[0].W != 1 || got[0].H != 0.08 {
+		t.Errorf("regions = %+v, want one region 100%% × 8%%", got)
+	}
+}
+
+// Switching a row to the ultrasound rule drops its geometry from what is
+// stored — the file supplies it — but keeps the typed numbers on screen so the
+// switch is reversible.
+func TestMaskRegionListModeSwitchKeepsTypedGeometry(t *testing.T) {
+	test.NewApp()
+	l := newMaskRegionList([]MaskRegion{{Mode: maskModeRect, W: 1, H: 0.1}})
+	l.rows[0].mode.SetSelected(maskUSLabel)
+
+	got, err := l.regions()
+	if err != nil {
+		t.Fatalf("regions: %v", err)
+	}
+	if len(got) != 1 || got[0].Mode != maskModeOutsideUS || got[0].W != 0 {
+		t.Errorf("regions = %+v, want a bare ultrasound rule", got)
+	}
+	if l.rows[0].w.Text != "100" {
+		t.Errorf("typed width = %q, want it kept for a switch back", l.rows[0].w.Text)
+	}
+	l.rows[0].mode.SetSelected(maskRectLabel)
+	if got, err = l.regions(); err != nil || len(got) != 1 || got[0].W != 1 {
+		t.Errorf("regions after switching back = %+v (%v), want the rectangle restored", got, err)
+	}
+}
+
+// The profile editor saves regions, and a per-modality override edits its own
+// set — the field set is shared, so both paths go through one implementation.
+func TestModProfileEditorSavesMaskRegions(t *testing.T) {
+	test.NewApp()
+	p := ModProfile{Sets: []string{"0010,0010=ANON"}}
+	ed := newModProfileEditor("mask", p, ModProfileConfig{"mask": p})
+
+	ed.fields.masks.add()
+	ed.fields.masks.rows[0].w.SetText("100")
+	ed.fields.masks.rows[0].h.SetText("8")
+
+	_, updated, err := ed.validate()
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	want := []MaskRegion{{Mode: maskModeRect, W: 1, H: 0.08}}
+	if !reflect.DeepEqual(updated.MaskRegions, want) {
+		t.Errorf("MaskRegions = %+v, want %+v", updated.MaskRegions, want)
+	}
+
+	// An invalid row blocks the save rather than storing a rule that would
+	// silently mask nothing.
+	ed.fields.masks.rows[0].h.SetText("")
+	if _, _, err := ed.validate(); err == nil {
+		t.Error("saved a profile whose mask region has no height")
+	}
+
+	sub := newPerModalityEditor("US", ModProfile{}, nil)
+	sub.fields.masks.add()
+	sub.fields.masks.rows[0].mode.SetSelected(maskUSLabel)
+	code, override, err := sub.validate()
+	if err != nil {
+		t.Fatalf("per-modality validate: %v", err)
+	}
+	if code != "US" || len(override.MaskRegions) != 1 ||
+		override.MaskRegions[0].Mode != maskModeOutsideUS {
+		t.Errorf("override = %q %+v, want US with one ultrasound rule", code, override.MaskRegions)
+	}
+	if got, want := perModalitySummary(code, override), "1 mask"; !strings.Contains(got, want) {
+		t.Errorf("summary = %q, want it to mention %q", got, want)
 	}
 }

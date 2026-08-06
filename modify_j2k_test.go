@@ -123,3 +123,50 @@ func TestRunModificationKeepsJ2KWhenAsStored(t *testing.T) {
 		t.Errorf("source disturbed: %v", err)
 	}
 }
+
+// Masking compressed input. There are no encoders, so a masked file can only
+// leave uncompressed: the run decompresses it even though the profile asked for
+// no conversion, and reports that in MaskDecompressed rather than changing the
+// export's encoding silently. This is the only test that drives the
+// decompress-then-mask chain with a real codestream.
+func TestRunModificationMasksJ2KByDecompressing(t *testing.T) {
+	params, err := compileModifyParams(ModProfile{
+		MaskRegions: []MaskRegion{{Mode: maskModeRect, W: 1, H: 0.25}},
+	})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	rootDir, outDir := t.TempDir(), t.TempDir()
+	srcPath := writeJ2KTestDICOM(t, rootDir)
+
+	res := runModification(context.Background(), []string{srcPath}, rootDir, outDir, params, nil, nil)
+	if res.Failed != 0 || res.Processed != 1 {
+		t.Fatalf("result = %+v (%v), want 1 processed 0 failed", res, res.Failures)
+	}
+	if res.MaskDecompressed != 1 {
+		t.Errorf("MaskDecompressed = %d, want 1 — the encoding change must be reported", res.MaskDecompressed)
+	}
+
+	outPath := filepath.Join(outDir, filepath.Base(srcPath))
+	if got := fileTransferSyntaxUID(outPath); got != tsExplicitVRLE {
+		t.Errorf("exported transfer syntax = %q, want %q", got, tsExplicitVRLE)
+	}
+	// The source keeps its compression: masking is an export-time operation.
+	if got := fileTransferSyntaxUID(srcPath); got != tsJPEG2000LL {
+		t.Errorf("source transfer syntax = %q, want it untouched at %q", got, tsJPEG2000LL)
+	}
+
+	ds, err := sdicom.ParseFile(outPath, nil)
+	if err != nil {
+		t.Fatalf("parse export: %v", err)
+	}
+	// The 8×8 ramp with its top two rows blanked and the rest bit-exact.
+	want := ramp8Pixels()
+	for i := range 16 {
+		want[i] = 0
+	}
+	if got := modifyTestPixels(t, &ds); !slices.Equal(got, want) {
+		t.Errorf("exported pixels = %v, want the ramp with rows 0-1 masked %v", got, want)
+	}
+}

@@ -65,6 +65,12 @@ type modifyParams struct {
 	// write each file in the syntax it was stored in. Profile-wide: unlike the
 	// tag rules it is never overridden per modality.
 	targetTS string
+	// maskRegions blanks burned-in PHI in the pixels themselves; per-modality
+	// overrides replace it wholesale. mayMask is true when this profile or any
+	// of its overrides can mask, which decides the write options for the run —
+	// masking may force a decompression the profile did not ask for.
+	maskRegions []MaskRegion
+	mayMask     bool
 }
 
 // compileModifyParams validates p and parses its tag references into a
@@ -153,10 +159,27 @@ func compileModifyParams(p ModProfile) (modifyParams, error) {
 		}
 	}
 
+	// Mask regions are validated rather than dropped on the floor, at the top
+	// level and inside every override: buildModalityOverrides skips unparsable
+	// tag entries for dicomtool parity, but a mask rule that silently does
+	// nothing exports the PHI it was written to remove.
+	if err := validateMaskRegions(p.MaskRegions); err != nil {
+		return mp, err
+	}
+	mp.maskRegions = p.MaskRegions
+	mp.mayMask = len(p.MaskRegions) > 0
+
 	if len(p.PerModality) > 0 {
 		normalized := make(map[string]ModProfile, len(p.PerModality))
 		for k, v := range p.PerModality {
-			normalized[strings.ToUpper(k)] = v
+			modKey := strings.ToUpper(k)
+			if err := validateMaskRegions(v.MaskRegions); err != nil {
+				return mp, fmt.Errorf("modality %s: %w", modKey, err)
+			}
+			if len(v.MaskRegions) > 0 {
+				mp.mayMask = true
+			}
+			normalized[modKey] = v
 		}
 		mp.perMod = buildModalityOverrides(normalized)
 	}
@@ -168,9 +191,9 @@ func compileModifyParams(p ModProfile) (modifyParams, error) {
 		mp.dobMask != "" || mp.uidSuffix != "" || mp.shiftDays != "" ||
 		mp.removePrivate || mp.fixvrMode != "" || mp.targetTS != "" ||
 		len(mp.ignoreTypes) > 0 || len(mp.ignoreModalities) > 0 ||
-		len(mp.perMod) > 0 || mp.remapUIDs
+		len(mp.perMod) > 0 || mp.remapUIDs || mp.mayMask
 	if !hasAction {
-		return mp, errors.New("the profile contains no actionable parameter (set, remove, dob, uid, shiftdays, noprivate, fixvr, remapuids, transfersyntax)")
+		return mp, errors.New("the profile contains no actionable parameter (set, remove, dob, uid, shiftdays, noprivate, fixvr, remapuids, transfersyntax, maskregions)")
 	}
 
 	return mp, nil
@@ -189,6 +212,15 @@ type modifyResult struct {
 	Failed    int
 	Canceled  bool
 	Failures  []modifyFailure
+	// MaskDecompressed counts files whose compressed pixel data had to be
+	// decompressed so that pixel masking could be applied, when the profile
+	// requested no conversion of its own. Reported rather than left silent:
+	// those files leave in a different encoding than the profile states.
+	MaskDecompressed int
+	// MaskUSFallback counts ultrasound files that declared no calibrated region
+	// and were masked with the profile's manual rectangles instead of their own
+	// stated geometry — a weaker guarantee, so the run says how many.
+	MaskUSFallback int
 }
 
 // exportRelPaths maps each file to its output path relative to the export
@@ -400,10 +432,27 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 						mu.Unlock()
 						return
 					}
-					skipped, ds, perr := processFile(srcFile, params, uidRemap)
+					skipped, ds, notes, perr := processFile(srcFile, params, uidRemap)
 					if perr != nil {
 						recordFailure(job.path, fmt.Errorf("process: %w", perr))
 						return
+					}
+					if notes.maskDecompressed {
+						logInfo("modify: %s decompressed to %s so its burned-in pixels could be masked",
+							job.path, transferSyntaxLabel(tsExplicitVRLE))
+						mu.Lock()
+						res.MaskDecompressed++
+						mu.Unlock()
+					}
+					if notes.maskUSFallback {
+						// Warning, not info: this file was masked by generic
+						// geometry because it did not state its own, which is a
+						// weaker guarantee than the rest of the export carries.
+						logWarn("modify: %s declares no calibrated ultrasound region — masked with the profile's rectangles instead",
+							job.path)
+						mu.Lock()
+						res.MaskUSFallback++
+						mu.Unlock()
 					}
 					if skipped {
 						mu.Lock()
@@ -539,7 +588,11 @@ func fixvrWriteOpts(mode string) []sdicom.WriteOption {
 // the stricter behaviour they have today.
 func modifyWriteOpts(p modifyParams) []sdicom.WriteOption {
 	opts := fixvrWriteOpts(p.fixvrMode)
-	if p.targetTS == "" {
+	// Masking relaxes verification for the same reason a conversion does: it
+	// can force a compressed file to be written out uncompressed, and emitting
+	// Explicit VR for elements parsed under Implicit VR fails files that write
+	// fine untouched.
+	if p.targetTS == "" && !p.mayMask {
 		return opts
 	}
 	switch p.fixvrMode {
@@ -563,6 +616,9 @@ type modalityOverride struct {
 	fixvrMode     string
 	removePrivate bool
 	keepPrivate   bool
+	// maskRegions replaces the profile's regions outright for this modality
+	// rather than adding to them — see mergeModProfiles.
+	maskRegions []MaskRegion
 }
 
 // buildModalityOverrides converts the per-modality profile map (already keyed
@@ -606,6 +662,7 @@ func buildModalityOverrides(perMod map[string]ModProfile) map[string]modalityOve
 		ov.fixvrMode = p.FixVR
 		ov.removePrivate = p.Priv
 		ov.keepPrivate = p.KeepPrivate
+		ov.maskRegions = p.MaskRegions
 		result[mod] = ov
 	}
 	return result
@@ -652,7 +709,19 @@ func filterKeep(removals []tag.Tag, keep []tag.Tag) []tag.Tag {
 // ignoremodality match), or (false, transformed dataset, nil) on success. The
 // caller is responsible for writing the returned dataset to its destination.
 // src is always closed.
-func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped bool, ds sdicom.Dataset, err error) {
+// fileNotes records what processFile had to do beyond the profile's literal
+// instructions — things the run reports because the export differs from what
+// the profile alone describes.
+type fileNotes struct {
+	// maskDecompressed: compressed pixel data was decompressed so masking could
+	// write to it, without the profile requesting a conversion.
+	maskDecompressed bool
+	// maskUSFallback: an ultrasound image declared no calibrated region, so the
+	// profile's manual rectangles masked it instead of its own stated geometry.
+	maskUSFallback bool
+}
+
+func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped bool, ds sdicom.Dataset, notes fileNotes, err error) {
 	// Copy to locals: per-modality overrides layer onto these per file, and p's
 	// slices are shared across concurrent workers.
 	edits := p.edits
@@ -662,25 +731,34 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 	shiftDaysStr := p.shiftDays
 	fixvrMode := p.fixvrMode
 	removePrivate := p.removePrivate
+	maskRegions := p.maskRegions
 
 	info, err := src.Stat()
 	if err != nil {
 		src.Close()
-		return false, ds, fmt.Errorf("stat: %w", err)
+		return false, ds, notes, fmt.Errorf("stat: %w", err)
 	}
 	br := bufio.NewReaderSize(src, 1<<20)
 	ds, err = sdicom.Parse(br, info.Size(), nil)
 	src.Close()
 	if err != nil {
-		return false, ds, fmt.Errorf("parse: %w", err)
+		return false, ds, notes, fmt.Errorf("parse: %w", err)
 	}
+
+	// Masking runs last but keys on the file as it arrived, so its identity is
+	// captured here, before anything below can rewrite it. UID remapping
+	// replaces SOP Instance UID and a removal rule can delete Modality or the
+	// ultrasound region sequence — resolve a mask against the transformed
+	// dataset and every image-scoped region quietly stops matching the image it
+	// was drawn on.
+	maskSrc := newMaskSource(&ds)
 
 	if len(p.ignoreTypes) > 0 {
 		if elem, err := ds.FindElementByTag(imageTypeTag); err == nil {
 			for _, component := range elemStringComponents(elem) {
 				for _, ignore := range p.ignoreTypes {
 					if strings.EqualFold(component, strings.TrimSpace(ignore)) {
-						return true, ds, nil
+						return true, ds, notes, nil
 					}
 				}
 			}
@@ -692,7 +770,7 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 			for _, component := range elemStringComponents(elem) {
 				for _, ignore := range p.ignoreModalities {
 					if strings.EqualFold(component, strings.TrimSpace(ignore)) {
-						return true, ds, nil
+						return true, ds, notes, nil
 					}
 				}
 			}
@@ -727,6 +805,12 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 					if ov.keepPrivate {
 						removePrivate = false
 					}
+					// Replace, never append: a modality's regions describe that
+					// modality's screen layout, which has nothing to do with
+					// the profile-wide geometry they stand in for.
+					if len(ov.maskRegions) > 0 {
+						maskRegions = ov.maskRegions
+					}
 					break
 				}
 			}
@@ -752,14 +836,14 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 		// dicomtool and keeps real dates from shipping unnoticed.
 		n, err := strconv.Atoi(shiftDaysStr)
 		if err != nil {
-			return false, ds, fmt.Errorf("shiftdays %q must be an integer", shiftDaysStr)
+			return false, ds, notes, fmt.Errorf("shiftdays %q must be an integer", shiftDaysStr)
 		}
 		applyDateShift(ds.Elements, n)
 	}
 
 	if dobMask != "" {
 		if err := applyDOBMask(&ds, dobMask); err != nil {
-			return false, ds, err
+			return false, ds, notes, err
 		}
 	}
 
@@ -774,7 +858,7 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 	for _, e := range edits {
 		newElem, err := buildElement(&ds, e)
 		if err != nil {
-			return false, ds, err
+			return false, ds, notes, err
 		}
 		// Replace every occurrence at any nesting depth; append at the top level
 		// only when the tag is absent throughout the dataset.
@@ -789,11 +873,45 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 	// the profile did not ask for.
 	if p.targetTS != "" {
 		if _, err := convertDatasetSyntax(&ds, datasetTransferSyntaxUID(&ds), p.targetTS); err != nil {
-			return false, ds, fmt.Errorf("convert to %s: %w", transferSyntaxLabel(p.targetTS), err)
+			return false, ds, notes, fmt.Errorf("convert to %s: %w", transferSyntaxLabel(p.targetTS), err)
 		}
 	}
 
-	return false, ds, nil
+	// Pixel masking comes after the conversion, not before it: masking writes
+	// sample values and needs them native, which the conversion is what
+	// produces. It writes no attribute, so the conversion still has the final
+	// say over everything describing the pixels.
+	//
+	// Masking a compressed file therefore forces a decompression even when the
+	// profile asked for none — there are no encoders, so the alternative is to
+	// fail every compressed file. The file is written as Explicit VR Little
+	// Endian and the run reports how many files this happened to, so an export
+	// whose encoding changed never does so silently.
+	if len(maskRegions) > 0 {
+		if encapsulatedPixelData(&ds) {
+			if _, err := convertDatasetSyntax(&ds, datasetTransferSyntaxUID(&ds), tsExplicitVRLE); err != nil {
+				return false, ds, notes, fmt.Errorf("decompress for pixel masking: %w", err)
+			}
+			notes.maskDecompressed = true
+		}
+		outcome, err := applyPixelMask(&ds, maskRegions, maskSrc)
+		if err != nil {
+			return false, ds, notes, fmt.Errorf("pixel masking: %w", err)
+		}
+		notes.maskUSFallback = outcome.usFellBack
+	}
+
+	return false, ds, notes, nil
+}
+
+// encapsulatedPixelData reports whether ds still holds compressed pixel data.
+func encapsulatedPixelData(ds *sdicom.Dataset) bool {
+	elem, err := ds.FindElementByTag(tag.PixelData)
+	if err != nil {
+		return false
+	}
+	info, ok := elem.Value.GetValue().(sdicom.PixelDataInfo)
+	return ok && info.IsEncapsulated
 }
 
 // applyEdit replaces or inserts an element in ds for the given tagEdit.

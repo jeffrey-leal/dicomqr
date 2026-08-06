@@ -99,6 +99,14 @@ func showModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabel
 func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabel string,
 	files []string, rootDir string, studyLevel bool, resolved ModProfile) {
 
+	// win is this panel's own window, assigned as it opens at the foot of this
+	// function. Every callback below parents its children to win rather than to
+	// the window that opened it: a child parented to the latter would surface
+	// behind the blocked Modification window with no way to reach it. All such
+	// uses sit inside callbacks, so the late assignment is in place long before
+	// any of them can run.
+	var win fyne.Window
+
 	header := widget.NewLabel(fmt.Sprintf("Profile %q — %d file(s) from %s",
 		profileName, len(files), nodeLabel))
 	header.Wrapping = fyne.TextWrapWord
@@ -228,8 +236,50 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	if len(setRows) > 0 {
 		sections = append(sections, prefSection("Set values", setForm))
 	}
+	sections = append(sections, prefSection("Options", optionsForm))
+
+	// Pixel masking. The regions are disclosed because this is the one part of a
+	// profile that alters the image rather than the header and cannot be undone
+	// in the export — a run that silently blanked pixels would be
+	// indistinguishable from one that silently failed to. They are also
+	// adjustable, in the review window rather than by typing: geometry is
+	// something to judge against the images it will be applied to.
+	//
+	// runMasks holds what this run will use. It starts as the profile's and is
+	// replaced when the review window applies — for this run only, like every
+	// other control in this dialog.
+	runMasks := resolved
+	maskLines := func() string {
+		regions, _ := (&maskWorkingSet{profile: runMasks.MaskRegions}).governing("")
+		if len(regions) == 0 {
+			return "No areas are masked."
+		}
+		lines := make([]string, 0, len(regions))
+		for _, r := range regions {
+			lines = append(lines, "• "+maskRegionSummary(r))
+		}
+		return strings.Join(lines, "\n")
+	}
+	maskList := widget.NewLabel(maskLines())
+	maskNote := widget.NewLabel("These areas of every exported image are blanked permanently. " +
+		"Compressed files are decompressed on the way out so their pixels can be written, " +
+		"whatever the output transfer syntax says.")
+	maskNote.TextStyle = fyne.TextStyle{Italic: true}
+	maskNote.Wrapping = fyne.TextWrapWord
+	// Review is where the geometry meets the images it will be applied to:
+	// fractional rectangles fail on a study that mixes image sizes, and nothing
+	// in the profile says so. It is offered even when the profile masks nothing,
+	// because that is exactly when a study's analysis screens go out unmasked.
+	reviewBtn := widget.NewButton("Review masking…", func() {
+		showMaskPreview(fyne.CurrentApp(), win, profileName, files, runMasks, func(updated ModProfile) {
+			runMasks = updated
+			maskList.SetText(maskLines())
+		})
+	})
+	sections = append(sections, prefSection("Pixel masking", maskList, maskNote,
+		container.NewHBox(reviewBtn)))
+
 	sections = append(sections,
-		prefSection("Options", optionsForm),
 		prefSection(fmt.Sprintf("Tags removed (%d)", len(removeLines)), removeBox),
 	)
 
@@ -241,13 +291,23 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	if len(resolved.IgnoreModalities) > 0 {
 		notes = append(notes, "skip Modality "+strings.Join(resolved.IgnoreModalities, ", "))
 	}
-	if len(resolved.PerModality) > 0 {
-		mods := make([]string, 0, len(resolved.PerModality))
-		for k := range resolved.PerModality {
+	if len(runMasks.PerModality) > 0 {
+		mods := make([]string, 0, len(runMasks.PerModality))
+		maskMods := make([]string, 0, len(runMasks.PerModality))
+		for k, ov := range runMasks.PerModality {
 			mods = append(mods, k)
+			if len(ov.MaskRegions) > 0 {
+				maskMods = append(maskMods, k)
+			}
 		}
 		sort.Strings(mods)
 		notes = append(notes, "per-modality overrides: "+strings.Join(mods, ", "))
+		// Named separately: an override's regions replace the profile's, so
+		// the section above is not what those files get.
+		if len(maskMods) > 0 {
+			sort.Strings(maskMods)
+			notes = append(notes, "own mask regions for "+strings.Join(maskMods, ", "))
+		}
 	}
 	if len(notes) > 0 {
 		noteLbl := widget.NewLabel("Also applied: " + strings.Join(notes, "; "))
@@ -358,7 +418,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	validOutDir := func(dir string) bool {
 		if pathWithinDir(dir, cfg.DownloadDir) {
 			dialog.ShowError(fmt.Errorf(
-				"the output folder must be outside the download folder (%s) — modified files are never mixed into the local index", cfg.DownloadDir), w)
+				"the output folder must be outside the download folder (%s) — modified files are never mixed into the local index", cfg.DownloadDir), win)
 			return false
 		}
 		return true
@@ -373,7 +433,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		}
 		cfg.ModifyOutputDir = dir
 		if err := saveSettingsE(*cfg); err != nil {
-			dialog.ShowError(fmt.Errorf("saving the default output folder: %w", err), w)
+			dialog.ShowError(fmt.Errorf("saving the default output folder: %w", err), win)
 		}
 	}
 	changeOutDirBtn := widget.NewButton("Change…", func() {
@@ -412,34 +472,29 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	exportNote.Wrapping = fyne.TextWrapWord
 	sections = append(sections, prefSection("Export", exportForm, exportNote))
 
-	var dlg dialog.Dialog
-	cancelBtn := widget.NewButton("Cancel", func() { dlg.Hide() })
+	cancelBtn := widget.NewButton("Cancel", func() { win.Close() })
 	modifyBtn := widget.NewButton("Modify…", nil)
 	modifyBtn.Importance = widget.HighImportance
-	sections = append(sections, widget.NewSeparator(),
-		container.NewHBox(layout.NewSpacer(), cancelBtn, modifyBtn))
 
 	minWidth := canvas.NewRectangle(color.Transparent)
 	minWidth.SetMinSize(fyne.NewSize(640, 0))
-	content := container.NewStack(minWidth, container.NewVBox(sections...))
-	dlg = dialog.NewCustomWithoutButtons("Modification — "+profileName, container.NewPadded(content), w)
 
 	modifyBtn.OnTapped = func() {
 		// Validate the editable fields; compileModifyParams re-checks, but
 		// friendly messages belong here where the user can correct them.
 		exportName := strings.TrimSpace(exportNameEntry.Text)
 		if err := validateExportFolderName(exportName); err != nil {
-			dialog.ShowError(err, w)
+			dialog.ShowError(err, win)
 			return
 		}
 		dob, err := validateDOBMask(dobEntry.Text)
 		if err != nil {
-			dialog.ShowError(err, w)
+			dialog.ShowError(err, win)
 			return
 		}
 		uidSfx, err := validateUIDSuffix(uidEntry.Text)
 		if err != nil {
-			dialog.ShowError(err, w)
+			dialog.ShowError(err, win)
 			return
 		}
 		if remapCheck.Checked {
@@ -451,19 +506,21 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		}
 		shift, err := validateShiftDays(shiftEntry.Text)
 		if err != nil {
-			dialog.ShowError(err, w)
+			dialog.ShowError(err, win)
 			return
 		}
 
 		// The rows hold resolved literals, so each value can be checked against
 		// its tag's value representation here — the last place a per-run edit
 		// can put a word into a date field before it reaches every output file.
-		edited := resolved
+		// runMasks carries any regions added in the review window; everything
+		// else still comes from the resolved profile plus the controls above.
+		edited := runMasks
 		edited.Sets = make([]string, 0, len(setRows))
 		for _, row := range setRows {
 			if row.parsed {
 				if verr := validateSetValue(row.t, row.entry.Text); verr != nil {
-					dialog.ShowError(fmt.Errorf("Set values: %w", verr), w)
+					dialog.ShowError(fmt.Errorf("Set values: %w", verr), win)
 					return
 				}
 			}
@@ -483,7 +540,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 
 		params, err := compileModifyParams(edited)
 		if err != nil {
-			dialog.ShowError(err, w)
+			dialog.ShowError(err, win)
 			return
 		}
 
@@ -502,7 +559,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 				}
 				zipPath := filepath.Join(outBase, zipName)
 				begin := func() {
-					dlg.Hide()
+					win.Close()
 					showModificationRunDialog(w, profileName, files, rootDir, zipPath, params, rels, true)
 				}
 				if _, serr := os.Stat(zipPath); serr == nil {
@@ -512,7 +569,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 							if ok {
 								begin()
 							}
-						}, w)
+						}, win)
 					return
 				}
 				begin()
@@ -520,7 +577,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 			}
 			exportRoot := filepath.Join(outBase, exportName)
 			begin := func() {
-				dlg.Hide()
+				win.Close()
 				showModificationRunDialog(w, profileName, files, rootDir, exportRoot, params, rels, false)
 			}
 			if entries, rerr := os.ReadDir(exportRoot); rerr == nil && len(entries) > 0 {
@@ -530,7 +587,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 						if ok {
 							begin()
 						}
-					}, w)
+					}, win)
 				return
 			}
 			begin()
@@ -560,7 +617,35 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		}()
 	}
 
-	dlg.Show()
+	// A window rather than a dialog, and the reason is the button row: a Fyne
+	// dialog is a canvas overlay sized to its content, so a profile with many
+	// set values and a long removal list grew this panel past the bottom of the
+	// screen, putting Modify… and Cancel where they could not be clicked. Here
+	// the body scrolls and the buttons are pinned below it, so the panel fits
+	// any screen and the window can still be moved and resized.
+	openOwnedWindow(fyne.CurrentApp(), windowSpec{
+		Title:    "Modification — " + profileName,
+		Size:     fyne.NewSize(700, 700),
+		Parent:   w,
+		Blocking: true,
+	}, func(owned fyne.Window) fyne.CanvasObject {
+		win = owned
+		body := container.NewVScroll(container.New(
+			layout.NewCustomPaddedLayout(modEditorMargin, modEditorMargin, modEditorMargin, modEditorMargin),
+			container.NewVBox(sections...)))
+		// A modest floor, as in the profile editor: it stops the window being
+		// shrunk to nothing without forbidding the vertical resizing that makes
+		// this a window in the first place.
+		body.SetMinSize(fyne.NewSize(0, 240))
+		buttonRow := container.NewBorder(
+			widget.NewSeparator(), nil, nil, nil,
+			container.New(
+				layout.NewCustomPaddedLayout(modEditorMargin, modEditorMargin, modEditorMargin, modEditorMargin),
+				container.NewHBox(layout.NewSpacer(), cancelBtn, modifyBtn)),
+		)
+		return container.NewStack(minWidth,
+			container.NewBorder(nil, buttonRow, nil, nil, body))
+	})
 }
 
 // showModificationRunDialog runs the modification in the background with a
@@ -609,8 +694,8 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 		} else {
 			res = runModification(ctx, files, rootDir, outDir, params, rels, onProgress)
 		}
-		logInfo("modify: %q finished — %d written, %d skipped, %d failed, cancelled=%v → %s",
-			profileName, res.Processed, res.Skipped, res.Failed, res.Canceled, outDir)
+		logInfo("modify: %q finished — %d written, %d skipped, %d failed, %d decompressed for masking, cancelled=%v → %s",
+			profileName, res.Processed, res.Skipped, res.Failed, res.MaskDecompressed, res.Canceled, outDir)
 		fyne.Do(func() {
 			progressBar.SetValue(1)
 			head := "Done"
@@ -623,6 +708,21 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 			}
 			if res.Failed > 0 {
 				msg += fmt.Sprintf(", %d failed", res.Failed)
+			}
+			// Masking cannot be applied to compressed pixels and there are no
+			// encoders, so those files left in a different encoding than the
+			// profile asked for. Stating it is the whole reason the run does it
+			// rather than failing the file.
+			if res.MaskDecompressed > 0 {
+				msg += fmt.Sprintf("; %d decompressed to %s so burned-in pixels could be masked",
+					res.MaskDecompressed, transferSyntaxLabel(tsExplicitVRLE))
+			}
+			// A weaker guarantee than the rest of the export: those files were
+			// masked by the profile's rectangles because they stated no region
+			// of their own, so they are worth checking by eye.
+			if res.MaskUSFallback > 0 {
+				msg += fmt.Sprintf("; %d ultrasound file(s) declared no image region and were masked "+
+					"with the profile's rectangles instead — worth reviewing", res.MaskUSFallback)
 			}
 			// Failures have to be impossible to walk past: an export missing
 			// files still looks finished, and a transfer-syntax conversion that
