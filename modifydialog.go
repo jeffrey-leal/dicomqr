@@ -168,12 +168,11 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	remapCheck.SetChecked(resolved.RemapUIDs)
 	privCheck := widget.NewCheck("", nil)
 	privCheck.SetChecked(resolved.Priv)
+	overlaysCheck := widget.NewCheck("", nil)
+	overlaysCheck.SetChecked(resolved.NoOverlays)
 	dobEntry := widget.NewEntry()
 	dobEntry.SetText(resolved.DOB)
 	dobEntry.SetPlaceHolder("YYYYMMDD — empty = no masking")
-	uidEntry := widget.NewEntry()
-	uidEntry.SetText(resolved.UIDSuffix)
-	uidEntry.SetPlaceHolder("digits 1-9 — empty = none")
 	shiftEntry := widget.NewEntry()
 	shiftEntry.SetText(resolved.ShiftDays)
 	shiftEntry.SetPlaceHolder("e.g. -45 — shifts all dates except birth date")
@@ -186,13 +185,6 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	tsSelect := widget.NewSelect(modProfileTSLabels, nil)
 	tsSelect.SetSelected(transferSyntaxPrefLabel(resolved.TransferSyntax))
 
-	// Remap UIDs and the UID suffix share a row and grey out together, through
-	// the same helpers the profile editor uses — the exclusion is visible
-	// rather than a message on confirm.
-	uidSuffixLabel := widget.NewLabel("UID suffix")
-	syncUIDSuffixEnabled(remapCheck, uidSuffixLabel, uidEntry)
-	uidRow := uidSuffixRow(remapCheck, uidSuffixLabel, uidEntry)
-
 	// Row order is the profile editor's, deliberately — the two Options blocks
 	// show the same fields and are read against each other, so they must not be
 	// ordered differently. The one field the editor has here and this dialog
@@ -200,8 +192,9 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	// naming the output and can see what the checkbox changes.
 	optionsForm := widget.NewForm(
 		widget.NewFormItem("Birth date mask", dobEntry),
-		widget.NewFormItem("Remap UIDs", uidRow),
+		widget.NewFormItem("Remap UIDs", remapCheck),
 		widget.NewFormItem("Remove private tags", privCheck),
+		widget.NewFormItem("Remove overlay planes", overlaysCheck),
 		widget.NewFormItem("Shift dates (days)", shiftEntry),
 		widget.NewFormItem("Fix VR", fixvrSelect),
 		widget.NewFormItem("Output transfer syntax", tsSelect),
@@ -492,18 +485,6 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 			dialog.ShowError(err, win)
 			return
 		}
-		uidSfx, err := validateUIDSuffix(uidEntry.Text)
-		if err != nil {
-			dialog.ShowError(err, win)
-			return
-		}
-		if remapCheck.Checked {
-			// The suffix entry is disabled while Remap UIDs is checked, so text
-			// left in it is inert and must not reach the run — the engine
-			// rejects the combination, and refusing here would be a dead end
-			// because the field cannot be cleared while it is disabled.
-			uidSfx = ""
-		}
 		shift, err := validateShiftDays(shiftEntry.Text)
 		if err != nil {
 			dialog.ShowError(err, win)
@@ -527,10 +508,10 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 			edited.Sets = append(edited.Sets, row.tagStr+"="+row.entry.Text)
 		}
 		edited.DOB = dob
-		edited.UIDSuffix = uidSfx
 		edited.ShiftDays = shift
 		edited.RemapUIDs = remapCheck.Checked
 		edited.Priv = privCheck.Checked
+		edited.NoOverlays = overlaysCheck.Checked
 		if sel := fixvrSelect.Selected; sel == "" || sel == fixvrOffLabel {
 			edited.FixVR = ""
 		} else {

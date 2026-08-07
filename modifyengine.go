@@ -5,7 +5,7 @@ package main
 // identically. Per-file order of operations (matching dicomtool):
 //
 //	parse → ignoretype → ignoremodality → per-modality overrides → fixvr →
-//	remove + noprivate → date shift → dob mask → uid suffix / uid remap → set →
+//	remove + noprivate + nooverlays → date shift → dob mask → uid remap → set →
 //	transfer syntax
 //
 // The transfer-syntax conversion is dicomqr's own step, with no dicomtool
@@ -48,15 +48,19 @@ type tagEdit struct {
 // modifyParams is a fully parsed and validated set of modification parameters,
 // ready for processFile. Built from a ModProfile by compileModifyParams.
 type modifyParams struct {
-	edits     []tagEdit
-	removals  []tag.Tag
-	dobMask   string
-	uidSuffix string
+	edits    []tagEdit
+	removals []tag.Tag
+	dobMask  string
 	// shiftDays stays a string: "" means no shift while "0" is an accepted
 	// (no-op) action, matching dicomtool. Atoi-validated by compileModifyParams.
-	shiftDays        string
-	fixvrMode        string
-	removePrivate    bool
+	shiftDays     string
+	fixvrMode     string
+	removePrivate bool
+	// removeOverlays drops every overlay-plane group (6000–60FE, even) — the
+	// bitmap channel a vendor can burn annotations into that no per-tag rule
+	// reaches practically (16 repeating groups) and pixel masking cannot touch.
+	// Profile-wide, like noprivate is in the editor.
+	removeOverlays   bool
 	ignoreTypes      []string
 	ignoreModalities []string
 	perMod           map[string]modalityOverride
@@ -98,14 +102,14 @@ func compileModifyParams(p ModProfile) (modifyParams, error) {
 	mp.targetTS = targetTS
 
 	mp.remapUIDs = p.RemapUIDs
-	mp.uidSuffix = strings.TrimSpace(p.UIDSuffix)
-	if mp.remapUIDs && mp.uidSuffix != "" {
-		return mp, errors.New("Remap UIDs and a UID suffix cannot be combined")
-	}
-	for _, c := range mp.uidSuffix {
-		if c < '1' || c > '9' {
-			return mp, fmt.Errorf("UID suffix %q must contain digits in the set [1..9] only", mp.uidSuffix)
-		}
+	// The UID suffix option is gone — Remap UIDs replaced it outright. A profile
+	// still carrying one is refused rather than run: silently ignoring the entry
+	// would export original UIDs from a profile whose author asked for them
+	// changed, which is exactly the quiet no-op a de-identification engine must
+	// not have. The stored `uid` value itself is preserved by load/save so the
+	// entry can be seen and deleted, never stripped behind the user's back.
+	if strings.TrimSpace(p.UIDSuffix) != "" {
+		return mp, errors.New("the uid suffix option has been removed — use Remap UIDs instead")
 	}
 
 	mp.dobMask = strings.TrimSpace(p.DOB)
@@ -147,6 +151,7 @@ func compileModifyParams(p ModProfile) (modifyParams, error) {
 	}
 
 	mp.removePrivate = p.Priv
+	mp.removeOverlays = p.NoOverlays
 
 	for _, v := range p.IgnoreTypes {
 		if v = strings.TrimSpace(v); v != "" {
@@ -176,6 +181,11 @@ func compileModifyParams(p ModProfile) (modifyParams, error) {
 			if err := validateMaskRegions(v.MaskRegions); err != nil {
 				return mp, fmt.Errorf("modality %s: %w", modKey, err)
 			}
+			// The same refusal as the top level: a hand-authored per-modality
+			// uid entry would otherwise become a silent no-op.
+			if strings.TrimSpace(v.UIDSuffix) != "" {
+				return mp, fmt.Errorf("modality %s: the uid suffix option has been removed — use Remap UIDs instead", modKey)
+			}
 			if len(v.MaskRegions) > 0 {
 				mp.mayMask = true
 			}
@@ -188,12 +198,12 @@ func compileModifyParams(p ModProfile) (modifyParams, error) {
 	// uncompressed syntax is a legitimate standalone operation, and export is
 	// the only place the application can perform one.
 	hasAction := len(mp.edits) > 0 || len(mp.removals) > 0 ||
-		mp.dobMask != "" || mp.uidSuffix != "" || mp.shiftDays != "" ||
-		mp.removePrivate || mp.fixvrMode != "" || mp.targetTS != "" ||
+		mp.dobMask != "" || mp.shiftDays != "" ||
+		mp.removePrivate || mp.removeOverlays || mp.fixvrMode != "" || mp.targetTS != "" ||
 		len(mp.ignoreTypes) > 0 || len(mp.ignoreModalities) > 0 ||
 		len(mp.perMod) > 0 || mp.remapUIDs || mp.mayMask
 	if !hasAction {
-		return mp, errors.New("the profile contains no actionable parameter (set, remove, dob, uid, shiftdays, noprivate, fixvr, remapuids, transfersyntax, maskregions)")
+		return mp, errors.New("the profile contains no actionable parameter (set, remove, dob, shiftdays, noprivate, nooverlays, fixvr, remapuids, transfersyntax, maskregions)")
 	}
 
 	return mp, nil
@@ -611,7 +621,6 @@ type modalityOverride struct {
 	removals      []tag.Tag
 	keep          []tag.Tag
 	dobMask       string
-	uidSuffix     string
 	shiftDays     string
 	fixvrMode     string
 	removePrivate bool
@@ -657,7 +666,6 @@ func buildModalityOverrides(perMod map[string]ModProfile) map[string]modalityOve
 			ov.keep = append(ov.keep, t)
 		}
 		ov.dobMask = p.DOB
-		ov.uidSuffix = p.UIDSuffix
 		ov.shiftDays = p.ShiftDays
 		ov.fixvrMode = p.FixVR
 		ov.removePrivate = p.Priv
@@ -727,7 +735,6 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 	edits := p.edits
 	removals := p.removals
 	dobMask := p.dobMask
-	uidSuffix := p.uidSuffix
 	shiftDaysStr := p.shiftDays
 	fixvrMode := p.fixvrMode
 	removePrivate := p.removePrivate
@@ -790,9 +797,6 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 					if ov.dobMask != "" {
 						dobMask = ov.dobMask
 					}
-					if ov.uidSuffix != "" {
-						uidSuffix = ov.uidSuffix
-					}
 					if ov.shiftDays != "" {
 						shiftDaysStr = ov.shiftDays
 					}
@@ -821,12 +825,12 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 		applyFixVR(&ds, fixvrMode)
 	}
 
-	if removePrivate || len(removals) > 0 {
+	if removePrivate || p.removeOverlays || len(removals) > 0 {
 		removalSet := make(map[tag.Tag]struct{}, len(removals))
 		for _, t := range removals {
 			removalSet[t] = struct{}{}
 		}
-		ds.Elements = pruneElements(ds.Elements, removalSet, removePrivate)
+		ds.Elements = pruneElements(ds.Elements, removalSet, removePrivate, p.removeOverlays)
 	}
 
 	if shiftDaysStr != "" {
@@ -845,10 +849,6 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 		if err := applyDOBMask(&ds, dobMask); err != nil {
 			return false, ds, notes, err
 		}
-	}
-
-	if uidSuffix != "" {
-		applyUIDSuffix(&ds, uidSuffix)
 	}
 
 	if uidRemap != nil {
@@ -973,51 +973,6 @@ func buildElement(ds *sdicom.Dataset, e tagEdit) (*sdicom.Element, error) {
 	default:
 		// VRStringList, VRString, VRDate, VRUnknown, etc.
 		return sdicom.NewElement(e.tag, []string{e.value})
-	}
-}
-
-// maxUIDLength is the maximum number of characters permitted in a DICOM UID
-// (DICOM PS3.5 §9.1).
-const maxUIDLength = 64
-
-// applyUIDSuffix iterates every element in ds that carries a UI (UID) value
-// and appends ".<suffix>" to it. If the resulting string would exceed
-// maxUIDLength, the last dot-delimited component of the original UID is
-// replaced with suffix instead.
-func applyUIDSuffix(ds *sdicom.Dataset, suffix string) {
-	for _, elem := range ds.Elements {
-		if elem.RawValueRepresentation != "UI" {
-			continue
-		}
-		// Transfer Syntax UIDs must not be modified — they describe the encoding
-		// of the file itself and must remain valid, recognised UIDs.
-		if elem.Tag == tag.TransferSyntaxUID || elem.Tag == tag.ReferencedTransferSyntaxUIDInFile {
-			continue
-		}
-		vals, ok := elem.Value.GetValue().([]string)
-		if !ok {
-			continue
-		}
-		modified := make([]string, len(vals))
-		for i, uid := range vals {
-			candidate := uid + "." + suffix
-			if len(candidate) <= maxUIDLength {
-				modified[i] = candidate
-			} else {
-				// Replace the last component.
-				if dot := strings.LastIndex(uid, "."); dot >= 0 {
-					modified[i] = uid[:dot+1] + suffix
-				} else {
-					// No dot at all — just use the suffix directly.
-					modified[i] = suffix
-				}
-			}
-		}
-		v, err := sdicom.NewValue(modified)
-		if err != nil {
-			continue
-		}
-		elem.Value = v
 	}
 }
 
@@ -1269,15 +1224,24 @@ func fixVRElements(elements []*sdicom.Element, mode string) []*sdicom.Element {
 	return filtered
 }
 
+// isOverlayGroup reports whether g is a standard overlay-plane repeating group
+// (6000–60FE, even — PS3.5 §7.6). Odd 60xx groups are ordinary private tags,
+// which are noprivate's business, not this check's.
+func isOverlayGroup(g uint16) bool { return g&0xFF00 == 0x6000 && g%2 == 0 }
+
 // pruneElements recursively drops elements whose tag is in removalSet, plus any
-// odd-group (private) element when removePrivate is set, at every nesting depth.
-// Sequence elements that are not themselves removed are recursed into and rebuilt
-// so that nested identifiers are scrubbed as well. The removalSet lookup keeps
-// this an O(elements) pass regardless of how many tags are being removed.
-func pruneElements(elements []*sdicom.Element, removalSet map[tag.Tag]struct{}, removePrivate bool) []*sdicom.Element {
+// odd-group (private) element when removePrivate is set and any overlay-plane
+// group when removeOverlays is set, at every nesting depth. Sequence elements
+// that are not themselves removed are recursed into and rebuilt so that nested
+// identifiers are scrubbed as well. The removalSet lookup keeps this an
+// O(elements) pass regardless of how many tags are being removed.
+func pruneElements(elements []*sdicom.Element, removalSet map[tag.Tag]struct{}, removePrivate, removeOverlays bool) []*sdicom.Element {
 	filtered := elements[:0] // reuse backing array, matching the existing in-place style
 	for _, elem := range elements {
 		if removePrivate && elem.Tag.Group%2 == 1 {
+			continue
+		}
+		if removeOverlays && isOverlayGroup(elem.Tag.Group) {
 			continue
 		}
 		if _, ok := removalSet[elem.Tag]; ok {
@@ -1288,7 +1252,7 @@ func pruneElements(elements []*sdicom.Element, removalSet map[tag.Tag]struct{}, 
 				rebuilt := make([][]*sdicom.Element, 0, len(seqItems))
 				for _, item := range seqItems {
 					if itemElems, ok2 := item.GetValue().([]*sdicom.Element); ok2 {
-						rebuilt = append(rebuilt, pruneElements(itemElems, removalSet, removePrivate))
+						rebuilt = append(rebuilt, pruneElements(itemElems, removalSet, removePrivate, removeOverlays))
 					} else {
 						rebuilt = append(rebuilt, nil)
 					}

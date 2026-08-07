@@ -72,9 +72,13 @@ func TestCompileModifyParamsValidation(t *testing.T) {
 		p    ModProfile
 		want string // substring of the expected error; "" = must succeed
 	}{
-		{"remap and suffix", ModProfile{RemapUIDs: true, UIDSuffix: "7"}, "cannot be combined"},
 		{"bad dob length", ModProfile{DOB: "1980"}, "8 characters"},
-		{"bad uid charset", ModProfile{UIDSuffix: "10"}, "digits in the set"},
+		// The uid suffix option is removed: a profile still carrying one is
+		// refused loudly rather than run with the entry silently ignored —
+		// at the top level and inside a hand-authored per-modality block.
+		{"uid suffix removed", ModProfile{UIDSuffix: "7"}, "has been removed"},
+		{"per-modality uid suffix removed",
+			ModProfile{PerModality: map[string]ModProfile{"CT": {UIDSuffix: "7"}}}, "has been removed"},
 		{"bad fixvr", ModProfile{FixVR: "maybe"}, "must be correct"},
 		{"bad shiftdays", ModProfile{ShiftDays: "abc"}, "must be an integer"},
 		{"bad transfersyntax", ModProfile{TransferSyntax: "jpeg2000"}, "must be explicit-le"},
@@ -83,6 +87,7 @@ func TestCompileModifyParamsValidation(t *testing.T) {
 		// Unlike zip, a transfer syntax alone is a real transformation: export is
 		// the only place the application can convert a file.
 		{"transfersyntax only is actionable", ModProfile{TransferSyntax: tsPrefImplicitLE}, ""},
+		{"nooverlays only is actionable", ModProfile{NoOverlays: true}, ""},
 		{"shiftdays only is actionable", ModProfile{ShiftDays: "-45"}, ""},
 		{"shiftdays zero accepted", ModProfile{ShiftDays: "0"}, ""},
 		// A bare keyword used to resolve through tags.json. With aliases gone it
@@ -243,6 +248,90 @@ func writeModifyTestDICOM(t *testing.T, path string) (hasPrivate bool) {
 		t.Fatalf("write test DICOM: %v", err)
 	}
 	return hasPrivate
+}
+
+// TestRunModificationNoOverlays: nooverlays removes every overlay-plane group
+// (6000–60FE, even) — the bitmap channel a vendor can burn patient text into,
+// which noprivate never touches (even groups) and no per-tag rule reaches
+// practically — and leaves the planes alone when unset, since a profile shared
+// with dicomtool must not change meaning by being run here.
+func TestRunModificationNoOverlays(t *testing.T) {
+	overlayRows := tag.Tag{Group: 0x6000, Element: 0x0010}
+	overlayData := tag.Tag{Group: 0x6000, Element: 0x3000}
+
+	writeFixture := func(t *testing.T, path string) {
+		writeModifyTestDICOM(t, path)
+		ds, err := sdicom.ParseFile(path, nil)
+		if err != nil {
+			t.Fatalf("parse fixture: %v", err)
+		}
+		if err := setElementValue(&ds, overlayRows, []int{2}); err != nil {
+			t.Fatalf("set overlay rows: %v", err)
+		}
+		if err := setElementValue(&ds, overlayData, []byte{0x03}); err != nil {
+			t.Fatalf("set overlay data: %v", err)
+		}
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		defer f.Close()
+		if err := sdicom.Write(f, ds, sdicom.SkipVRVerification(), sdicom.SkipValueTypeVerification()); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		profile  ModProfile
+		wantGone bool
+	}{
+		{"removed when set", ModProfile{NoOverlays: true}, true},
+		{"kept when unset", ModProfile{Sets: []string{"0010,0010=ANON"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rootDir, outDir := t.TempDir(), t.TempDir()
+			srcPath := filepath.Join(rootDir, "ov.dcm")
+			writeFixture(t, srcPath)
+
+			params, err := compileModifyParams(tc.profile)
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			res := runModification(context.Background(), []string{srcPath}, rootDir, outDir, params, nil, nil)
+			if res.Processed != 1 || res.Failed != 0 {
+				t.Fatalf("result = %+v (%v), want the file exported", res, res.Failures)
+			}
+			out, err := sdicom.ParseFile(filepath.Join(outDir, "ov.dcm"), nil)
+			if err != nil {
+				t.Fatalf("parse export: %v", err)
+			}
+			overlayLeft := false
+			for _, el := range out.Elements {
+				if isOverlayGroup(el.Tag.Group) {
+					overlayLeft = true
+				}
+			}
+			if tc.wantGone && overlayLeft {
+				t.Errorf("overlay-plane elements survived nooverlays")
+			}
+			if !tc.wantGone && !overlayLeft {
+				t.Errorf("overlay-plane elements missing from an export that never asked for nooverlays")
+			}
+			if _, ferr := out.FindElementByTag(tag.PatientID); ferr != nil {
+				t.Errorf("PatientID missing — nooverlays must remove only overlay groups")
+			}
+		})
+	}
+
+	// The group test is the whole safety boundary: odd 60xx groups are private
+	// tags (noprivate's business), and nearby even groups are not overlays.
+	if isOverlayGroup(0x6001) || isOverlayGroup(0x5000) || isOverlayGroup(0x6100) {
+		t.Errorf("isOverlayGroup admits a non-overlay group")
+	}
+	if !isOverlayGroup(0x6000) || !isOverlayGroup(0x60FE) {
+		t.Errorf("isOverlayGroup rejects a real overlay group")
+	}
 }
 
 func TestRunModificationBaseDeident(t *testing.T) {

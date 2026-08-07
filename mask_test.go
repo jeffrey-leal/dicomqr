@@ -659,7 +659,6 @@ func TestScopedMaskSurvivesUIDRemapping(t *testing.T) {
 		profile ModProfile
 	}{
 		{"remap UIDs", ModProfile{RemapUIDs: true}},
-		{"UID suffix", ModProfile{UIDSuffix: "9"}},
 		// A removal rule can delete the attributes a scope keys on, which is
 		// the same failure by another route.
 		{"modality removed", ModProfile{Removes: []string{"0008,0060"}}},

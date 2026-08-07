@@ -13,10 +13,13 @@ package main
 // preserved.
 //
 // The JSON format and merge semantics otherwise follow dicomtool, with these
-// deliberate divergences: `zip` and `transfersyntax` are dicomqr-only
-// (dicomtool ignores unknown keys); dicomtool's `maskrows` is unsupported here,
-// dropped on load and stripped on save; and dicomqr no longer resolves
-// dicomtool's tag aliases, so a profile copied from it must use tag numbers.
+// deliberate divergences: `zip`, `transfersyntax` and `nooverlays` are
+// dicomqr-only (dicomtool ignores unknown keys); dicomtool's `maskrows` is
+// unsupported here, dropped on load and stripped on save; the `uid` suffix
+// option is removed — the value is preserved through load and save but a
+// profile carrying it is refused at run time in favour of Remap UIDs; and
+// dicomqr no longer resolves dicomtool's tag aliases, so a profile copied from
+// it must use tag numbers.
 // The tag picker names tags from the standard dictionary, which is a better
 // naming authority than a map the user has to maintain.
 
@@ -43,11 +46,16 @@ var defaultModProfilesJSON []byte
 // profile field), TransferSyntax is dicomqr-only (dicomtool has no equivalent),
 // and dicomtool's maskrows has no field here by design.
 type ModProfile struct {
-	Base             string   `json:"base,omitempty"`
-	Sets             []string `json:"set,omitempty"`
-	Removes          []string `json:"remove,omitempty"`
-	Keep             []string `json:"keep,omitempty"`
-	DOB              string   `json:"dob,omitempty"`
+	Base    string   `json:"base,omitempty"`
+	Sets    []string `json:"set,omitempty"`
+	Removes []string `json:"remove,omitempty"`
+	Keep    []string `json:"keep,omitempty"`
+	DOB     string   `json:"dob,omitempty"`
+	// UIDSuffix is the removed uid-suffix option (Remap UIDs replaced it). The
+	// field survives only so a profile still carrying `uid` — dicomtool-authored
+	// or old — round-trips through load and save instead of being silently
+	// stripped; compileModifyParams refuses to run such a profile, with a
+	// message naming the replacement, and the editors disclose the entry.
 	UIDSuffix        string   `json:"uid,omitempty"`
 	ShiftDays        string   `json:"shiftdays,omitempty"`
 	RemapUIDs        bool     `json:"remapuids,omitempty"`
@@ -59,6 +67,15 @@ type ModProfile struct {
 	IgnoreTypes      []string `json:"ignoretype,omitempty"`
 	IgnoreModalities []string `json:"ignoremodality,omitempty"`
 	FixVR            string   `json:"fixvr,omitempty"`
+
+	// NoOverlays removes every overlay-plane group (6000–60FE, even) on export.
+	// Overlay Data (60xx,3000) is a bitmap channel a vendor can burn patient
+	// text into: no per-tag rule reaches it practically — sixteen repeating
+	// groups of it exist — noprivate never touches it (even groups), and pixel
+	// masking writes PixelData only. dicomqr-only (dicomtool ignores
+	// `nooverlays` and drops it when it saves); profile-wide, like the other
+	// scalar options.
+	NoOverlays bool `json:"nooverlays,omitempty"`
 
 	// TransferSyntax is the syntax every exported file is written in, using the
 	// same tokens as ServerProfile.TransferSyntax: tsPrefAny (empty) writes each
@@ -291,6 +308,7 @@ func mergeModProfiles(base, override ModProfile) ModProfile {
 	}
 
 	result.Priv = base.Priv || override.Priv
+	result.NoOverlays = base.NoOverlays || override.NoOverlays
 	result.Dicomdir = base.Dicomdir || override.Dicomdir
 	result.Verbose = base.Verbose || override.Verbose
 	result.Zip = base.Zip || override.Zip
@@ -520,18 +538,6 @@ func validateDOBMask(s string) (string, error) {
 	s = strings.TrimSpace(s)
 	if s != "" && len(s) != 8 {
 		return "", fmt.Errorf("the birth date mask must be exactly 8 characters (YYYYMMDD), got %d", len(s))
-	}
-	return s, nil
-}
-
-// validateUIDSuffix trims s and returns it; only the digits 1-9 are allowed
-// (0 would create ".0"-prefixed UID components, which are invalid).
-func validateUIDSuffix(s string) (string, error) {
-	s = strings.TrimSpace(s)
-	for _, c := range s {
-		if c < '1' || c > '9' {
-			return "", fmt.Errorf("the UID suffix may contain only the digits 1-9")
-		}
 	}
 	return s, nil
 }

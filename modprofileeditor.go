@@ -3,9 +3,9 @@ package main
 // Modification-profile editor — opened from Preferences > Modification &
 // Export. Edits one named ModProfile from ~/.dicomqr/profiles.json. The
 // top-level editor owns every de-identification option the engine honors: the
-// tag lists, the scalar options (birth-date mask, UID suffix, date shift,
-// fixvr, private-tag removal, UID remapping), the zip output default and the
-// ignoretype/ignoremodality file filters. A per-modality override, edited in a
+// tag lists, the scalar options (birth-date mask, date shift, fixvr,
+// private-tag removal, overlay-plane removal, UID remapping), the zip output
+// default and the ignoretype/ignoremodality file filters. A per-modality override, edited in a
 // nested sub-editor, may only vary what is genuinely modality-specific — the
 // tag lists plus keepprivate — since the scalar options are profile-wide
 // decisions; the engine would honor a hand-authored per-modality scalar, so
@@ -76,39 +76,6 @@ func checkTagLines(field, text string) ([]string, error) {
 		out = append(out, ref)
 	}
 	return out, nil
-}
-
-// Remap UIDs and a UID suffix are mutually exclusive, and both the profile
-// editor and the Modification dialog present the pair. These two helpers are
-// what they share: the behaviour existed in the editor alone for a while, and
-// the dialog's Options block silently lacked it, so there is one implementation
-// now rather than two that can drift.
-//
-// Split into wiring and layout because the editor installs the wiring when its
-// controls are built — which is what its tests drive — but lays them out later,
-// inside the window-build callback.
-
-// syncUIDSuffixEnabled makes the suffix entry and its label follow the remap
-// checkbox, and applies the current state immediately.
-func syncUIDSuffixEnabled(remap *widget.Check, label *widget.Label, suffix *widget.Entry) {
-	apply := func() {
-		if remap.Checked {
-			suffix.Disable()
-			label.Importance = widget.LowImportance
-		} else {
-			suffix.Enable()
-			label.Importance = widget.MediumImportance
-		}
-		label.Refresh()
-	}
-	remap.OnChanged = func(bool) { apply() }
-	apply()
-}
-
-// uidSuffixRow lays the pair out on one line: the checkbox, then the suffix
-// label and entry that grey out with it.
-func uidSuffixRow(remap *widget.Check, label *widget.Label, suffix *widget.Entry) fyne.CanvasObject {
-	return container.NewBorder(nil, nil, container.NewHBox(remap, label), nil, suffix)
 }
 
 // modProfileFieldSet groups the three tag-list controls — the only ModProfile
@@ -190,15 +157,15 @@ type modProfileEditor struct {
 	fields     *modProfileFieldSet
 	// The scalar de-identification options are profile-wide: they have no
 	// per-modality controls, so they live here rather than in the shared set.
-	dob, uidSfx, shiftDays *widget.Entry
-	fixvr                  *widget.Select
-	privCheck              *widget.Check
-	remapCheck             *widget.Check
-	uidSuffixLabel         *widget.Label
-	tsSelect               *widget.Select
-	zipCheck               *widget.Check
-	ignoreTypesEntry       *widget.Entry
-	ignoreModsEntry        *widget.Entry
+	dob, shiftDays   *widget.Entry
+	fixvr            *widget.Select
+	privCheck        *widget.Check
+	overlaysCheck    *widget.Check
+	remapCheck       *widget.Check
+	tsSelect         *widget.Select
+	zipCheck         *widget.Check
+	ignoreTypesEntry *widget.Entry
+	ignoreModsEntry  *widget.Entry
 	// perMod is the working copy edited through the per-modality sub-editor.
 	// The shallow clone is safe because sub-editor saves always build fresh
 	// slices (updated := orig, whole-field overwrites) rather than mutating
@@ -235,10 +202,6 @@ func newModProfileEditor(name string, p ModProfile, cfg ModProfileConfig) *modPr
 	e.dob.SetText(p.DOB)
 	e.dob.SetPlaceHolder("YYYYMMDD — empty = no masking")
 
-	e.uidSfx = widget.NewEntry()
-	e.uidSfx.SetText(p.UIDSuffix)
-	e.uidSfx.SetPlaceHolder("digits 1-9 — empty = none")
-
 	e.shiftDays = widget.NewEntry()
 	e.shiftDays.SetText(p.ShiftDays)
 	e.shiftDays.SetPlaceHolder("e.g. -45 — shifts all dates except birth date")
@@ -253,13 +216,11 @@ func newModProfileEditor(name string, p ModProfile, cfg ModProfileConfig) *modPr
 	e.privCheck = widget.NewCheck("", nil)
 	e.privCheck.SetChecked(p.Priv)
 
-	// Remap UIDs and a UID suffix are mutually exclusive, so the suffix
-	// control (sharing the Remap UIDs form row) is disabled — label greyed —
-	// while remap is checked; validate() clears the inert text on save.
+	e.overlaysCheck = widget.NewCheck("", nil)
+	e.overlaysCheck.SetChecked(p.NoOverlays)
+
 	e.remapCheck = widget.NewCheck("", nil)
 	e.remapCheck.SetChecked(p.RemapUIDs)
-	e.uidSuffixLabel = widget.NewLabel("UID suffix")
-	syncUIDSuffixEnabled(e.remapCheck, e.uidSuffixLabel, e.uidSfx)
 
 	e.tsSelect = widget.NewSelect(modProfileTSLabels, nil)
 	e.tsSelect.SetSelected(transferSyntaxPrefLabel(p.TransferSyntax))
@@ -301,18 +262,14 @@ func (e *modProfileEditor) validate() (string, ModProfile, error) {
 	if err != nil {
 		return "", ModProfile{}, err
 	}
-	uidSfx, err := validateUIDSuffix(e.uidSfx.Text)
-	if err != nil {
-		return "", ModProfile{}, err
-	}
 	shift, err := validateShiftDays(e.shiftDays.Text)
 	if err != nil {
 		return "", ModProfile{}, err
 	}
 	updated.DOB = dob
-	updated.UIDSuffix = uidSfx
 	updated.ShiftDays = shift
 	updated.Priv = e.privCheck.Checked
+	updated.NoOverlays = e.overlaysCheck.Checked
 	if sel := e.fixvr.Selected; sel == "" || sel == fixvrOffLabel {
 		updated.FixVR = ""
 	} else {
@@ -324,12 +281,6 @@ func (e *modProfileEditor) validate() (string, ModProfile, error) {
 		updated.Base = sel
 	}
 	updated.RemapUIDs = e.remapCheck.Checked
-	if updated.RemapUIDs {
-		// The suffix entry is disabled while Remap UIDs is checked; any text
-		// left in it is inert and must not reach the stored profile — the
-		// engine rejects the combination.
-		updated.UIDSuffix = ""
-	}
 	updated.TransferSyntax = transferSyntaxPrefFromLabel(e.tsSelect.Selected)
 	updated.Zip = e.zipCheck.Checked
 	// The engine matches these filters against ImageType/Modality components
@@ -486,11 +437,11 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 		widget.NewFormItem("Keep tags",
 			tagListField(a, win, ed.fields.keep, "Choose tags to keep"))))
 
-	uidRow := uidSuffixRow(ed.remapCheck, ed.uidSuffixLabel, ed.uidSfx)
 	optionsForm := widget.NewForm(
 		widget.NewFormItem("Birth date mask", ed.dob),
-		widget.NewFormItem("Remap UIDs", uidRow),
+		widget.NewFormItem("Remap UIDs", ed.remapCheck),
 		widget.NewFormItem("Remove private tags", ed.privCheck),
+		widget.NewFormItem("Remove overlay planes", ed.overlaysCheck),
 		widget.NewFormItem("Shift dates (days)", ed.shiftDays),
 		widget.NewFormItem("Fix VR", ed.fixvr),
 		widget.NewFormItem("Output transfer syntax", ed.tsSelect),
@@ -571,6 +522,16 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 	perModSection := prefSection("Per-modality overrides", perModCaption, perModList, addOverrideBtn)
 
 	sections := []fyne.CanvasObject{topRow, tagSection, optionsSection, maskSection, filtersSection, perModSection}
+	// A profile still carrying the removed uid-suffix option cannot run, and
+	// this editor deliberately has no control for it — the entry is preserved,
+	// disclosed here, and refused by compileModifyParams with the same advice.
+	if p.UIDSuffix != "" {
+		warn := widget.NewLabel(fmt.Sprintf("This profile sets uid (UID suffix %q), an option that has been removed. "+
+			"Runs of it will fail until the entry is deleted from profiles.json — Remap UIDs is its replacement.", p.UIDSuffix))
+		warn.TextStyle = fyne.TextStyle{Italic: true}
+		warn.Wrapping = fyne.TextWrapWord
+		sections = append(sections, warn)
+	}
 	var preserved []string
 	if p.KeepPrivate {
 		preserved = append(preserved, "keepprivate (honored only inside per-modality overrides)")
@@ -705,9 +666,6 @@ func perModalityPreservedNote(p ModProfile) fyne.CanvasObject {
 	if p.DOB != "" {
 		profileWide = append(profileWide, "dob")
 	}
-	if p.UIDSuffix != "" {
-		profileWide = append(profileWide, "uid")
-	}
 	if p.ShiftDays != "" {
 		profileWide = append(profileWide, "shiftdays")
 	}
@@ -725,6 +683,9 @@ func perModalityPreservedNote(p ModProfile) fyne.CanvasObject {
 	}
 	if p.RemapUIDs {
 		ignored = append(ignored, "remapuids")
+	}
+	if p.NoOverlays {
+		ignored = append(ignored, "nooverlays")
 	}
 	if p.Zip {
 		ignored = append(ignored, "zip")
@@ -749,6 +710,12 @@ func perModalityPreservedNote(p ModProfile) fyne.CanvasObject {
 	}
 
 	var notes []fyne.CanvasObject
+	if p.UIDSuffix != "" {
+		// Not "preserved" like the rest: the option is removed, and a profile
+		// carrying it anywhere is refused at run time.
+		notes = append(notes, italic(fmt.Sprintf("uid (UID suffix %q) is set on this override — the option has been "+
+			"removed, and this profile will fail to run until the entry is deleted from profiles.json.", p.UIDSuffix)))
+	}
 	if len(profileWide) > 0 {
 		notes = append(notes, italic("Set on this override and still applied, but managed at the profile level "+
 			"rather than per modality: "+strings.Join(profileWide, ", ")))

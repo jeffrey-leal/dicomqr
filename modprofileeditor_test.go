@@ -34,22 +34,6 @@ func TestModProfileScalarValidators(t *testing.T) {
 			}
 		}
 	})
-	t.Run("uid suffix", func(t *testing.T) {
-		for _, tc := range []struct {
-			in, want string
-			ok       bool
-		}{
-			{"", "", true},
-			{" 129 ", "129", true},
-			{"0", "", false},
-			{"a", "", false},
-		} {
-			got, err := validateUIDSuffix(tc.in)
-			if (err == nil) != tc.ok || got != tc.want {
-				t.Errorf("validateUIDSuffix(%q) = %q, %v; want %q, ok=%v", tc.in, got, err, tc.want, tc.ok)
-			}
-		}
-	})
 	t.Run("shift days", func(t *testing.T) {
 		for _, tc := range []struct {
 			in, want string
@@ -335,47 +319,22 @@ func TestModProfileEditorValidationErrors(t *testing.T) {
 	}
 }
 
-// TestModProfileEditorRemapDisablesSuffix covers the Remap UIDs / UID suffix
-// mutual exclusion in the editor: checking remap disables the suffix entry and
-// greys its label, saving with remap checked stores an empty suffix (the
-// disabled entry's text is inert), and unchecking restores the typed suffix.
-func TestModProfileEditorRemapDisablesSuffix(t *testing.T) {
+// TestModProfileEditorPreservesRemovedUIDSuffix: the uid suffix option is
+// removed and the editor has no control for it, so a profile still carrying
+// one must round-trip through the editor untouched — the entry stays visible
+// to compileModifyParams, which is what refuses to run it. Silently stripping
+// it here would turn "refused loudly" into "sailed through without the UID
+// change its author asked for".
+func TestModProfileEditorPreservesRemovedUIDSuffix(t *testing.T) {
 	test.NewApp()
-	p := ModProfile{UIDSuffix: "7"}
+	p := ModProfile{UIDSuffix: "7", Sets: []string{"0010,0010=X"}}
 	ed := newModProfileEditor("a", p, ModProfileConfig{"a": p})
-
-	if ed.uidSfx.Disabled() {
-		t.Fatalf("suffix entry disabled while remap is unchecked")
-	}
-	if ed.uidSuffixLabel.Importance == widget.LowImportance {
-		t.Fatalf("suffix label greyed while remap is unchecked")
-	}
-
-	ed.remapCheck.SetChecked(true)
-	if !ed.uidSfx.Disabled() {
-		t.Errorf("suffix entry still enabled with remap checked")
-	}
-	if ed.uidSuffixLabel.Importance != widget.LowImportance {
-		t.Errorf("suffix label not greyed with remap checked")
-	}
 	_, updated, err := ed.validate()
 	if err != nil {
-		t.Fatalf("validate with remap checked: %v", err)
+		t.Fatalf("validate: %v", err)
 	}
-	if !updated.RemapUIDs || updated.UIDSuffix != "" {
-		t.Errorf("saved remap=%v suffix=%q, want remap with cleared suffix", updated.RemapUIDs, updated.UIDSuffix)
-	}
-
-	ed.remapCheck.SetChecked(false)
-	if ed.uidSfx.Disabled() {
-		t.Errorf("suffix entry still disabled after unchecking remap")
-	}
-	_, updated, err = ed.validate()
-	if err != nil {
-		t.Fatalf("validate with remap unchecked: %v", err)
-	}
-	if updated.RemapUIDs || updated.UIDSuffix != "7" {
-		t.Errorf("saved remap=%v suffix=%q, want suffix 7 restored", updated.RemapUIDs, updated.UIDSuffix)
+	if updated.UIDSuffix != "7" {
+		t.Errorf("UIDSuffix = %q after an editor round-trip, want the entry preserved", updated.UIDSuffix)
 	}
 }
 
