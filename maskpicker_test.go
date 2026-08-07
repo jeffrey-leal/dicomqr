@@ -10,6 +10,7 @@ import (
 	"image"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -176,8 +177,11 @@ func TestPixelRectsToRegions(t *testing.T) {
 	}
 }
 
-// writeSizedTestDICOM writes a minimal file of the given modality and size.
-func writeSizedTestDICOM(t *testing.T, path, modality string, cols, rows int) {
+// writeSizedTestDICOM writes a minimal file of the given modality, size, and
+// series identity. An empty seriesUID omits the series elements entirely, so a
+// file with no series information stays testable.
+func writeSizedTestDICOM(t *testing.T, path, modality string, cols, rows int,
+	seriesUID string, seriesNum, instance int) {
 	t.Helper()
 	nf := frame.NewNativeFrame[uint8](8, rows, cols, cols*rows, 1)
 	pd, err := sdicom.NewElement(tag.PixelData, sdicom.PixelDataInfo{
@@ -186,7 +190,7 @@ func writeSizedTestDICOM(t *testing.T, path, modality string, cols, rows int) {
 	if err != nil {
 		t.Fatalf("NewElement(PixelData): %v", err)
 	}
-	ds := sdicom.Dataset{Elements: []*sdicom.Element{
+	elems := []*sdicom.Element{
 		mustTestElement(t, tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.7"}),
 		mustTestElement(t, tag.MediaStorageSOPInstanceUID, []string{"1.2.3." + filepath.Base(path)}),
 		mustTestElement(t, tag.TransferSyntaxUID, []string{tsExplicitVRLE}),
@@ -201,8 +205,16 @@ func writeSizedTestDICOM(t *testing.T, path, modality string, cols, rows int) {
 		mustTestElement(t, tag.HighBit, []int{7}),
 		mustTestElement(t, tag.PixelRepresentation, []int{0}),
 		mustTestElement(t, tag.SamplesPerPixel, []int{1}),
-		pd,
-	}}
+	}
+	if seriesUID != "" {
+		elems = append(elems,
+			mustTestElement(t, tag.SeriesInstanceUID, []string{seriesUID}),
+			mustTestElement(t, tag.SeriesNumber, []string{strconv.Itoa(seriesNum)}),
+			mustTestElement(t, tag.InstanceNumber, []string{strconv.Itoa(instance)}),
+		)
+	}
+	elems = append(elems, pd)
+	ds := sdicom.Dataset{Elements: elems}
 	f, err := os.Create(path)
 	if err != nil {
 		t.Fatalf("create: %v", err)
@@ -213,56 +225,66 @@ func writeSizedTestDICOM(t *testing.T, path, modality string, cols, rows int) {
 	}
 }
 
-// The preview groups by modality and size, largest group first — the whole
-// point being that a study mixing sizes shows every one of them.
-func TestScanMaskGeometryClasses(t *testing.T) {
+// The preview walks series in acquisition order — geometry classes cut across
+// series in ways that read as arbitrary outside ultrasound, so the series is
+// the unit of review and the files inside it come in instance order.
+func TestScanMaskSeries(t *testing.T) {
 	dir := t.TempDir()
 	var files []string
-	add := func(name, modality string, cols, rows int) {
+	add := func(name, modality string, cols, rows int, uid string, num, instance int) {
 		p := filepath.Join(dir, name)
-		writeSizedTestDICOM(t, p, modality, cols, rows)
+		writeSizedTestDICOM(t, p, modality, cols, rows, uid, num, instance)
 		files = append(files, p)
 	}
-	add("us1.dcm", "US", 800, 600)
-	add("us2.dcm", "US", 800, 600)
-	add("us3.dcm", "US", 800, 600)
-	add("sc1.dcm", "SC", 1024, 768)
-	add("ct1.dcm", "CT", 512, 512)
-	add("ct2.dcm", "CT", 512, 512)
+	// Written deliberately out of order: the scan must order by series number
+	// and instance number, never by path or arrival.
+	add("b2.dcm", "CT", 512, 512, "1.2.3.2", 2, 2)
+	add("b1.dcm", "CT", 512, 512, "1.2.3.2", 2, 1)
+	add("a3.dcm", "US", 800, 600, "1.2.3.1", 1, 3)
+	add("a1.dcm", "US", 800, 600, "1.2.3.1", 1, 1)
+	add("a2.dcm", "US", 800, 600, "1.2.3.1", 1, 2)
+	add("c1.dcm", "SC", 1024, 768, "1.2.3.9", 9, 1)
 
-	classes := scanMaskGeometryClasses(files, nil)
-	if len(classes) != 3 {
-		t.Fatalf("classes = %d (%+v), want 3", len(classes), classes)
+	series, skipped := scanMaskSeries(files, nil)
+	if skipped != 0 {
+		t.Fatalf("skipped = %d, want 0", skipped)
 	}
-	if classes[0].modality != "US" || classes[0].count() != 3 || classes[0].cols != 800 {
-		t.Errorf("first class = %+v, want the 3 ultrasound files", classes[0])
+	if len(series) != 3 {
+		t.Fatalf("series = %d (%+v), want 3", len(series), series)
 	}
-	if classes[1].modality != "CT" || classes[1].count() != 2 {
-		t.Errorf("second class = %+v, want the 2 CT files", classes[1])
+	if series[0].modality != "US" || series[0].count() != 3 || series[0].number != 1 {
+		t.Errorf("first series = %+v, want the 3-file ultrasound series", series[0])
+	}
+	for i, f := range series[0].files {
+		if f.instance != i+1 {
+			t.Errorf("US file %d has instance %d — files must be in instance order", i, f.instance)
+		}
+	}
+	if series[1].modality != "CT" || series[1].count() != 2 || series[1].files[0].instance != 1 {
+		t.Errorf("second series = %+v, want the CT pair in instance order", series[1])
 	}
 	// The lone secondary capture — a different size from everything else, and
 	// exactly the file a rectangle judged on the ultrasound loops would miss.
-	if classes[2].modality != "SC" || classes[2].count() != 1 || classes[2].cols != 1024 {
-		t.Errorf("third class = %+v, want the single 1024×768 capture", classes[2])
+	if series[2].modality != "SC" || series[2].count() != 1 || series[2].files[0].cols != 1024 {
+		t.Errorf("third series = %+v, want the single 1024×768 capture", series[2])
 	}
-	for _, c := range classes {
-		if len(c.files) == 0 {
-			t.Errorf("class %+v has no files to display", c)
-		}
+	if !strings.Contains(series[0].label(), "3 file(s)") || !strings.Contains(series[0].label(), "Series 1") {
+		t.Errorf("label = %q, want the series number and file count", series[0].label())
 	}
 }
 
-// Ultrasound images that state no calibrated region are their own class even
-// at identical dimensions: the two are masked by entirely different means, and
-// grouping them would hide the ones needing a rectangle among the ones that
-// need none. This is the study shape that prompted stepping through files at
-// all — 88 calibrated loops and a handful of analysis screens.
-func TestScanMaskGeometryClassesSeparatesUncalibratedUltrasound(t *testing.T) {
+// Whether an ultrasound file declares a calibrated region is read per file:
+// the window no longer groups by it, but it still decides what the note says
+// about the image on screen and what a size-scoped rectangle drawn on it means
+// (MaskScope.USRegion splits the two, because they are masked by entirely
+// different means). This is the study shape the review exists for — calibrated
+// loops with a handful of analysis screens mixed into the same series.
+func TestScanMaskSeriesReadsCalibrationPerFile(t *testing.T) {
 	dir := t.TempDir()
 	var files []string
-	add := func(name string, calibrated bool) {
+	add := func(name string, instance int, calibrated bool) {
 		p := filepath.Join(dir, name)
-		writeSizedTestDICOM(t, p, "US", 800, 600)
+		writeSizedTestDICOM(t, p, "US", 800, 600, "1.2.3.1", 1, instance)
 		if calibrated {
 			ds, err := sdicom.ParseFile(p, nil)
 			if err != nil {
@@ -280,29 +302,23 @@ func TestScanMaskGeometryClassesSeparatesUncalibratedUltrasound(t *testing.T) {
 		}
 		files = append(files, p)
 	}
-	add("loop1.dcm", true)
-	add("loop2.dcm", true)
-	add("loop3.dcm", true)
-	add("worksheet1.dcm", false)
-	add("worksheet2.dcm", false)
+	add("loop1.dcm", 1, true)
+	add("worksheet1.dcm", 2, false)
+	add("loop2.dcm", 3, true)
 
-	classes := scanMaskGeometryClasses(files, nil)
-	if len(classes) != 2 {
-		t.Fatalf("classes = %d (%+v), want the calibrated and uncalibrated groups apart", len(classes), classes)
+	series, skipped := scanMaskSeries(files, nil)
+	if skipped != 0 || len(series) != 1 || series[0].count() != 3 {
+		t.Fatalf("series = %+v (skipped %d), want one 3-file series", series, skipped)
 	}
-	if !classes[0].calibrated || classes[0].count() != 3 {
-		t.Errorf("first class = %+v, want the 3 calibrated loops", classes[0])
+	byName := map[string]bool{}
+	for _, f := range series[0].files {
+		byName[filepath.Base(f.path)] = f.calibrated
 	}
-	if classes[1].calibrated || classes[1].count() != 2 {
-		t.Errorf("second class = %+v, want the 2 analysis screens", classes[1])
+	if !byName["loop1.dcm"] || !byName["loop2.dcm"] {
+		t.Errorf("calibrated loops read as uncalibrated: %+v", byName)
 	}
-	// The label has to say why they are separate, or the split looks arbitrary.
-	if !strings.Contains(classes[1].label(), "no calibrated region") {
-		t.Errorf("label = %q, want it to name the reason", classes[1].label())
-	}
-	// Every file is kept so the window can step through them, not just one.
-	if len(classes[1].files) != 2 {
-		t.Errorf("files = %v, want both analysis screens steppable", classes[1].files)
+	if byName["worksheet1.dcm"] {
+		t.Errorf("analysis screen read as calibrated: %+v", byName)
 	}
 }
 
@@ -378,18 +394,22 @@ func TestMaskWorkingSet(t *testing.T) {
 }
 
 // An unreadable file must not sink the scan: the preview is advisory, and one
-// bad file should not stop the rest being checked.
-func TestScanMaskGeometryClassesSkipsUnreadable(t *testing.T) {
+// bad file should not stop the rest being checked. It is counted rather than
+// silently absent — the window says how many files it is not showing.
+func TestScanMaskSeriesSkipsUnreadable(t *testing.T) {
 	dir := t.TempDir()
 	good := filepath.Join(dir, "good.dcm")
-	writeSizedTestDICOM(t, good, "US", 640, 480)
+	writeSizedTestDICOM(t, good, "US", 640, 480, "1.2.3.1", 1, 1)
 	bad := filepath.Join(dir, "bad.dcm")
 	if err := os.WriteFile(bad, []byte("not a dicom file"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
-	classes := scanMaskGeometryClasses([]string{good, bad}, nil)
-	if len(classes) != 1 || classes[0].count() != 1 || classes[0].cols != 640 {
-		t.Errorf("classes = %+v, want just the readable file", classes)
+	series, skipped := scanMaskSeries([]string{good, bad}, nil)
+	if len(series) != 1 || series[0].count() != 1 || series[0].files[0].cols != 640 {
+		t.Errorf("series = %+v, want just the readable file", series)
+	}
+	if skipped != 1 {
+		t.Errorf("skipped = %d, want the unreadable file counted", skipped)
 	}
 }
