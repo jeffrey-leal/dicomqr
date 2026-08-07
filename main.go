@@ -180,9 +180,21 @@ func main() {
 		scp           *StorageSCP
 		cancelQuery   context.CancelFunc // UI-goroutine only
 		cancelConnect context.CancelFunc // UI-goroutine only
-		connCtx       context.Context
-		cancelConn    context.CancelFunc
-		connMu        sync.Mutex // guards client, scp, activeProfile, connCtx, cancelConn
+		// cancelRetrieve aborts the retrieve loop (UI-goroutine only). Non-nil
+		// only while a run is active; the run's completion closure nils it.
+		cancelRetrieve context.CancelFunc
+		// retrieveInFlight guards against overlapping retrieves (UI-goroutine
+		// only). A second run started while one is active would overwrite
+		// cancelRetrieve — orphaning the first run's cancel — share the
+		// progress bar and status label, and nest the SCP OnFileReceived
+		// interception so whichever run finished first restored the other's
+		// callback mid-flight. It stays true until the run's completion
+		// closure has executed, so a cancelled run still holds the guard while
+		// its in-flight files drain.
+		retrieveInFlight bool
+		connCtx          context.Context
+		cancelConn       context.CancelFunc
+		connMu           sync.Mutex // guards client, scp, activeProfile, connCtx, cancelConn
 
 		// refreshLocalTree re-renders the Local Browse tab tree after preferences change.
 		// Assigned once buildLocalBrowseContent is called during layout setup.
@@ -924,6 +936,14 @@ func main() {
 		if cancelQuery != nil {
 			cancelQuery()
 		}
+		// A running retrieve must not outlive the connection: without this it
+		// kept issuing C-MOVEs against a stopped SCP until the stall watchdog
+		// gave up two minutes later. Cancelling first means the association is
+		// aborted before the SCP below stops listening; the retrieve loop
+		// notices and reports "Retrieve cancelled" through its normal path.
+		if cancelRetrieve != nil {
+			cancelRetrieve()
+		}
 		s, cancelC := clearConn()
 		if cancelC != nil {
 			cancelC()
@@ -998,8 +1018,6 @@ func main() {
 		go exec.Command("explorer", cfg.DownloadDir).Start()
 	})
 
-	var cancelRetrieve context.CancelFunc
-
 	type retrieveTarget struct {
 		level     string // "STUDY" or "SERIES"
 		patientID string
@@ -1012,6 +1030,11 @@ func main() {
 	// targets without duplicating the full retrieve loop (Phase 4-E).
 	var startRetrieveTargets func(targets []retrieveTarget)
 	startRetrieveTargets = func(targets []retrieveTarget) {
+		if retrieveInFlight {
+			dialog.ShowInformation("Retrieve already running",
+				"A retrieve is already in progress.\n\nWait for it to finish, or cancel it first, then try again.", w)
+			return
+		}
 		cl := getClient()
 		sc := getSCP()
 		if getState() != stateConnected || cl == nil {
@@ -1047,6 +1070,7 @@ func main() {
 
 		ctx, cancel := context.WithCancel(context.Background())
 		cancelRetrieve = cancel
+		retrieveInFlight = true
 		progressBar.SetValue(0)
 		progressBar.Show()
 		startNoun := "studies"
@@ -1303,6 +1327,11 @@ func main() {
 				}
 			}
 			fyne.Do(func() {
+				// The run is over: release the single-retrieve guard before any
+				// dialog below can offer a retry, and drop the cancel func so a
+				// later Cancel or Disconnect is not aimed at a finished run.
+				retrieveInFlight = false
+				cancelRetrieve = nil
 				progressBar.Hide()
 				switch {
 				case cancelled && stalled.Load():
