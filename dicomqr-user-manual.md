@@ -513,7 +513,9 @@ The Import tab copies DICOM files from any folder into the organised download fo
 
 ### 9.1  Scanning a Source Folder
 
-Enter or browse to a source folder and click Scan. dicomqr walks the folder and builds a tree of studies and series found in it. The destination folder (the configured download folder) is shown read-only below the source field.
+Type a source folder into the field, or click Browse… to choose one, then click Scan. dicomqr walks the folder and builds a tree of studies and series found in it. The destination folder (the configured download folder) is shown read-only below the source field.
+
+The folder imported from is remembered: it is filled in when the application next starts, and the folder chooser opens there, so importing again from the same disc or department share is a click on Scan. Like every folder chooser in the application, it opens in front of the window that asked for it and starts at the folder currently in the field.
 
 
 ### 9.2  Selecting and Importing
@@ -741,14 +743,14 @@ Ultrasound images that declare no calibrated region are usually analysis or meas
 
 Drawing a rectangle instead of measuring one. Pick from image… beside Add region opens any DICOM file and shows it full size; drag across the image to mark an area, Undo last removes the most recent, and Apply replaces the profile's rectangles with what is on screen (Outside ultrasound region rows are left alone, having no geometry to draw). Rectangles snap to the image's own pixel grid, so what is stored is the area marked, to the nearest pixel, expressed as percentages that then apply to every image size in the study. The window also states what the file declares about itself — its size, its modality, and for ultrasound whether it carries a calibrated region, which tells you whether a rectangle is needed for that file at all.
 
-Reviewing and masking a run. The Modification dialog's Pixel masking section has a Review masking… button, and for a study with burned-in annotation this is where the work is done. It reads the header of every selected file and groups them — by modality, image size, and for ultrasound whether the file declares a calibrated region, so the analysis screens that need a rectangle are never mixed in with the loops that do not. Choose a group from the list at the top and step through its images one at a time with Previous and Next; each is shown with the areas that will be blanked drawn in black, resolved by the same code the export uses, so what is shown is what will happen.
+Reviewing and masking a run. The Modification dialog's Pixel masking section has a Review masking… button, and for a study with burned-in annotation this is where the work is done. It reads the header of every selected file and presents them series by series, in acquisition order — for an ultrasound study that is clip by clip, each clip shown at its middle frame. Every control sits beneath the image, in the order the work is done: the slider scrubs the images of the current series, Previous and Next step to another series (named beside them), and the row under those says which image is on screen. The arrow keys step a single image and Ctrl with an arrow key steps a series, for review that needs to be precise rather than quick. Each image is shown with the areas that will be blanked drawn in black, resolved by the same code the export uses, so what is shown is what will happen. Files that cannot be read, or that hold no image, are counted in the window's caption rather than silently left out.
 
 Tick Draw rectangles to mark an area on the image in front of you: drag across it and the rectangle joins the regions this run will apply. How far it reaches is set by Applies to beside it:
 
 | Applies to | Effect |
 |---|---|
-| This image only | The image on screen and no other. The default, and the right choice for an analysis or measurement screen: the next screen in the group is laid out differently, and blanking the same area there would destroy report content the export exists to keep. |
-| This group | Every image of the same modality and size — and, for ultrasound, the same answer on whether the file states its own image region. Exactly the group named at the top of the window. Use it where the layout genuinely repeats, such as a series of captures from one machine. |
+| This image only | The image on screen and no other. The default, and the right choice for an analysis or measurement screen: the next screen is laid out differently, and blanking the same area there would destroy report content the export exists to keep. |
+| Images of this size | Every image in the run with this image's modality and pixel dimensions — in this series or any other, since a like-sized image elsewhere carries the same banner in the same place. For ultrasound it also matches on whether the file states its own image region, because calibrated loops and analysis screens are masked by different means. Use it where a layout genuinely repeats, such as a series of captures from one machine. |
 | All images | Every image in the run, whatever its modality or size. The same reach a rectangle defined in the profile editor has. |
 
 Undo takes back the most recent thing added in this session, wherever it went; it never removes a region the profile arrived with. Needs no masking records that the image on screen (or its group, following the same Applies to setting) was reviewed and requires no mask — which is what lets an ultrasound image with no stated region be exported instead of failed. Step to the next image to see whether it is covered too: that loop, draw and check, is the point of the window. Use these regions applies everything marked to this run; Cancel discards it.
