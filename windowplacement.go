@@ -27,6 +27,10 @@ import (
 const (
 	spiGetWorkArea = 0x0030
 
+	// MonitorFromPoint: return the nearest monitor when the point is on none —
+	// which is exactly the unplugged-monitor case a saved position can present.
+	monitorDefaultToNearest = 0x0002
+
 	swpNoZOrder   = 0x0004
 	swpNoActivate = 0x0010
 	swpNoSize     = 0x0001
@@ -55,6 +59,8 @@ var (
 	procGetWindowTextW       = user32.NewProc("GetWindowTextW")
 	procSetWindowPos         = user32.NewProc("SetWindowPos")
 	procGetWindowRect        = user32.NewProc("GetWindowRect")
+	procMonitorFromPoint     = user32.NewProc("MonitorFromPoint")
+	procGetMonitorInfoW      = user32.NewProc("GetMonitorInfoW")
 
 	kernel32                = syscall.NewLazyDLL("kernel32.dll")
 	procGetCurrentProcessID = kernel32.NewProc("GetCurrentProcessId")
@@ -117,9 +123,10 @@ func mainWindowPlacement(area, cur winRect, saved *winPoint,
 }
 
 // screenWorkArea returns the primary monitor's work area — the desktop minus
-// the taskbar and any other appbars — in physical pixels. On a multi-monitor
-// setup this is the primary display, which is where a freshly launched window
-// lands anyway.
+// the taskbar and any other appbars — in physical pixels. This is the default
+// placement's frame of reference: a freshly launched window lands on the
+// primary display. A saved position is clamped against its own monitor
+// instead — see monitorWorkAreaAt.
 func screenWorkArea() (winRect, bool) {
 	var r winRect
 	ret, _, _ := procSystemParametersInfo.Call(
@@ -128,6 +135,38 @@ func screenWorkArea() (winRect, bool) {
 		return winRect{}, false
 	}
 	return r, true
+}
+
+// winMonitorInfo mirrors the Windows MONITORINFO struct.
+type winMonitorInfo struct {
+	cbSize    uint32
+	rcMonitor winRect
+	rcWork    winRect
+	dwFlags   uint32
+}
+
+// monitorWorkAreaAt returns the work area of the monitor containing p — or the
+// nearest monitor when p is on none, which is what a position saved on a
+// display that has since been unplugged resolves to. Radiology setups are
+// multi-monitor as a rule, so a saved position must be judged against the
+// monitor it names: clamping it into the primary work area (the previous
+// behaviour) yanked a window parked on the second display back to the first on
+// every launch.
+func monitorWorkAreaAt(p winPoint) (winRect, bool) {
+	// MonitorFromPoint takes a POINT by value; on amd64 the two int32s travel
+	// as one 8-byte argument, X in the low half.
+	pt := uintptr(uint32(p.X)) | uintptr(uint32(p.Y))<<32
+	hmon, _, _ := procMonitorFromPoint.Call(pt, uintptr(monitorDefaultToNearest))
+	if hmon == 0 {
+		return winRect{}, false
+	}
+	var mi winMonitorInfo
+	mi.cbSize = uint32(unsafe.Sizeof(mi))
+	ret, _, _ := procGetMonitorInfoW.Call(hmon, uintptr(unsafe.Pointer(&mi)))
+	if ret == 0 || mi.rcWork.Right <= mi.rcWork.Left || mi.rcWork.Bottom <= mi.rcWork.Top {
+		return winRect{}, false
+	}
+	return mi.rcWork, true
 }
 
 // findProcessWindow returns the handle of a visible top-level window owned by
@@ -190,6 +229,15 @@ func placeMainWindow(title string, saved *winPoint, widthFrac, heightFrac float6
 		if !ok {
 			logWarn("window placement: work area unavailable; leaving the window where Windows put it")
 			return
+		}
+		// A saved position is judged against the monitor it sits on (or the
+		// nearest, once that monitor is gone), not the primary: otherwise a
+		// window parked on a second display comes home to the first on every
+		// launch. The default placement keeps the primary work area.
+		if saved != nil {
+			if monArea, monOK := monitorWorkAreaAt(*saved); monOK {
+				area = monArea
+			}
 		}
 
 		var hwnd uintptr
