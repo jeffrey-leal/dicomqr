@@ -23,7 +23,6 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/widget"
-	sqweekdialog "github.com/sqweek/dialog"
 	"github.com/suyashkumar/dicom/pkg/tag"
 )
 
@@ -430,13 +429,10 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		}
 	}
 	changeOutDirBtn := widget.NewButton("Change…", func() {
+		start := chosenOutDir
 		go func() {
-			picker := sqweekdialog.Directory().Title("Choose output folder for modified files")
-			if chosenOutDir != "" {
-				picker = picker.SetStartDir(chosenOutDir)
-			}
-			dir, derr := picker.Browse()
-			if derr != nil {
+			dir, ok := browseFolder(win.Title(), "Choose output folder for modified files", start)
+			if !ok {
 				return // picker cancelled
 			}
 			fyne.Do(func() {
@@ -581,9 +577,8 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		// No output folder configured yet — ask once; the choice is persisted
 		// as the default so later runs skip the picker.
 		go func() {
-			picker := sqweekdialog.Directory().Title("Choose output folder for modified files")
-			outDir, derr := picker.Browse()
-			if derr != nil {
+			outDir, ok := browseFolder(win.Title(), "Choose output folder for modified files", cfg.ModifyOutputDir)
+			if !ok {
 				return // picker cancelled
 			}
 			fyne.Do(func() {

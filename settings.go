@@ -93,6 +93,12 @@ type Settings struct {
 	// tag viewer's Export Tags… save dialog, and the format applied when the
 	// typed filename has no extension.
 	ExportFormat string `json:"exportFormat"`
+
+	// ImportSourceDir is the folder the Import tab last imported from. It
+	// pre-fills the source field at startup and is where its folder chooser
+	// opens, so importing repeatedly from one place (a CD drive, a
+	// department share) does not mean navigating there every session.
+	ImportSourceDir string `json:"importSourceDir,omitempty"`
 }
 
 func appSettingsDir() (string, error) {

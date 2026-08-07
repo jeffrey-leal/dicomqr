@@ -364,9 +364,10 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 	downloadDirEntry.SetText(cfg.DownloadDir)
 	downloadDirEntry.SetPlaceHolder("Select download folder…")
 	dirBrowseBtn := widget.NewButton("Browse…", func() {
+		start := strings.TrimSpace(downloadDirEntry.Text)
 		go func() {
-			dir, err := sqweekdialog.Directory().Browse()
-			if err != nil {
+			dir, ok := browseFolder(w.Title(), "Choose the download folder", start)
+			if !ok {
 				return
 			}
 			fyne.Do(func() { downloadDirEntry.SetText(dir) })
@@ -620,9 +621,10 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 	modOutDirEntry.SetText(cfg.ModifyOutputDir)
 	modOutDirEntry.SetPlaceHolder("No default — the first folder chosen in the Modification dialog is saved here")
 	modOutBrowseBtn := widget.NewButton("Browse…", func() {
+		start := strings.TrimSpace(modOutDirEntry.Text)
 		go func() {
-			dir, err := sqweekdialog.Directory().Title("Choose default output folder for modified files").Browse()
-			if err != nil {
+			dir, ok := browseFolder(w.Title(), "Choose default output folder for modified files", start)
+			if !ok {
 				return
 			}
 			fyne.Do(func() { modOutDirEntry.SetText(dir) })

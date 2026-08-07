@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -13,7 +12,6 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	sqweekdialog "github.com/sqweek/dialog"
 	sdicom "github.com/suyashkumar/dicom"
 	"github.com/suyashkumar/dicom/pkg/tag"
 )
@@ -160,6 +158,9 @@ func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, 
 
 	srcEntry := widget.NewEntry()
 	srcEntry.SetPlaceHolder("Source folder containing DICOM files to import…")
+	// Opens on the folder last imported from, so a repeat import from the same
+	// share or disc is a click on Scan rather than a navigation.
+	srcEntry.SetText(cfg.ImportSourceDir)
 
 	scanBtn := widget.NewButton("Scan", func() {
 		dir := strings.TrimSpace(srcEntry.Text)
@@ -205,22 +206,28 @@ func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, 
 
 	srcEntry.OnSubmitted = func(_ string) { scanBtn.OnTapped() }
 
-	browseBtn := widget.NewButton("Browse…", func() {
+	// One button, labelled and iconed, for choosing the source folder. There
+	// were two: this one, and a folder icon that opened the source folder in
+	// Windows Explorer — which did nothing at all until a folder had been
+	// chosen, so on a freshly opened tab (the only state it is ever seen in)
+	// it read as broken. The Explorer shortcut is not worth a second
+	// folder-shaped button beside the one that matters.
+	browseBtn := widget.NewButtonWithIcon("Browse…", theme.FolderOpenIcon(), func() {
+		start := strings.TrimSpace(srcEntry.Text)
+		if start == "" {
+			start = cfg.ImportSourceDir
+		}
 		go func() {
-			dir, err := sqweekdialog.Directory().Browse()
-			if err != nil {
+			dir, ok := browseFolder(w.Title(), "Choose the folder to import from", start)
+			if !ok {
 				return
 			}
-			fyne.Do(func() { srcEntry.SetText(dir) })
+			fyne.Do(func() {
+				srcEntry.SetText(dir)
+				cfg.ImportSourceDir = dir
+				saveSettings(*cfg)
+			})
 		}()
-	})
-
-	openSrcBtn := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {
-		dir := strings.TrimSpace(srcEntry.Text)
-		if dir == "" {
-			return
-		}
-		go exec.Command("explorer", dir).Start()
 	})
 
 	destLabel := widget.NewLabel(cfg.DownloadDir)
@@ -336,7 +343,7 @@ func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, 
 	topBar := container.NewVBox(
 		container.NewBorder(nil, nil,
 			widget.NewLabel("Source:"),
-			container.NewHBox(openSrcBtn, browseBtn, scanBtn),
+			container.NewHBox(browseBtn, scanBtn),
 			srcEntry,
 		),
 		container.NewBorder(nil, nil,
