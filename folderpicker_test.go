@@ -146,11 +146,23 @@ func TestComCallDispatchesThroughVtable(t *testing.T) {
 		return 7
 	})
 
+	// The fake object must sit at an address the runtime will never change:
+	// the stub records self as a raw integer, and the callback re-entering Go
+	// can grow the goroutine stack, relocating stack-built locals out from
+	// under that comparison (-race makes this deterministic — its larger
+	// frames force the growth). A real COM object lives in native memory;
+	// pinned heap allocations are the Go-memory equivalent.
+	var pin runtime.Pinner
+	defer pin.Unpin()
+
 	// An object is a pointer to a vtable pointer; slot 3 is the one called.
-	vtbl := [32]uintptr{}
+	vtbl := new([32]uintptr)
 	vtbl[3] = stub
-	vtblPtr := unsafe.Pointer(&vtbl)
-	obj := unsafe.Pointer(&vtblPtr)
+	pin.Pin(vtbl)
+	vtblPtr := new(unsafe.Pointer)
+	*vtblPtr = unsafe.Pointer(vtbl)
+	pin.Pin(vtblPtr)
+	obj := unsafe.Pointer(vtblPtr)
 
 	if ret := comCall(obj, 3, 42); ret != 7 {
 		t.Errorf("comCall returned %d, want the stub's 7", ret)
