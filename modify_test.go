@@ -34,34 +34,31 @@ func TestResolveModProfileEmbeddedDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve base-deident: %v", err)
 	}
-	if len(base.Sets) != 4 {
-		t.Errorf("base-deident sets = %d, want 4", len(base.Sets))
+	// The set values lead with Patient Name — the order the profile stores is
+	// the order the editor and the Modification dialog present.
+	if len(base.Sets) != 4 || base.Sets[0] != "0010,0010=ANON" {
+		t.Errorf("base-deident sets = %v, want 4 entries led by Patient Name", base.Sets)
 	}
-	if base.DOB != "YYYY0101" || !base.Priv || !base.RemapUIDs || base.FixVR != "correct" {
-		t.Errorf("base-deident options = dob %q priv %v remap %v fixvr %q",
-			base.DOB, base.Priv, base.RemapUIDs, base.FixVR)
+	if base.DOB != "YYYY0101" || !base.Priv || !base.RemapUIDs || base.FixVR != "correct" || !base.NoOverlays {
+		t.Errorf("base-deident options = dob %q priv %v remap %v fixvr %q nooverlays %v",
+			base.DOB, base.Priv, base.RemapUIDs, base.FixVR, base.NoOverlays)
+	}
+	if want := []string{"SR", "PR", "KO", "OT"}; !slices.Equal(base.IgnoreModalities, want) {
+		t.Errorf("base-deident ignoremodality = %v, want %v", base.IgnoreModalities, want)
 	}
 
-	keepOrder, err := resolveModProfile("base-deident-keep-order", profiles)
+	// deident-US layers the calibrated-ultrasound mask rule on the base
+	// profile; everything else is inherited unchanged.
+	us, err := resolveModProfile("deident-US", profiles)
 	if err != nil {
-		t.Fatalf("resolve base-deident-keep-order: %v", err)
+		t.Fatalf("resolve deident-US: %v", err)
 	}
-	// The derived profile keeps the 29 Group-0040 workflow tags: its effective
-	// removal list must be exactly that much shorter, with no 0040,xxxx entry
-	// from the keep list surviving.
-	if want := len(base.Removes) - 29; len(keepOrder.Removes) != want {
-		t.Errorf("keep-order removes = %d, want %d", len(keepOrder.Removes), want)
+	if len(us.MaskRegions) != 1 || maskRegionMode(us.MaskRegions[0]) != maskModeOutsideUS {
+		t.Errorf("deident-US mask regions = %+v, want one %s rule", us.MaskRegions, maskModeOutsideUS)
 	}
-	for _, r := range keepOrder.Removes {
-		for _, k := range profiles["base-deident-keep-order"].Keep {
-			if strings.EqualFold(strings.TrimSpace(r), strings.TrimSpace(k)) {
-				t.Errorf("kept tag %q still present in removal list", r)
-			}
-		}
-	}
-	// Inherited scalars/booleans survive the merge.
-	if keepOrder.DOB != "YYYY0101" || !keepOrder.RemapUIDs {
-		t.Errorf("keep-order inherited options = dob %q remap %v", keepOrder.DOB, keepOrder.RemapUIDs)
+	if us.DOB != "YYYY0101" || !us.RemapUIDs || !us.NoOverlays || len(us.Removes) != len(base.Removes) {
+		t.Errorf("deident-US inherited options = dob %q remap %v nooverlays %v removes %d (base %d)",
+			us.DOB, us.RemapUIDs, us.NoOverlays, len(us.Removes), len(base.Removes))
 	}
 }
 
@@ -191,7 +188,15 @@ func TestPathWithinDir(t *testing.T) {
 
 // writeModifyTestDICOM writes a native 8-bit file carrying patient identity,
 // a removable tag, and (when the library allows creating one) a private tag.
+// writeModifyTestDICOM writes the fixture as CT — a modality the shipped
+// base-deident processes. Its ignoremodality list skips SR/PR/KO/OT, so the
+// fixture's original OT made every end-to-end run of the shipped profile a
+// silent skip; tests that need an excluded modality ask for it explicitly.
 func writeModifyTestDICOM(t *testing.T, path string) (hasPrivate bool) {
+	return writeModifyTestDICOMModality(t, path, "CT")
+}
+
+func writeModifyTestDICOMModality(t *testing.T, path, modality string) (hasPrivate bool) {
 	t.Helper()
 	nf := frame.NewNativeFrame[uint8](8, 2, 2, 4, 1)
 	copy(nf.RawData, []uint8{10, 20, 30, 40})
@@ -213,7 +218,7 @@ func writeModifyTestDICOM(t *testing.T, path string) (hasPrivate bool) {
 		mustTestElement(t, tag.PatientBirthDate, []string{"19800615"}),
 		mustTestElement(t, tag.AccessionNumber, []string{"ACC42"}),
 		mustTestElement(t, tag.InstitutionName, []string{"GENERAL HOSPITAL"}),
-		mustTestElement(t, tag.Modality, []string{"OT"}),
+		mustTestElement(t, tag.Modality, []string{modality}),
 		mustTestElement(t, tag.StudyDate, []string{"20240102"}),
 		mustTestElement(t, tag.AcquisitionDateTime, []string{"20240102093000.000000+0000"}),
 		// A sequence carrying a date proves the shift recurses; 0008,1140 is not
@@ -436,6 +441,28 @@ func TestRunModificationBaseDeident(t *testing.T) {
 	}
 }
 
+// The shipped profile's ignoremodality list (SR/PR/KO/OT) skips such files
+// rather than exporting them — a skip, never a failure.
+func TestRunModificationBaseDeidentSkipsOT(t *testing.T) {
+	profiles := embeddedModConfigs(t)
+	resolved, err := resolveModProfile("base-deident", profiles)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	params, err := compileModifyParams(resolved)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	rootDir := t.TempDir()
+	srcPath := filepath.Join(rootDir, "ot.dcm")
+	writeModifyTestDICOMModality(t, srcPath, "OT")
+	res := runModification(context.Background(), []string{srcPath}, rootDir, t.TempDir(), params, nil, nil)
+	if res.Skipped != 1 || res.Processed != 0 || res.Failed != 0 {
+		t.Fatalf("result = %+v, want the OT file skipped", res)
+	}
+}
+
 func TestRunModificationToZip(t *testing.T) {
 	profiles := embeddedModConfigs(t)
 	resolved, err := resolveModProfile("base-deident", profiles)
@@ -655,7 +682,7 @@ func writeEncapsulatedTestDICOM(t *testing.T, path, transferSyntax string) {
 		mustTestElement(t, tag.SOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.7"}),
 		mustTestElement(t, tag.SOPInstanceUID, []string{"1.2.3.4.9"}),
 		mustTestElement(t, tag.PatientName, []string{"DOE^JANE"}),
-		mustTestElement(t, tag.Modality, []string{"OT"}),
+		mustTestElement(t, tag.Modality, []string{"CT"}),
 		mustTestElement(t, tag.PhotometricInterpretation, []string{"MONOCHROME2"}),
 		mustTestElement(t, tag.Rows, []int{2}),
 		mustTestElement(t, tag.Columns, []int{2}),
@@ -922,11 +949,11 @@ func TestRunModificationShiftDaysPerModality(t *testing.T) {
 
 	rootDir := t.TempDir()
 	srcPath := filepath.Join(rootDir, "img1.dcm")
-	writeModifyTestDICOM(t, srcPath) // fixture Modality is OT
+	writeModifyTestDICOM(t, srcPath) // fixture Modality is CT
 
 	params, err := compileModifyParams(ModProfile{
 		ShiftDays:   "-45",
-		PerModality: map[string]ModProfile{"OT": {ShiftDays: "10"}},
+		PerModality: map[string]ModProfile{"CT": {ShiftDays: "10"}},
 	})
 	if err != nil {
 		t.Fatalf("compile: %v", err)
@@ -952,7 +979,7 @@ func TestRunModificationShiftDaysPerModality(t *testing.T) {
 	// file: compileModifyParams only validates the top-level value.
 	params, err = compileModifyParams(ModProfile{
 		Sets:        []string{"0010,0010=X"},
-		PerModality: map[string]ModProfile{"OT": {ShiftDays: "x"}},
+		PerModality: map[string]ModProfile{"CT": {ShiftDays: "x"}},
 	})
 	if err != nil {
 		t.Fatalf("compile with bad override: %v", err)
