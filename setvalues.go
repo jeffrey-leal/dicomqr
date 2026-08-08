@@ -11,7 +11,6 @@ package main
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	"fyne.io/fyne/v2"
@@ -46,35 +45,20 @@ type setValueList struct {
 	box    *fyne.Container
 }
 
-// newSetValueList builds the list from a profile's stored Sets.
+// newSetValueList builds the list from a profile's stored Sets, in the order
+// the profile stores them. The rows were briefly sorted by group then element;
+// reverted, because the stored order is the author's presentation choice — the
+// shipped base-deident leads with Patient Name and the Patient ID that follows
+// it, which sorting filed behind a blank Accession Number — and it is the
+// order the Modification dialog already presents. Sorting also meant Apply
+// rewrote a hand-ordered profile even when nothing was edited.
 func newSetValueList(sets []string) *setValueList {
 	l := &setValueList{box: container.NewVBox()}
 	for _, s := range sets {
 		l.rows = append(l.rows, newSetValueRow(s))
 	}
-	l.sortRows()
 	l.rebuild()
 	return l
-}
-
-// sortRows orders the rows by group then element, which is the order a DICOM
-// reader expects and the order the Remove and Keep lists already read in. Rows
-// whose reference does not parse sort last and keep their relative order —
-// there is nothing to sort them by, and they need to stay visible to be fixed.
-func (l *setValueList) sortRows() {
-	sort.SliceStable(l.rows, func(i, j int) bool {
-		a, b := l.rows[i], l.rows[j]
-		if a.ok != b.ok {
-			return a.ok
-		}
-		if !a.ok {
-			return false
-		}
-		if a.t.Group != b.t.Group {
-			return a.t.Group < b.t.Group
-		}
-		return a.t.Element < b.t.Element
-	})
 }
 
 // attach supplies the app and the window the tag picker is opened against.
@@ -148,7 +132,9 @@ func (l *setValueList) rebuild() {
 
 // chooseTags opens the tag picker with the current tags checked, so it both
 // adds rows and — by unchecking — removes them. A tag already present keeps its
-// value; a newly checked one starts empty.
+// value; a newly checked one starts empty. Row order follows the refs the
+// picker hands back — mergeTagSelection keeps surviving entries in their
+// stored positions and appends additions in dictionary order.
 func (l *setValueList) chooseTags() {
 	if l.a == nil || l.parent == nil {
 		return // not attached to a window (tests)
@@ -175,7 +161,6 @@ func (l *setValueList) chooseTags() {
 				rows = append(rows, newSetValueRow(canonical+"="))
 			}
 			l.rows = rows
-			l.sortRows()
 			l.rebuild()
 		})
 }

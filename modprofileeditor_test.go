@@ -156,36 +156,38 @@ func TestModProfileEditorRoundTrip(t *testing.T) {
 	}
 }
 
-// Set rows read in group-then-element order regardless of how the profile
-// stored them, which is the order the Remove and Keep lists already use.
-func TestSetValueListSortsRows(t *testing.T) {
+// Set rows read back in the order the profile stores them. The order is the
+// author's presentation choice — the shipped base-deident leads with Patient
+// Name, not with a tag-number sort's blank Accession Number — and preserving
+// it is also what keeps Apply from rewriting an unedited profile reordered.
+func TestSetValueListKeepsProfileOrder(t *testing.T) {
 	test.NewApp()
-	l := newSetValueList([]string{
+	stored := []string{
 		"0040,1008=Y",
 		"0010,0020=[0010,0010]",
 		"0008,0050=",
 		"0010,0010=ANON",
-	})
+	}
+	l := newSetValueList(stored)
 	got, err := l.entries()
 	if err != nil {
 		t.Fatalf("entries: %v", err)
 	}
-	want := []string{"0008,0050=", "0010,0010=ANON", "0010,0020=[0010,0010]", "0040,1008=Y"}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("entries = %v, want them sorted %v", got, want)
+	if !reflect.DeepEqual(got, stored) {
+		t.Errorf("entries = %v, want the stored order %v", got, stored)
 	}
 }
 
-// A row whose reference does not parse cannot be sorted and must not vanish:
-// it sorts last and is still reported on save.
-func TestSetValueListKeepsUnparsableRowsLast(t *testing.T) {
+// A row whose reference does not parse must not vanish: it stays where the
+// profile put it and is still reported on save.
+func TestSetValueListKeepsUnparsableRows(t *testing.T) {
 	test.NewApp()
 	l := newSetValueList([]string{"garbage=X", "0010,0010=ANON"})
 	if len(l.rows) != 2 {
 		t.Fatalf("rows = %d, want 2 — an unparsable row must not be dropped", len(l.rows))
 	}
-	if l.rows[0].ref != "0010,0010" || l.rows[1].ref != "garbage" {
-		t.Errorf("rows = %q, %q; want the parsable one first", l.rows[0].ref, l.rows[1].ref)
+	if l.rows[0].ref != "garbage" || l.rows[1].ref != "0010,0010" {
+		t.Errorf("rows = %q, %q; want the stored order", l.rows[0].ref, l.rows[1].ref)
 	}
 	if _, err := l.entries(); err == nil {
 		t.Error("an unparsable row must be reported on save")
@@ -211,21 +213,20 @@ func TestSetValueReferenceSurvivesDeleteAndReadd(t *testing.T) {
 	l.rebuild()
 
 	// Re-add it the way chooseTags does for a newly checked tag: canonical
-	// reference, empty value.
+	// reference, empty value, appended after the surviving rows.
 	l.rows = append(l.rows, newSetValueRow("0010,0010="))
-	l.sortRows()
 	l.rebuild()
 
 	saved, err := l.entries()
 	if err != nil {
 		t.Fatalf("entries: %v", err)
 	}
-	if want := []string{"0010,0010=", "0010,0020=[0010,0010]"}; !reflect.DeepEqual(saved, want) {
+	if want := []string{"0010,0020=[0010,0010]", "0010,0010="}; !reflect.DeepEqual(saved, want) {
 		t.Fatalf("saved = %v, want %v — the reference must survive", saved, want)
 	}
 	// And it still resolves: typing a name into the re-added row reaches
 	// Patient ID, which is the behaviour that was lost.
-	l.rows[0].value.SetText("NEW^NAME")
+	l.rows[1].value.SetText("NEW^NAME")
 	saved, err = l.entries()
 	if err != nil {
 		t.Fatalf("entries: %v", err)
@@ -234,7 +235,7 @@ func TestSetValueReferenceSurvivesDeleteAndReadd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	if want := []string{"0010,0010=NEW^NAME", "0010,0020=NEW^NAME"}; !reflect.DeepEqual(resolvedSets, want) {
+	if want := []string{"0010,0020=NEW^NAME", "0010,0010=NEW^NAME"}; !reflect.DeepEqual(resolvedSets, want) {
 		t.Errorf("resolved = %v, want %v", resolvedSets, want)
 	}
 }
