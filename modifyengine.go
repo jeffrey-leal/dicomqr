@@ -224,9 +224,19 @@ type modifyResult struct {
 	Failures  []modifyFailure
 	// MaskDecompressed counts files whose compressed pixel data had to be
 	// decompressed so that pixel masking could be applied, when the profile
-	// requested no conversion of its own. Reported rather than left silent:
-	// those files leave in a different encoding than the profile states.
+	// requested no conversion of its own, and which could not be recompressed
+	// (lossy source, or the lossless re-encode failed). Reported rather than
+	// left silent: those files leave in a different encoding than the profile
+	// states.
 	MaskDecompressed int
+	// MaskRecompressed counts masked files whose pixels were re-encoded back
+	// into their original compressed transfer syntax, verified bit-identical —
+	// the export keeps the encoding it arrived in.
+	MaskRecompressed int
+	// MaskRecodedLossless counts masked files whose lossy source syntax was
+	// re-encoded to JPEG 2000 Lossless instead: no loss added beyond the
+	// decode masking forced, export stays compressed, syntax change disclosed.
+	MaskRecodedLossless int
 	// MaskUSFallback counts ultrasound files that declared no calibrated region
 	// and were masked with the profile's manual rectangles instead of their own
 	// stated geometry — a weaker guarantee, so the run says how many.
@@ -446,6 +456,27 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 					if perr != nil {
 						recordFailure(job.path, fmt.Errorf("process: %w", perr))
 						return
+					}
+					if notes.maskRecompressErr != "" {
+						// The file still exported (uncompressed), so a warning
+						// rather than a failure — but the reason must be on
+						// record, since the encoding differs from the source's.
+						logWarn("modify: %s masked, but %s — exported as %s instead",
+							job.path, notes.maskRecompressErr, transferSyntaxLabel(tsExplicitVRLE))
+					}
+					if notes.maskRecompressed {
+						logInfo("modify: %s recompressed to its original transfer syntax after masking",
+							job.path)
+						mu.Lock()
+						res.MaskRecompressed++
+						mu.Unlock()
+					}
+					if notes.maskRecodedLossless {
+						logInfo("modify: %s re-encoded to %s after masking — its own syntax is lossy, and the lossless encode adds no further loss",
+							job.path, transferSyntaxLabel(tsJPEG2000LL))
+						mu.Lock()
+						res.MaskRecodedLossless++
+						mu.Unlock()
 					}
 					if notes.maskDecompressed {
 						logInfo("modify: %s decompressed to %s so its burned-in pixels could be masked",
@@ -722,8 +753,23 @@ func filterKeep(removals []tag.Tag, keep []tag.Tag) []tag.Tag {
 // the profile alone describes.
 type fileNotes struct {
 	// maskDecompressed: compressed pixel data was decompressed so masking could
-	// write to it, without the profile requesting a conversion.
+	// write to it, without the profile requesting a conversion, and could not
+	// be recompressed (lossy source, or recompression failed) — the file left
+	// as Explicit VR LE.
 	maskDecompressed bool
+	// maskRecompressed: the decompression masking forced was undone on the way
+	// out — the masked frames were re-encoded, verified bit-identical, back
+	// into the file's own transfer syntax.
+	maskRecompressed bool
+	// maskRecodedLossless: the file's own syntax is lossy, so the masked
+	// frames were re-encoded to JPEG 2000 Lossless instead — no loss added
+	// beyond the decode masking forced, but the syntax changed, so it is
+	// counted apart from the round-trip case.
+	maskRecodedLossless bool
+	// maskRecompressErr: recompression to the source syntax was attempted and
+	// failed; the file fell back to Explicit VR LE (maskDecompressed) and the
+	// worker logs this reason.
+	maskRecompressErr string
 	// maskUSFallback: an ultrasound image declared no calibrated region, so the
 	// profile's manual rectangles masked it instead of its own stated geometry.
 	maskUSFallback bool
@@ -883,10 +929,16 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 	// say over everything describing the pixels.
 	//
 	// Masking a compressed file forces a decompression even when the profile
-	// asked for none — there are no encoders, so the alternative is to fail
-	// every compressed file. The file is written as Explicit VR Little Endian
-	// and the run reports how many files this happened to, so an export whose
-	// encoding changed never does so silently.
+	// asked for none — the alternative is to fail every compressed file. When
+	// the source syntax is lossless (JPEG 2000 Lossless, JPEG Lossless) the
+	// masked frames are recompressed straight back into it, verified
+	// bit-identical, so the export keeps the encoding it arrived in. A lossy
+	// source is re-encoded to JPEG 2000 Lossless instead — returning to the
+	// lossy syntax would degrade every pixel a second time, while the
+	// lossless encode adds nothing beyond the decode masking forced. Only a
+	// source with no encoder path, or an encode that fails, leaves as
+	// Explicit VR Little Endian. Each outcome has its own count in the run
+	// summary — an export whose encoding changed never does so silently.
 	//
 	// Which is why the regions are resolved against the header FIRST, before a
 	// single frame is decoded. A profile whose rectangles are scoped to a few
@@ -896,10 +948,13 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 	// and minutes of CPU spent producing pixels identical to the ones already
 	// on disk.
 	if len(maskRegions) > 0 && maskingApplies(&ds, maskRegions, maskSrc) {
+		var snap *pixelStateSnapshot
 		if encapsulatedPixelData(&ds) {
-			if _, err := convertDatasetSyntax(&ds, datasetTransferSyntaxUID(&ds), tsExplicitVRLE); err != nil {
+			s := snapshotPixelState(&ds)
+			if _, err := convertDatasetSyntax(&ds, s.sourceTS, tsExplicitVRLE); err != nil {
 				return false, ds, notes, fmt.Errorf("decompress for pixel masking: %w", err)
 			}
+			snap = &s
 			notes.maskDecompressed = true
 		}
 		outcome, err := applyPixelMask(&ds, maskRegions, maskSrc)
@@ -907,6 +962,33 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 			return false, ds, notes, fmt.Errorf("pixel masking: %w", err)
 		}
 		notes.maskUSFallback = outcome.usFellBack
+		if snap != nil {
+			if !outcome.masked {
+				// The generous header gate admitted a file the authoritative
+				// per-frame resolution then found nothing to mask on. Put the
+				// original codestream back verbatim — no pixel changed, so the
+				// export must not change encoding (or bytes) either.
+				if rerr := snap.restoreOriginalPixels(&ds); rerr != nil {
+					return false, ds, notes, fmt.Errorf("restore unmasked pixel data: %w", rerr)
+				}
+				notes.maskDecompressed = false
+			} else if target, ok := recompressTargetFor(snap.sourceTS); ok {
+				if rerr := recompressPixelData(&ds, *snap, target); rerr != nil {
+					// Fall back to the uncompressed export; the worker logs
+					// this and maskDecompressed keeps it in the summary.
+					notes.maskRecompressErr = fmt.Sprintf("recompress to %s: %v",
+						transferSyntaxLabel(target), rerr)
+				} else if target == snap.sourceTS {
+					notes.maskDecompressed = false
+					notes.maskRecompressed = true
+				} else {
+					// A lossy source re-encoded losslessly: no loss added, but
+					// the syntax changed, which gets its own disclosure.
+					notes.maskDecompressed = false
+					notes.maskRecodedLossless = true
+				}
+			}
+		}
 	}
 
 	return false, ds, notes, nil

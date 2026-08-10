@@ -165,6 +165,116 @@ static void dq_decode_jls(const unsigned char *data, int len, dq_jls_result *r) 
     r->sgnd = 0; // T.81 samples are unsigned; DICOM signedness comes from PixelRepresentation
     r->samples = out;
 }
+
+// ---- encoding (lossless SOF3 only) ----
+
+typedef struct {
+    int ok;
+    unsigned char *data;  // malloc'd by jpeg_mem_dest; free with dq_jls_free_bytes
+    unsigned long size;
+    char err[256];
+} dq_jls_enc_result;
+
+static void dq_jls_enc_err(dq_jls_enc_result *r, const char *msg) {
+    r->ok = 0;
+    strncpy(r->err, msg, sizeof(r->err) - 1);
+    r->err[sizeof(r->err) - 1] = 0;
+}
+
+static void dq_jls_free_bytes(unsigned char *p) { free(p); }
+
+// dq_encode_jls encodes planar int32 samples (nc planes of w*h, plane 0 first
+// — the exact layout dq_decode_jls produces) as a lossless (SOF3) JPEG stream
+// with predictor selection value 1 and point transform 0: what the SV1
+// transfer syntax (.70) requires, and one of the predictors plain .57 permits,
+// so one encoder serves both. Samples pass through with no colour conversion
+// (jpeg_enable_lossless forbids it), mirroring the decoder. Same lifecycle
+// rule as dq_decode_jls: everything in one call frame so the longjmp never
+// crosses a Go stack frame.
+static void dq_encode_jls(const int32_t *samples, int w, int h, int nc, int prec,
+                          dq_jls_enc_result *r) {
+    memset(r, 0, sizeof(*r));
+    if (w <= 0 || h <= 0 || nc < 1 || nc > 4 || prec < 2 || prec > 16) {
+        dq_jls_enc_err(r, "unsupported image geometry");
+        return;
+    }
+
+    struct jpeg_compress_struct cinfo;
+    dq_jls_err_mgr jerr;
+    unsigned char * volatile outbuf = NULL;
+    unsigned long outsize = 0;
+    void * volatile rowbuf = NULL;
+
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = dq_jls_error_exit;
+    jerr.pub.output_message = dq_jls_output_message;
+    jerr.msg[0] = 0;
+    if (setjmp(jerr.jb)) {
+        jpeg_destroy_compress(&cinfo);
+        free((void *)outbuf);
+        free((void *)rowbuf);
+        dq_jls_enc_err(r, jerr.msg[0] ? jerr.msg : "JPEG encode failed");
+        return;
+    }
+
+    jpeg_create_compress(&cinfo);
+    jpeg_mem_dest(&cinfo, (unsigned char **)&outbuf, &outsize);
+    cinfo.image_width = (JDIMENSION)w;
+    cinfo.image_height = (JDIMENSION)h;
+    cinfo.input_components = nc;
+    cinfo.in_color_space = (nc >= 3) ? JCS_RGB : JCS_GRAYSCALE;
+    cinfo.data_precision = prec;
+    jpeg_set_defaults(&cinfo);
+    jpeg_enable_lossless(&cinfo, 1, 0); // PSV 1, Pt 0
+    // Lossless mode supports no colour conversion; pin the stream colour space
+    // to the input's rather than relying on jpeg_set_defaults' pick (which for
+    // RGB input would otherwise be YCbCr).
+    jpeg_set_colorspace(&cinfo, cinfo.in_color_space);
+
+    rowbuf = malloc((size_t)w * (size_t)nc * 2); // 2 bytes/sample covers 8/12/16-bit
+    if (rowbuf == NULL) {
+        jpeg_destroy_compress(&cinfo);
+        free((void *)outbuf);
+        dq_jls_enc_err(r, "out of memory");
+        return;
+    }
+
+    jpeg_start_compress(&cinfo, TRUE);
+    size_t pixels = (size_t)w * (size_t)h;
+    while (cinfo.next_scanline < cinfo.image_height) {
+        int y = (int)cinfo.next_scanline;
+        if (prec <= 8) {
+            JSAMPLE *row = (JSAMPLE *)rowbuf;
+            for (int x = 0; x < w; x++)
+                for (int c = 0; c < nc; c++)
+                    row[x * nc + c] = (JSAMPLE)samples[(size_t)c * pixels + (size_t)y * w + x];
+            JSAMPROW rp = (JSAMPROW)rowbuf;
+            jpeg_write_scanlines(&cinfo, &rp, 1);
+        } else if (prec <= 12) {
+            J12SAMPLE *row = (J12SAMPLE *)rowbuf;
+            for (int x = 0; x < w; x++)
+                for (int c = 0; c < nc; c++)
+                    row[x * nc + c] = (J12SAMPLE)samples[(size_t)c * pixels + (size_t)y * w + x];
+            J12SAMPROW rp = (J12SAMPROW)rowbuf;
+            jpeg12_write_scanlines(&cinfo, &rp, 1);
+        } else {
+            J16SAMPLE *row = (J16SAMPLE *)rowbuf;
+            for (int x = 0; x < w; x++)
+                for (int c = 0; c < nc; c++)
+                    row[x * nc + c] = (J16SAMPLE)samples[(size_t)c * pixels + (size_t)y * w + x];
+            J16SAMPROW rp = (J16SAMPROW)rowbuf;
+            jpeg16_write_scanlines(&cinfo, &rp, 1);
+        }
+    }
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+    free((void *)rowbuf);
+    rowbuf = NULL;
+
+    r->ok = 1;
+    r->data = outbuf;
+    r->size = outsize;
+}
 */
 import "C"
 
@@ -257,4 +367,25 @@ func decodeJPEGLosslessFrame(data []byte, slope, intercept float64, hasWindow bo
 	df := &decodedFrame{rows: h, cols: w, gray: gray, invert: photometric == "MONOCHROME1"}
 	df.computeDefaultWindow(hasWindow, wc, ww)
 	return df, nil
+}
+
+// encodeJPEGLossless encodes planar int32 samples (numComps planes of
+// width*height, plane 0 first — the same layout decodeJPEGLossless returns) as
+// a lossless SOF3 JPEG stream, predictor selection value 1 and point transform
+// 0, suitable for encapsulation under either JPEG Lossless transfer syntax
+// (.57 or .70). Samples are raw stored values: T.81 carries no signedness, so
+// signed DICOM data goes in as its unsigned two's-complement container bits,
+// exactly as the decoder hands it back.
+func encodeJPEGLossless(samples []int32, width, height, numComps, prec int) ([]byte, error) {
+	if width <= 0 || height <= 0 || numComps < 1 || len(samples) < width*height*numComps {
+		return nil, errors.New("jpeg lossless encode: sample buffer smaller than geometry")
+	}
+	var res C.dq_jls_enc_result
+	C.dq_encode_jls((*C.int32_t)(unsafe.Pointer(&samples[0])),
+		C.int(width), C.int(height), C.int(numComps), C.int(prec), &res)
+	if res.ok == 0 {
+		return nil, fmt.Errorf("jpeg lossless encode: %s", C.GoString(&res.err[0]))
+	}
+	defer C.dq_jls_free_bytes(res.data)
+	return C.GoBytes(unsafe.Pointer(res.data), C.int(res.size)), nil
 }

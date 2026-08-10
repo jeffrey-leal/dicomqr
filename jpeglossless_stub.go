@@ -19,3 +19,7 @@ func decodeJPEGLosslessFrame(_ []byte, _, _ float64, _ bool, _, _ float64, _ str
 func decodeJPEGLossless(_ []byte) (width, height, numComps, prec int, signed bool, samples []int32, err error) {
 	return 0, 0, 0, 0, false, nil, errors.New("JPEG Lossless support is not built into this version of dicomqr")
 }
+
+func encodeJPEGLossless(_ []int32, _, _, _, _ int) ([]byte, error) {
+	return nil, errors.New("JPEG Lossless support is not built into this version of dicomqr")
+}

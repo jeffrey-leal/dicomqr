@@ -176,6 +176,177 @@ static void dq_decode_j2k(const unsigned char *data, int len, dq_j2k_result *r) 
     opj_destroy_codec(codec);
     opj_stream_destroy(stream);
 }
+
+// ---- encoding (reversible / lossless only) ----
+
+// Growable memory sink for OpenJPEG's write stream. The encoder seeks back to
+// patch earlier bytes (e.g. tile-part lengths), so len tracks the high-water
+// mark independently of the current offset, and growth is zero-filled so a
+// seek past the end reads deterministic bytes.
+typedef struct {
+    unsigned char *data;
+    OPJ_SIZE_T cap;
+    OPJ_SIZE_T len;
+    OPJ_SIZE_T off;
+} dq_wmem;
+
+static int dq_wmem_reserve(dq_wmem *m, OPJ_SIZE_T need) {
+    if (need <= m->cap) return 1;
+    OPJ_SIZE_T cap = m->cap ? m->cap : 65536;
+    while (cap < need) cap *= 2;
+    unsigned char *p = (unsigned char *)realloc(m->data, cap);
+    if (!p) return 0;
+    memset(p + m->cap, 0, cap - m->cap);
+    m->data = p;
+    m->cap = cap;
+    return 1;
+}
+
+static OPJ_SIZE_T dq_wwrite(void *buf, OPJ_SIZE_T n, void *user) {
+    dq_wmem *m = (dq_wmem *)user;
+    if (!dq_wmem_reserve(m, m->off + n)) return (OPJ_SIZE_T)-1;
+    memcpy(m->data + m->off, buf, n);
+    m->off += n;
+    if (m->off > m->len) m->len = m->off;
+    return n;
+}
+
+static OPJ_OFF_T dq_wskip(OPJ_OFF_T n, void *user) {
+    dq_wmem *m = (dq_wmem *)user;
+    if (n < 0) return -1;
+    if (!dq_wmem_reserve(m, m->off + (OPJ_SIZE_T)n)) return -1;
+    m->off += (OPJ_SIZE_T)n;
+    if (m->off > m->len) m->len = m->off;
+    return n;
+}
+
+static OPJ_BOOL dq_wseek(OPJ_OFF_T n, void *user) {
+    dq_wmem *m = (dq_wmem *)user;
+    if (n < 0) return OPJ_FALSE;
+    if (!dq_wmem_reserve(m, (OPJ_SIZE_T)n)) return OPJ_FALSE;
+    m->off = (OPJ_SIZE_T)n;
+    if (m->off > m->len) m->len = m->off;
+    return OPJ_TRUE;
+}
+
+typedef struct {
+    int ok;
+    unsigned char *data; // malloc'd; free with dq_free_bytes
+    OPJ_SIZE_T size;
+    char err[256];
+} dq_j2k_enc_result;
+
+static void dq_enc_err(dq_j2k_enc_result *r, const char *msg) {
+    r->ok = 0;
+    strncpy(r->err, msg, sizeof(r->err) - 1);
+    r->err[sizeof(r->err) - 1] = 0;
+}
+
+static void dq_free_bytes(unsigned char *p) { free(p); }
+
+// dq_encode_j2k encodes planar int32 samples (nc planes of w*h, plane 0 first
+// — the exact layout dq_decode_j2k produces) as a reversible (5/3 wavelet,
+// lossless) raw J2K codestream. mct applies the reversible colour transform
+// and is only legal for 3 components.
+static void dq_encode_j2k(const int32_t *samples, int w, int h, int nc,
+                          int prec, int sgnd, int mct, dq_j2k_enc_result *r) {
+    memset(r, 0, sizeof(*r));
+    if (w <= 0 || h <= 0 || nc < 1 || nc > 4 || prec < 1 || prec > 16) {
+        dq_enc_err(r, "unsupported image geometry");
+        return;
+    }
+
+    opj_image_cmptparm_t cmpt[4];
+    memset(cmpt, 0, sizeof(cmpt));
+    for (int c = 0; c < nc; c++) {
+        cmpt[c].dx = 1;
+        cmpt[c].dy = 1;
+        cmpt[c].w = (OPJ_UINT32)w;
+        cmpt[c].h = (OPJ_UINT32)h;
+        cmpt[c].x0 = 0;
+        cmpt[c].y0 = 0;
+        cmpt[c].prec = (OPJ_UINT32)prec;
+        cmpt[c].sgnd = sgnd ? 1 : 0;
+    }
+    opj_image_t *image = opj_image_create((OPJ_UINT32)nc, cmpt,
+                                          nc >= 3 ? OPJ_CLRSPC_SRGB : OPJ_CLRSPC_GRAY);
+    if (!image) { dq_enc_err(r, "opj_image_create failed"); return; }
+    image->x0 = 0;
+    image->y0 = 0;
+    image->x1 = (OPJ_UINT32)w;
+    image->y1 = (OPJ_UINT32)h;
+    size_t pixels = (size_t)w * (size_t)h;
+    for (int c = 0; c < nc; c++) {
+        memcpy(image->comps[c].data, samples + (size_t)c * pixels, pixels * sizeof(int32_t));
+    }
+
+    opj_cparameters_t params;
+    opj_set_default_encoder_parameters(&params);
+    // Reversible: one layer, rate 0 (no truncation), 5/3 wavelet. These are
+    // the opj_compress defaults for lossless, spelled out rather than assumed.
+    params.tcp_numlayers = 1;
+    params.tcp_rates[0] = 0;
+    params.cp_disto_alloc = 1;
+    params.irreversible = 0;
+    params.tcp_mct = (mct && nc == 3) ? 1 : 0;
+    // The default 6 resolution levels are invalid for images smaller than
+    // 2^5 in either dimension (opj_setup_encoder rejects them); scale down.
+    int mind = w < h ? w : h;
+    int nres = 1;
+    while (nres < 6 && (1 << nres) <= mind) nres++;
+    params.numresolution = nres;
+
+    opj_codec_t *codec = opj_create_compress(OPJ_CODEC_J2K);
+    if (!codec) {
+        opj_image_destroy(image);
+        dq_enc_err(r, "opj_create_compress failed");
+        return;
+    }
+    opj_set_info_handler(codec, dq_quiet, NULL);
+    opj_set_warning_handler(codec, dq_quiet, NULL);
+    opj_set_error_handler(codec, dq_quiet, NULL);
+
+    if (!opj_setup_encoder(codec, &params, image)) {
+        opj_destroy_codec(codec);
+        opj_image_destroy(image);
+        dq_enc_err(r, "opj_setup_encoder failed");
+        return;
+    }
+
+    dq_wmem mem;
+    memset(&mem, 0, sizeof(mem));
+    // OPJ_FALSE = output (write) stream.
+    opj_stream_t *stream = opj_stream_default_create(OPJ_FALSE);
+    if (!stream) {
+        opj_destroy_codec(codec);
+        opj_image_destroy(image);
+        dq_enc_err(r, "opj_stream_default_create failed");
+        return;
+    }
+    opj_stream_set_user_data(stream, &mem, NULL);
+    opj_stream_set_write_function(stream, dq_wwrite);
+    opj_stream_set_skip_function(stream, dq_wskip);
+    opj_stream_set_seek_function(stream, dq_wseek);
+
+    if (!opj_start_compress(codec, image, stream) ||
+        !opj_encode(codec, stream) ||
+        !opj_end_compress(codec, stream)) {
+        free(mem.data);
+        opj_stream_destroy(stream);
+        opj_destroy_codec(codec);
+        opj_image_destroy(image);
+        dq_enc_err(r, "opj_encode failed");
+        return;
+    }
+
+    opj_stream_destroy(stream);
+    opj_destroy_codec(codec);
+    opj_image_destroy(image);
+
+    r->ok = 1;
+    r->data = mem.data;
+    r->size = mem.len;
+}
 */
 import "C"
 
@@ -253,4 +424,31 @@ func decodeJPEG2000Frame(data []byte, slope, intercept float64, hasWindow bool, 
 	df := &decodedFrame{rows: h, cols: w, gray: gray, invert: photometric == "MONOCHROME1"}
 	df.computeDefaultWindow(hasWindow, wc, ww)
 	return df, nil
+}
+
+// encodeJPEG2000Lossless encodes planar int32 samples (numComps planes of
+// width*height, plane 0 first — the same layout decodeJPEG2000 returns) as a
+// reversible JPEG 2000 codestream, suitable for encapsulation under the JPEG
+// 2000 Lossless transfer syntax. signed samples must arrive sign-extended
+// (real negative int32 values); mct applies the reversible colour transform
+// and is honoured only for 3-component input.
+func encodeJPEG2000Lossless(samples []int32, width, height, numComps, prec int, signed, mct bool) ([]byte, error) {
+	if width <= 0 || height <= 0 || numComps < 1 || len(samples) < width*height*numComps {
+		return nil, errors.New("jpeg2000 encode: sample buffer smaller than geometry")
+	}
+	cSigned, cMCT := C.int(0), C.int(0)
+	if signed {
+		cSigned = 1
+	}
+	if mct {
+		cMCT = 1
+	}
+	var res C.dq_j2k_enc_result
+	C.dq_encode_j2k((*C.int32_t)(unsafe.Pointer(&samples[0])),
+		C.int(width), C.int(height), C.int(numComps), C.int(prec), cSigned, cMCT, &res)
+	if res.ok == 0 {
+		return nil, fmt.Errorf("jpeg2000 encode: %s", C.GoString(&res.err[0]))
+	}
+	defer C.dq_free_bytes(res.data)
+	return C.GoBytes(unsafe.Pointer(res.data), C.int(res.size)), nil
 }

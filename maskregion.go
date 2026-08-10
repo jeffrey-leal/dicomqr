@@ -286,6 +286,11 @@ type maskResolution struct {
 	// geometry rather than by its own stated layout, which is a weaker claim
 	// than the profile otherwise makes.
 	usFellBack bool
+	// exempt records that a "none" region applied: the image was reviewed and
+	// needs no masking. Different from no region applying at all — the first
+	// is a decision someone made, the second an absence — and the review
+	// window shows the two differently.
+	exempt bool
 }
 
 // maskRects resolves every region against one frame's dimensions. Regions that
@@ -338,6 +343,7 @@ func maskRects(src maskSource, regions []MaskRegion, cols, rows int) (maskResolu
 	if usUnresolved && len(res.rects) > 0 {
 		res.usFellBack = true
 	}
+	res.exempt = exempt
 	return res, nil
 }
 

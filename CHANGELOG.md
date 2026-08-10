@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.15.0] — 2026-08-10
+
+### Added
+
+- **The mask review window gains the viewer's filmstrip** — a series that contains clips now shows one thumbnail per image between the picture and the slider, decoded in the background with the current image outlined; click a thumbnail to jump straight to it, exactly as in the viewer. A coloured stripe under each thumbnail states what the run's masking will do to that image — green masked, amber masked by fallback rectangles on an ultrasound image with no calibrated region, blue marked as needing none, red cannot be masked and would fail — resolved by the export's own rules and re-resolved live as rectangles are drawn, undone or exempted. For an echo study this turns finding the analysis screens that need hand masking from a scrub through every clip into a glance along the strip
+
+### Changed
+
+- **A masked file stays compressed on export** — masking still has to decompress a file to write its pixels, but the masked image is now re-encoded on the way out instead of leaving as uncompressed Explicit VR Little Endian. A JPEG 2000 Lossless or JPEG Lossless source is recompressed straight back into its own transfer syntax — the export keeps the encoding, and roughly the size, it arrived in. A lossily-compressed source (JPEG Baseline, JPEG Extended, lossy JPEG 2000) is re-encoded to JPEG 2000 Lossless instead: re-entering the lossy format would degrade every pixel in the image a second time, while a lossless encode of the already-decoded samples adds no loss at all — the transfer syntax changes, the image does not. Measured on a JPEG Baseline echo study, a fully masked export shrinks from 16.5× the stored size to 2.1×. Every re-encoded frame is decoded again and compared bit for bit against the masked pixels before it is written, so a defective encode can only ever fall back to the old uncompressed behaviour, never ship altered pixels. The completion summary and Activity Log report the three outcomes — recompressed to own syntax, re-encoded to JPEG 2000 Lossless, left uncompressed — as separate counts
+- **A compressed file that masking inspects but leaves untouched now exports byte-identical** — when the header could not settle whether a scoped region applied, the file was decompressed to find out and then exported uncompressed even though nothing was masked. Its original pixel data is now restored verbatim in that case, so only files whose pixels actually changed are ever re-encoded
+
 ## [1.14.0] — 2026-08-08
 
 ### Added

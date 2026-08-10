@@ -19,3 +19,7 @@ func decodeJPEG2000Frame(_ []byte, _, _ float64, _ bool, _, _ float64, _ string)
 func decodeJPEG2000(_ []byte) (width, height, numComps, prec int, signed bool, samples []int32, err error) {
 	return 0, 0, 0, 0, false, nil, errors.New("JPEG 2000 support is not built into this version of dicomqr")
 }
+
+func encodeJPEG2000Lossless(_ []int32, _, _, _, _ int, _, _ bool) ([]byte, error) {
+	return nil, errors.New("JPEG 2000 support is not built into this version of dicomqr")
+}

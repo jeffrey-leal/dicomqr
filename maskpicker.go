@@ -19,6 +19,7 @@ package main
 import (
 	"fmt"
 	"image"
+	"image/color"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -171,6 +172,14 @@ type maskSeriesFile struct {
 	// note says about the image on screen, and what a size-scoped rectangle
 	// drawn on that image means (see MaskScope.USRegion).
 	calibrated bool
+	// chap is the file as the viewer's filmstrip understands it — frame
+	// count, label, cine facts — built in the same header pass, so the review
+	// window's filmstrip shows exactly the cells the viewer would.
+	chap chapter
+	// src is the file's masking identity, snapshotted at scan time so the
+	// filmstrip can resolve every file's regions to a status without parsing
+	// anything again.
+	src maskSource
 }
 
 // maskSeries is one series of the run, its files in instance order — the unit
@@ -274,6 +283,8 @@ func scanMaskSeries(files []string, progress func(done, total int)) (series []ma
 						cols:       cols,
 						rows:       rows,
 						calibrated: calibrated,
+						chap:       chapterFromHeader(0, path, &ds),
+						src:        newMaskSource(&ds),
 					})
 				}
 				mu.Unlock()
@@ -306,6 +317,38 @@ func scanMaskSeries(files []string, progress func(done, total int)) (series []ma
 		return out[i].label() < out[j].label()
 	})
 	return out, skipped
+}
+
+// Filmstrip status colours — what this run's masking will do to each image,
+// painted along the bottom edge of its thumbnail. Fixed rather than themed:
+// they are semantic (masked / weaker guarantee / reviewed / would fail), sit
+// on the cell's own dark backdrop in either theme, and match the language the
+// note under the image already uses.
+var (
+	maskStatusMasked   = color.NRGBA{R: 0x2E, G: 0xB2, B: 0x5C, A: 0xFF} // green: regions resolve, image is masked
+	maskStatusFallback = color.NRGBA{R: 0xE0, G: 0xA0, B: 0x20, A: 0xFF} // amber: masked by fallback rectangles — worth reviewing
+	maskStatusExempt   = color.NRGBA{R: 0x4A, G: 0x90, B: 0xD9, A: 0xFF} // blue: reviewed, marked as needing none
+	maskStatusFail     = color.NRGBA{R: 0xD6, G: 0x45, B: 0x45, A: 0xFF} // red: cannot be masked, would fail the export
+)
+
+// maskFileStatusColor resolves one file's regions — the same resolution the
+// export runs — into the stripe colour its filmstrip cell shows. Transparent
+// means nothing applies and nothing fails: the file exports untouched, which
+// needs no flag.
+func maskFileStatusColor(f maskSeriesFile, regions []MaskRegion) color.Color {
+	res, err := maskRects(f.src, regions, f.cols, f.rows)
+	switch {
+	case err != nil:
+		return maskStatusFail
+	case res.usFellBack:
+		return maskStatusFallback
+	case len(res.rects) > 0:
+		return maskStatusMasked
+	case res.exempt:
+		return maskStatusExempt
+	default:
+		return color.Transparent
+	}
 }
 
 // maskWorkingSet is the run's mask regions while they are being reviewed: the
@@ -451,15 +494,31 @@ func buildMaskPreview(a fyne.App, parent fyne.Window, profileName string,
 
 	work := newMaskWorkingSet(resolved)
 
+	// The filmstrip outlives the builder closure — its thumbnail decoders must
+	// stop when the window goes, exactly as the viewer stops its strip.
+	var strip *chapterStrip
+
 	openOwnedWindow(a, windowSpec{
 		Title:    "Review masking — " + profileName,
-		Size:     fyne.NewSize(940, 820),
+		Size:     fyne.NewSize(940, 880),
 		Parent:   parent,
 		Blocking: true,
+		OnClosed: func() {
+			if strip != nil {
+				strip.stop()
+			}
+		},
 	}, func(win fyne.Window) fyne.CanvasObject {
 		imageCanvas := newMaskCanvas(nil, maskCanvasPreview)
 		note := widget.NewLabel("")
 		note.Wrapping = fyne.TextWrapWord
+
+		// The filmstrip sits above the slider for any series with clips in it
+		// — the same gate, cells and thumbnails as the viewer's, plus a status
+		// stripe per image saying what this run's masking will do to it. Its
+		// helpers are assigned once navigation exists below.
+		stripHolder := container.NewVBox()
+		var refreshStripStatuses, rebuildStrip func()
 
 		// Previous/Next step the series; the slider below owns navigation
 		// within one. A dropdown listing every series sat at the top of the
@@ -543,6 +602,11 @@ func buildMaskPreview(a fyne.App, parent fyne.Window, profileName string,
 			if !work.canUndo() {
 				undoBtn.Disable()
 			}
+			// Every edit changes what the regions resolve to on every image of
+			// the series, so the filmstrip's stripes re-resolve with the note.
+			if refreshStripStatuses != nil {
+				refreshStripStatuses()
+			}
 			if !haveShown || current == nil {
 				return
 			}
@@ -566,7 +630,11 @@ func buildMaskPreview(a fyne.App, parent fyne.Window, profileName string,
 					parts = append(parts, "This image cannot be masked and would fail the export: "+rerr.Error())
 				case len(res.rects) == 0:
 					imageCanvas.setRects(nil)
-					parts = append(parts, "Nothing is masked on this image")
+					if res.exempt {
+						parts = append(parts, "Marked as needing no masking")
+					} else {
+						parts = append(parts, "Nothing is masked on this image")
+					}
 				default:
 					imageCanvas.setRects(pixelRectsToRegions(res.rects, shownFile.cols, shownFile.rows))
 					if res.usFellBack {
@@ -609,6 +677,9 @@ func buildMaskPreview(a fyne.App, parent fyne.Window, profileName string,
 				slider.Disable()
 			}
 			slider.Refresh()
+			if strip != nil {
+				strip.selectIndex(fileIdx)
+			}
 		}
 
 		// One decode in flight at a time: scrubbing the slider fires a change
@@ -671,8 +742,50 @@ func buildMaskPreview(a fyne.App, parent fyne.Window, profileName string,
 				return
 			}
 			seriesIdx, fileIdx = idx, 0
+			if rebuildStrip != nil {
+				rebuildStrip()
+			}
 			chrome()
 			requestLoad()
+		}
+
+		// The filmstrip helpers, now that navigation exists to hang them on.
+		// Statuses re-resolve against the working set, so a rectangle drawn
+		// two images ago shows on every cell it reaches.
+		refreshStripStatuses = func() {
+			if strip == nil {
+				return
+			}
+			sr := series[seriesIdx]
+			colors := make([]color.Color, len(sr.files))
+			for i, f := range sr.files {
+				regions, _ := work.governing(f.modality)
+				colors[i] = maskFileStatusColor(f, regions)
+			}
+			strip.setStatuses(colors)
+		}
+		rebuildStrip = func() {
+			if strip != nil {
+				strip.stop()
+				strip = nil
+			}
+			stripHolder.Objects = nil
+			sr := series[seriesIdx]
+			chaps := make([]chapter, len(sr.files))
+			for i, f := range sr.files {
+				chaps[i] = f.chap
+			}
+			// The viewer's gate, applied per series: a filmstrip for anything
+			// with clips to tell apart, and none for a plain single-frame
+			// stack, whose hundreds of near-identical thumbnails would cost
+			// decode time and say nothing.
+			if len(chaps) > 1 && anyMultiFrame(chaps) {
+				strip = newChapterStrip(chaps, func(index int) { goTo(index) })
+				strip.selectIndex(fileIdx)
+				refreshStripStatuses()
+				stripHolder.Objects = []fyne.CanvasObject{strip.object()}
+			}
+			stripHolder.Refresh()
 		}
 		prevBtn.OnTapped = func() { selectSeries(seriesIdx - 1) }
 		nextBtn.OnTapped = func() { selectSeries(seriesIdx + 1) }
@@ -737,11 +850,16 @@ func buildMaskPreview(a fyne.App, parent fyne.Window, profileName string,
 			&desktop.CustomShortcut{KeyName: fyne.KeyRight, Modifier: fyne.KeyModifierControl},
 			func(fyne.Shortcut) { selectSeries(seriesIdx + 1) })
 
+		rebuildStrip()
 		chrome()
 		requestLoad()
 
 		captionText := "Every selected image, series by series in acquisition order — for an ultrasound study " +
-			"that is clip by clip, each clip shown at its middle frame. Previous and Next step through the " +
+			"that is clip by clip, each clip shown at its middle frame. A series with clips gets the viewer's " +
+			"filmstrip above the slider — click a thumbnail to jump to it, and read the stripe under each: " +
+			"green is masked, amber is masked by the profile's rectangles standing in for a missing ultrasound " +
+			"region, blue is marked as needing none, red cannot be masked and would fail the export, and no " +
+			"stripe means nothing applies. Previous and Next step through the " +
 			"series; the slider scrubs the images within one (arrow keys step a single image, Ctrl+arrows a " +
 			"series). Tick Draw rectangles to mark an area on the image in front of you; Applies to decides how " +
 			"far that rectangle reaches, and defaults to the one image, since analysis screens are laid out " +
@@ -785,7 +903,7 @@ func buildMaskPreview(a fyne.App, parent fyne.Window, profileName string,
 
 		head := container.NewVBox(caption, widget.NewSeparator())
 		foot := container.NewBorder(widget.NewSeparator(), nil, nil, nil, container.NewPadded(
-			container.NewVBox(slider, seriesRow, posLabel, editRow, actionRow)))
+			container.NewVBox(stripHolder, slider, seriesRow, posLabel, editRow, actionRow)))
 		return container.NewBorder(head, foot, nil, nil, imageCanvas)
 	})
 }

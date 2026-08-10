@@ -670,8 +670,8 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 		} else {
 			res = runModification(ctx, files, rootDir, outDir, params, rels, onProgress)
 		}
-		logInfo("modify: %q finished — %d written, %d skipped, %d failed, %d decompressed for masking, cancelled=%v → %s",
-			profileName, res.Processed, res.Skipped, res.Failed, res.MaskDecompressed, res.Canceled, outDir)
+		logInfo("modify: %q finished — %d written, %d skipped, %d failed, %d recompressed after masking, %d lossy re-encoded lossless, %d decompressed for masking, cancelled=%v → %s",
+			profileName, res.Processed, res.Skipped, res.Failed, res.MaskRecompressed, res.MaskRecodedLossless, res.MaskDecompressed, res.Canceled, outDir)
 		fyne.Do(func() {
 			progressBar.SetValue(1)
 			head := "Done"
@@ -685,10 +685,29 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 			if res.Failed > 0 {
 				msg += fmt.Sprintf(", %d failed", res.Failed)
 			}
-			// Masking cannot be applied to compressed pixels and there are no
-			// encoders, so those files left in a different encoding than the
-			// profile asked for. Stating it is the whole reason the run does it
-			// rather than failing the file.
+			// Masked files whose source compression is lossless are re-encoded,
+			// verified bit-identical, back into their own syntax — the pixels
+			// changed (that was the point), the encoding did not. Stated so the
+			// rewrite is on record.
+			if res.MaskRecompressed > 0 {
+				msg += fmt.Sprintf("; %d masked file(s) recompressed to their original transfer syntax",
+					res.MaskRecompressed)
+			}
+			// Masked files whose source compression is lossy are re-encoded to
+			// JPEG 2000 Lossless instead — re-entering the lossy syntax would
+			// degrade every pixel a second time, while the lossless encode
+			// adds nothing beyond the decode masking already forced. A syntax
+			// change, so it gets its own clause rather than hiding in the one
+			// above.
+			if res.MaskRecodedLossless > 0 {
+				msg += fmt.Sprintf("; %d masked lossy file(s) re-encoded to %s — no added loss",
+					res.MaskRecodedLossless, transferSyntaxLabel(tsJPEG2000LL))
+			}
+			// Masking cannot be applied to compressed pixels, and a lossy source
+			// cannot be recompressed without degrading every pixel a second
+			// time, so those files left in a different encoding than the profile
+			// asked for. Stating it is the whole reason the run does it rather
+			// than failing the file.
 			if res.MaskDecompressed > 0 {
 				msg += fmt.Sprintf("; %d decompressed to %s so burned-in pixels could be masked",
 					res.MaskDecompressed, transferSyntaxLabel(tsExplicitVRLE))

@@ -39,6 +39,7 @@ type chapterCell struct {
 	widget.BaseWidget
 	thumb    *canvas.Image
 	border   *canvas.Rectangle
+	status   *canvas.Rectangle
 	caption  *widget.Label
 	badge    *widget.Label
 	onTapped func()
@@ -56,6 +57,12 @@ func newChapterCell(c chapter, onTapped func()) *chapterCell {
 	cell.border = canvas.NewRectangle(color.Transparent)
 	cell.border.StrokeWidth = 2
 	cell.border.StrokeColor = color.Transparent
+
+	// The status stripe overlays the thumbnail's bottom edge, transparent
+	// until a caller paints it (the viewer never does; the mask review window
+	// uses it to say what masking will do to each image).
+	cell.status = canvas.NewRectangle(color.Transparent)
+	cell.status.SetMinSize(fyne.NewSize(0, 4))
 
 	cell.caption = widget.NewLabel(c.label)
 	cell.caption.Truncation = fyne.TextTruncateEllipsis
@@ -90,8 +97,15 @@ func (c *chapterCell) CreateRenderer() fyne.WidgetRenderer {
 	return widget.NewSimpleRenderer(container.NewStack(
 		c.border,
 		container.NewBorder(nil, container.NewVBox(c.caption, c.badge), nil, nil,
-			container.NewStack(backdrop, c.thumb)),
+			container.NewStack(backdrop, c.thumb,
+				container.NewBorder(nil, c.status, nil, nil))),
 	))
+}
+
+// setStatus paints the stripe along the thumbnail's bottom edge.
+func (c *chapterCell) setStatus(col color.Color) {
+	c.status.FillColor = col
+	c.status.Refresh()
 }
 
 func (c *chapterCell) setSelected(selected bool) {
@@ -142,6 +156,17 @@ func newChapterStrip(chapters []chapter, onSelect func(index int)) *chapterStrip
 }
 
 func (s *chapterStrip) object() fyne.CanvasObject { return s.scroll }
+
+// setStatuses paints every cell's status stripe in one pass — index i colours
+// cell i, and a short slice leaves the rest untouched. Must be called on the
+// UI goroutine, like everything else that touches the cells.
+func (s *chapterStrip) setStatuses(colors []color.Color) {
+	for i, col := range colors {
+		if i < len(s.cells) {
+			s.cells[i].setStatus(col)
+		}
+	}
+}
 
 // stop abandons thumbnail decoding — the window is closing, and there is
 // nothing left to fill.

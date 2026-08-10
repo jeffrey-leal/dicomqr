@@ -80,8 +80,11 @@ type ModProfile struct {
 	// TransferSyntax is the syntax every exported file is written in, using the
 	// same tokens as ServerProfile.TransferSyntax: tsPrefAny (empty) writes each
 	// file in the syntax it is stored in, tsPrefExplicitLE or tsPrefImplicitLE
-	// convert it. Compressed pixel data is decompressed on the way out; there
-	// are no encoders, so a compressed syntax can never be a target.
+	// convert it. Compressed pixel data is decompressed on the way out; a
+	// compressed syntax can never be a target here — the lossless encoders
+	// exist only so masking can keep a masked file compressed (its own syntax
+	// back, or JPEG 2000 Lossless for a lossy source — recompress.go), never
+	// as a conversion a profile can request.
 	//
 	// This is independent of the server profile's requirement, which constrains
 	// what a retrieve is allowed to receive. Requiring nothing there and setting
@@ -104,9 +107,13 @@ type ModProfile struct {
 	// for dicomtool's `maskrows`, which could only blank whole rows from the
 	// top of the image.
 	//
-	// Masking writes pixels, and there are no encoders, so a masked file always
-	// leaves uncompressed: a compressed source is decompressed on the way out
-	// even when the profile asks for no conversion. See processFile.
+	// Masking writes pixels, so a compressed source is decompressed on the way
+	// out even when the profile asks for no conversion. A losslessly-compressed
+	// source (JPEG 2000 Lossless, JPEG Lossless) is then recompressed back into
+	// its own syntax, verified bit-identical; a lossy source is re-encoded to
+	// JPEG 2000 Lossless — no loss added beyond the decode, where re-entering
+	// the lossy syntax would degrade every pixel a second time. Every outcome
+	// is reported. See processFile and recompress.go.
 	MaskRegions []MaskRegion `json:"maskregions,omitempty"`
 
 	PerModality map[string]ModProfile `json:"per-modality,omitempty"`

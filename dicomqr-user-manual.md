@@ -1,8 +1,8 @@
 # dicomqr
 
-**User Manual  v1.14.0**
+**User Manual  v1.15.0**
 
-August 8, 2026
+August 10, 2026
 
 A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.
 
@@ -745,6 +745,8 @@ Drawing a rectangle instead of measuring one. Pick from image… beside Add regi
 
 Reviewing and masking a run. The Modification dialog's Pixel masking section has a Review masking… button, and for a study with burned-in annotation this is where the work is done. It reads the header of every selected file and presents them series by series, in acquisition order — for an ultrasound study that is clip by clip, each clip shown at its middle frame. Every control sits beneath the image, in the order the work is done: the slider scrubs the images of the current series, Previous and Next step to another series (named beside them), and the row under those says which image is on screen. The arrow keys step a single image and Ctrl with an arrow key steps a series, for review that needs to be precise rather than quick. Each image is shown with the areas that will be blanked drawn in black, resolved by the same code the export uses, so what is shown is what will happen. Files that cannot be read, or that hold no image, are counted in the window's caption rather than silently left out.
 
+A series that contains clips also gets the viewer's filmstrip, between the image and the slider: one thumbnail per image of the series, decoded in the background, with the current image outlined — click any thumbnail to jump straight to it, exactly as in the viewer. A coloured stripe along the bottom edge of each thumbnail says what this run's masking will do to that image, resolved by the export's own rules and updated as regions are drawn or undone: green means the image is masked; amber means it is masked by the profile's rectangles standing in for a calibrated ultrasound region it does not declare, and is worth a look; blue means it has been marked as needing no masking; red means it cannot be masked and would fail the export; no stripe means nothing applies and the image exports untouched. For an echo study this is the quick pass the window exists for — the amber and red cells are the analysis screens needing a hand-drawn rectangle or an exemption, visible at a glance instead of found by scrubbing.
+
 Tick Draw rectangles to mark an area on the image in front of you: drag across it and the rectangle joins the regions this run will apply. How far it reaches is set by Applies to beside it:
 
 | Applies to | Effect |
@@ -759,7 +761,7 @@ Regions marked here apply to this run only, like every other control in the Modi
 
 Regions may also be set on a per-modality override, where they replace the profile's regions for files of that modality rather than adding to them — the layout of an ultrasound frame has nothing to do with the layout of a secondary capture, so there is nothing to combine.
 
-Two consequences worth knowing before enabling masking. Because writing pixels requires them to be uncompressed, and the application can decompress but never compress, a compressed file is decompressed on export whenever masking applies to it — even when Output transfer syntax is As stored. Those files leave as Explicit VR Little Endian and the count is reported in the run's completion message and the Activity Log. And because a mask that fails to apply is indistinguishable, in the finished export, from a profile that never asked for one, any file that cannot be masked is reported as a failure and left out of the export rather than written with the annotation intact.
+Two consequences worth knowing before enabling masking. Because writing pixels requires them to be uncompressed, a compressed file is decompressed on export whenever masking applies to it — even when Output transfer syntax is As stored — and then re-encoded so the export stays compressed. When the file's own compression is lossless (JPEG 2000 Lossless or JPEG Lossless), the masked image is recompressed straight back into that same syntax. When it is lossy (JPEG Baseline, JPEG Extended or lossy JPEG 2000), the masked image is re-encoded to JPEG 2000 Lossless instead: re-entering the lossy format would degrade every pixel in the image a second time, while the lossless encode adds nothing beyond the decode masking already required — the transfer syntax changes, the image does not, and the file stays a fraction of its uncompressed size. In both cases the result is decoded again and verified bit-for-bit against the masked pixels before it is written; a file whose re-encode fails leaves as Explicit VR Little Endian. All three counts are reported in the run's completion message and the Activity Log. And because a mask that fails to apply is indistinguishable, in the finished export, from a profile that never asked for one, any file that cannot be masked is reported as a failure and left out of the export rather than written with the annotation intact.
 
 Masked areas are filled with black as the image's own photometric interpretation defines it, so a redaction reads as a redaction: the maximum stored value on an inverted greyscale image, neutral chroma on a colour-difference image, and the darkest entry of the palette on a palette-colour image. The one format that cannot be masked directly is uncompressed chroma-subsampled ultrasound, whose samples are not stored one set per pixel; setting Output transfer syntax to either uncompressed option rewrites it in a form that masks normally, and the error says so.
 
@@ -809,7 +811,7 @@ The status bar at the bottom of the window provides real-time feedback. A colour
 
 | Situation | Status bar text |
 |---|---|
-| Application started, not connected | `v1.14.0` |
+| Application started, not connected | `v1.15.0` |
 | Connecting to server | `Connecting…` |
 | Connected | `Connected: <AE>@<host>:<port>` |
 | Connection cancelled | `Connection cancelled` |

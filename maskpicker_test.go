@@ -8,6 +8,7 @@ package main
 
 import (
 	"image"
+	"image/color"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -411,5 +412,107 @@ func TestScanMaskSeriesSkipsUnreadable(t *testing.T) {
 	}
 	if skipped != 1 {
 		t.Errorf("skipped = %d, want the unreadable file counted", skipped)
+	}
+}
+
+// The filmstrip stripe is the run's masking resolved per file — the same
+// resolution the export runs, so a colour can never promise something the
+// export will not do. One colour per outcome, and transparent for a file
+// nothing applies to, which exports untouched and needs no flag.
+func TestMaskFileStatusColor(t *testing.T) {
+	calibrated := maskSeriesFile{
+		cols: 800, rows: 600,
+		src:  maskSource{modality: "US", usDeclared: true, usBounds: pixelRect{10, 40, 790, 560}},
+	}
+	uncalibrated := maskSeriesFile{
+		cols: 800, rows: 600,
+		src:  maskSource{modality: "US"},
+	}
+	ct := maskSeriesFile{
+		cols: 512, rows: 512,
+		src:  maskSource{modality: "CT"},
+	}
+	usRule := MaskRegion{Mode: maskModeOutsideUS}
+	rect := MaskRegion{Mode: maskModeRect, W: 1, H: 0.1}
+	exempt := MaskRegion{Mode: maskModeNone}
+
+	cases := []struct {
+		name    string
+		file    maskSeriesFile
+		regions []MaskRegion
+		want    color.Color
+	}{
+		{"calibrated US, US rule", calibrated, []MaskRegion{usRule}, maskStatusMasked},
+		{"rectangle", ct, []MaskRegion{rect}, maskStatusMasked},
+		{"uncalibrated US, US rule only", uncalibrated, []MaskRegion{usRule}, maskStatusFail},
+		{"uncalibrated US, fallback rectangle", uncalibrated, []MaskRegion{usRule, rect}, maskStatusFallback},
+		{"uncalibrated US, exempted", uncalibrated, []MaskRegion{usRule, exempt}, maskStatusExempt},
+		{"CT, US rule is inert", ct, []MaskRegion{usRule}, color.Color(color.Transparent)},
+		{"no regions", ct, nil, color.Color(color.Transparent)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := maskFileStatusColor(tc.file, tc.regions); got != tc.want {
+				t.Errorf("colour = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// The scan builds each file's viewer chapter (frames, label) and masking
+// identity in its one header pass — what the review window's filmstrip cells
+// and status stripes are made of.
+func TestScanMaskSeriesBuildsChapters(t *testing.T) {
+	dir := t.TempDir()
+	clip := filepath.Join(dir, "clip.dcm")
+	still := filepath.Join(dir, "still.dcm")
+	writeSizedTestDICOM(t, clip, "US", 800, 600, "1.2.3.1", 1, 1)
+	writeSizedTestDICOM(t, still, "US", 800, 600, "1.2.3.1", 1, 2)
+
+	// Make the first file a 7-frame clip, the way the calibration test adds
+	// its region: rewrite with the extra element.
+	ds, err := sdicom.ParseFile(clip, nil)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	ds.Elements = append(ds.Elements, mustTestElement(t, tag.NumberOfFrames, []string{"7"}))
+	f, err := os.Create(clip)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := sdicom.Write(f, ds, sdicom.SkipVRVerification(), sdicom.SkipValueTypeVerification()); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f.Close()
+
+	series, skipped := scanMaskSeries([]string{clip, still}, nil)
+	if skipped != 0 || len(series) != 1 || series[0].count() != 2 {
+		t.Fatalf("series = %+v (skipped %d), want one 2-file series", series, skipped)
+	}
+	files := series[0].files
+	if files[0].chap.frames != 7 || files[1].chap.frames != 1 {
+		t.Errorf("chapter frames = %d, %d, want 7 and 1", files[0].chap.frames, files[1].chap.frames)
+	}
+	for i, sf := range files {
+		if sf.chap.label == "" {
+			t.Errorf("file %d has no chapter label", i)
+		}
+		if sf.chap.path != sf.path {
+			t.Errorf("file %d chapter path = %q, want %q", i, sf.chap.path, sf.path)
+		}
+		wantUID := "1.2.3." + filepath.Base(sf.path)
+		if sf.src.sopInstanceUID != wantUID {
+			t.Errorf("file %d mask source SOP UID = %q, want %q", i, sf.src.sopInstanceUID, wantUID)
+		}
+	}
+	// The gate the filmstrip uses: this series holds a clip, so it qualifies.
+	chaps := []chapter{files[0].chap, files[1].chap}
+	if !anyMultiFrame(chaps) {
+		t.Error("a series with a 7-frame clip must qualify for the filmstrip")
+	}
+	// A stills-only series must not: hundreds of near-identical thumbnails
+	// would cost decode time and say nothing.
+	if anyMultiFrame([]chapter{files[1].chap}) {
+		t.Error("a stills-only series must not qualify for the filmstrip")
 	}
 }

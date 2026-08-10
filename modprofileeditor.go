@@ -463,9 +463,10 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 	maskCaption := widget.NewLabel("Areas of the image blanked permanently in the export, as percentages of " +
 		"each image's width and height — so one profile covers a study whose series differ in size. " +
 		"Outside ultrasound region takes its geometry from the file's own region calibration instead, " +
-		"which is what generalises across vendors. Masking writes pixels, so a compressed file is " +
-		"decompressed on export whatever Output transfer syntax says, and a file that cannot be masked " +
-		"fails rather than exporting with the annotation intact.")
+		"which is what generalises across vendors. Masking rewrites the pixels: a losslessly-compressed " +
+		"file is recompressed into its own syntax, a lossy one is re-encoded to JPEG 2000 Lossless with no " +
+		"added loss (the run summary states both), and a file that cannot be masked fails rather than " +
+		"exporting with the annotation intact.")
 	maskCaption.TextStyle = fyne.TextStyle{Italic: true}
 	maskCaption.Wrapping = fyne.TextWrapWord
 	maskSection := prefSection("Pixel masking", maskCaption, ed.fields.masks.canvasObject())

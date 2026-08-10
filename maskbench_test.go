@@ -201,10 +201,10 @@ func runMaskBench(t *testing.T, name string, study maskBenchStudy, p ModProfile)
 	if res.Processed > 0 {
 		perFile = elapsed / time.Duration(res.Processed)
 	}
-	t.Logf("%-18s %8s  %6.1f MB/s in  |  %d processed, %d failed, %d decompressed, %d us-fallback  |  "+
+	t.Logf("%-18s %8s  %6.1f MB/s in  |  %d processed, %d failed, %d recompressed, %d recoded-lossless, %d decompressed, %d us-fallback  |  "+
 		"export %.0f MB from %.0f MB source (x%.1f)  |  %v/file",
 		name, elapsed.Round(time.Millisecond), float64(source)/1e6/elapsed.Seconds(),
-		res.Processed, res.Failed, res.MaskDecompressed, res.MaskUSFallback,
+		res.Processed, res.Failed, res.MaskRecompressed, res.MaskRecodedLossless, res.MaskDecompressed, res.MaskUSFallback,
 		float64(exported)/1e6, float64(source)/1e6, float64(exported)/float64(max(source, 1)),
 		perFile.Round(time.Millisecond))
 	for _, f := range res.Failures {
@@ -275,11 +275,13 @@ func TestMaskBenchScenarios(t *testing.T) {
 			if res.Failed != 0 {
 				t.Errorf("%d file(s) failed", res.Failed)
 			}
-			// Only the named image should have needed decompressing — unless it
-			// was stored uncompressed to begin with, in which case none did.
-			if res.MaskDecompressed > 1 {
-				t.Errorf("MaskDecompressed = %d, want at most 1: files no region applies to "+
-					"must keep their compression", res.MaskDecompressed)
+			// Only the named image should have needed its pixels rewritten
+			// (recompressed into its own syntax, re-encoded lossless from a
+			// lossy source, or decompressed when neither is possible) — unless
+			// it was stored uncompressed to begin with, in which case none did.
+			if rewritten := res.MaskRecompressed + res.MaskRecodedLossless + res.MaskDecompressed; rewritten > 1 {
+				t.Errorf("recompressed+recoded+decompressed = %d, want at most 1: files no region applies to "+
+					"must keep their stored encoding", rewritten)
 			}
 			assertMaskBenchMasked(t, study, out, target)
 		})
@@ -318,14 +320,42 @@ func assertMaskBenchMasked(t *testing.T, study maskBenchStudy, outDir string, ta
 	if !ok || len(info.Frames) == 0 {
 		t.Fatalf("unexpected pixel data in the masked export")
 	}
+	// A lossless source comes back recompressed into its own syntax; anything
+	// else leaves uncompressed. Check row 1 either way — it sits inside the
+	// top 8% of any image tall enough to bother masking.
 	if info.IsEncapsulated {
-		t.Fatal("the masked export is still compressed, so nothing was written to it")
+		tsUID := datasetTransferSyntaxUID(&ds)
+		var (
+			w, nc   int
+			samples []int32
+		)
+		switch tsUID {
+		case tsJPEG2000LL:
+			w, _, nc, _, _, samples, err = decodeJPEG2000(info.Frames[0].EncapsulatedData.Data)
+		case tsJPEGLossless, tsJPEGLosslessSV1:
+			w, _, nc, _, _, samples, err = decodeJPEGLossless(info.Frames[0].EncapsulatedData.Data)
+		default:
+			t.Fatalf("the masked export is still compressed as %s, so nothing was written to it",
+				transferSyntaxLabel(tsUID))
+		}
+		if err != nil {
+			t.Fatalf("decode masked export: %v", err)
+		}
+		// Decoded samples are planar: nc planes of w*h each.
+		pixels := len(samples) / max(nc, 1)
+		for c := 0; c < nc; c++ {
+			if v := samples[c*pixels+1*w+w/2]; v != 0 {
+				t.Errorf("%s was not masked: plane %d sample %d at mid-width, row 1",
+					filepath.Base(target.path), c, v)
+				return
+			}
+		}
+		return
 	}
 	nf, err := info.Frames[0].GetNativeFrame()
 	if err != nil {
 		t.Fatalf("native frame: %v", err)
 	}
-	// Row 1 sits inside the top 8% of any image tall enough to bother masking.
 	px, err := nf.GetPixel(nf.Cols()/2, 1)
 	if err != nil {
 		t.Fatalf("GetPixel: %v", err)

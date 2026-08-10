@@ -3,10 +3,12 @@ package main
 // Pixel masking — blanking burned-in PHI in the exported copy of an image.
 //
 // This is the only part of the application that writes pixel values. It works
-// on native (uncompressed) pixel data only: there are decoders but no encoders,
-// so a masked image can only leave as one of the uncompressed syntaxes, and the
-// caller must have decompressed first. processFile does exactly that, which is
-// why masking runs after the transfer-syntax conversion rather than before it.
+// on native (uncompressed) pixel data only — the caller must have decompressed
+// first. processFile does exactly that, which is why masking runs after the
+// transfer-syntax conversion rather than before it; afterwards the masked
+// frames are re-encoded — back into a lossless source's own syntax, or into
+// JPEG 2000 Lossless for a lossy source (recompress.go) — so decompression
+// here no longer dictates what the export looks like.
 //
 // The load-bearing rule: if masking was asked for and cannot be carried out on
 // a file that has pixel data, the file must fail. Exporting it unmasked would
