@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.16.0] — 2026-08-18
+
+### Added
+
+- **Modification exports can include a DICOMDIR index** — a new "Include DICOMDIR" option (Modification & Export profile editor, and the Modification dialog's Export section alongside Zip export) writes a PS3.10 File-set index referencing every exported file, so a DICOM viewer or a CD/DVD-burning workflow can browse the export without a database. dicomtool's own `dicomdir` option refuses to combine with `zip`; here the two compose freely, and the index lands as a `DICOMDIR` entry inside the `.zip` when both are checked together
+
+### Changed
+
+- **A modification export keeps its source study and series folder names** — a Patient-level export used to replace every study folder with a generic `study-01`, `study-02`, … because a study folder was assumed to carry PHI. It does not: only the patient folder (name + MRN) does, and that is already what the export folder name typed in the Modification dialog replaces. Every folder below the export root now keeps its original name — study, series, and any deeper subfolder — **unless** the profile actually deletes or replaces a value that name is built from, in which case just that one folder is rebuilt from the new value (a removed Study Description becomes `Unknown Study`, a shifted Study Date or a replaced Series Description shows the new one), using the same naming the download folder itself uses. The exported file name follows the same rule: it now matches the file's SOP Instance UID after Remap UIDs runs, instead of leaving the original UID as the file name of a de-identified export
+
 ## [1.15.0] — 2026-08-10
 
 ### Added

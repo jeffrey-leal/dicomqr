@@ -61,12 +61,20 @@ type ModProfile struct {
 	RemapUIDs        bool     `json:"remapuids,omitempty"`
 	Priv             bool     `json:"noprivate,omitempty"`
 	KeepPrivate      bool     `json:"keepprivate,omitempty"`
-	Dicomdir         bool     `json:"dicomdir,omitempty"`
 	Verbose          bool     `json:"verbose,omitempty"`
 	Zip              bool     `json:"zip,omitempty"`
 	IgnoreTypes      []string `json:"ignoretype,omitempty"`
 	IgnoreModalities []string `json:"ignoremodality,omitempty"`
 	FixVR            string   `json:"fixvr,omitempty"`
+
+	// Dicomdir writes a DICOMDIR (PS3.10 File-set) index alongside the export,
+	// referencing every file the run actually wrote — the same key dicomtool
+	// uses, but dicomtool's own `dicomdir:true` refuses to combine with
+	// `zip:true`; here Zip export and Dicomdir compose freely, the index
+	// landing as a "DICOMDIR" entry inside the archive when both are set
+	// (dicomdir.go, modifyengine.go). Profile-wide only, like Zip and
+	// TransferSyntax — there is no per-modality meaning for a run-level index.
+	Dicomdir bool `json:"dicomdir,omitempty"`
 
 	// NoOverlays removes every overlay-plane group (6000–60FE, even) on export.
 	// Overlay Data (60xx,3000) is a bitmap channel a vendor can burn patient

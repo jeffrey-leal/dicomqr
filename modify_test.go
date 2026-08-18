@@ -85,6 +85,9 @@ func TestCompileModifyParamsValidation(t *testing.T) {
 		// the only place the application can convert a file.
 		{"transfersyntax only is actionable", ModProfile{TransferSyntax: tsPrefImplicitLE}, ""},
 		{"nooverlays only is actionable", ModProfile{NoOverlays: true}, ""},
+		// Like transfersyntax, a bare dicomdir request is a real standalone
+		// export operation (unmodified files plus an index), not a no-op.
+		{"dicomdir only is actionable", ModProfile{Dicomdir: true}, ""},
 		{"shiftdays only is actionable", ModProfile{ShiftDays: "-45"}, ""},
 		{"shiftdays zero accepted", ModProfile{ShiftDays: "0"}, ""},
 		// A bare keyword used to resolve through tags.json. With aliases gone it
@@ -537,6 +540,161 @@ func TestRunModificationToZip(t *testing.T) {
 	}
 }
 
+// TestRunModificationDicomdir: a folder-mode run with Dicomdir set writes a
+// DICOMDIR at the export root that references the file actually written —
+// the folder-export counterpart of TestRunModificationToZipDicomdir.
+func TestRunModificationDicomdir(t *testing.T) {
+	params, err := compileModifyParams(ModProfile{Sets: []string{"0010,0010=ANON"}, Dicomdir: true})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	rootDir, outDir := t.TempDir(), t.TempDir()
+	subDir := filepath.Join(rootDir, "PAT", "STUDY")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srcPath := filepath.Join(subDir, "img1.dcm")
+	writeModifyTestDICOM(t, srcPath)
+
+	res := runModification(context.Background(), []string{srcPath}, rootDir, outDir, params, nil, nil)
+	if res.Failed != 0 || res.Processed != 1 {
+		t.Fatalf("result = %+v, want 1 processed 0 failed", res)
+	}
+	if !res.DicomdirWritten || res.DicomdirError != "" {
+		t.Fatalf("DicomdirWritten=%v DicomdirError=%q, want written with no error", res.DicomdirWritten, res.DicomdirError)
+	}
+
+	records, firstIdx, _ := parseDICOMDIR(t, mustReadFile(t, filepath.Join(outDir, "DICOMDIR")))
+	// patient → study → series → image: three .child hops down from the root.
+	studyIdx := records[firstIdx].child
+	seriesIdx := records[studyIdx].child
+	imageIdx := records[seriesIdx].child
+	imgRecs := walkSiblings(records, imageIdx)
+	if len(imgRecs) != 1 || records[imgRecs[0]].recordType != "IMAGE" {
+		t.Fatalf("image records = %+v, want exactly one IMAGE record", imgRecs)
+	}
+	refID := records[imgRecs[0]].fields[tag.ReferencedFileID]
+	if got := filepath.Join(refID...); got != filepath.Join("PAT", "STUDY", "img1.dcm") {
+		t.Errorf("ReferencedFileID = %v, want PAT/STUDY/img1.dcm", refID)
+	}
+	if _, err := os.Stat(filepath.Join(outDir, filepath.Join(refID...))); err != nil {
+		t.Errorf("DICOMDIR references a file that was not written: %v", err)
+	}
+}
+
+// TestRunModificationDicomdirNoFiles: a run where the only file is skipped
+// leaves no DICOMDIR behind — an index with nothing in it is worse than no
+// index, since its mere presence would claim the export succeeded.
+func TestRunModificationDicomdirNoFiles(t *testing.T) {
+	profiles := embeddedModConfigs(t)
+	resolved, err := resolveModProfile("base-deident", profiles) // ignores OT
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	resolved.Dicomdir = true
+	params, err := compileModifyParams(resolved)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	rootDir, outDir := t.TempDir(), t.TempDir()
+	srcPath := filepath.Join(rootDir, "ot.dcm")
+	writeModifyTestDICOMModality(t, srcPath, "OT")
+
+	res := runModification(context.Background(), []string{srcPath}, rootDir, outDir, params, nil, nil)
+	if res.Skipped != 1 || res.Processed != 0 {
+		t.Fatalf("result = %+v, want the OT file skipped", res)
+	}
+	if res.DicomdirWritten {
+		t.Error("DicomdirWritten = true, want false — nothing was exported to index")
+	}
+	if _, err := os.Stat(filepath.Join(outDir, "DICOMDIR")); !os.IsNotExist(err) {
+		t.Errorf("DICOMDIR exists for a run that wrote nothing: %v", err)
+	}
+}
+
+// TestRunModificationToZipDicomdir: with Zip export and Dicomdir both set,
+// the DICOMDIR lands as its own entry inside the archive — the combination
+// dicomtool's CLI refuses but dicomqr supports, since it is the shape a
+// CD/DVD-burning workflow actually wants.
+func TestRunModificationToZipDicomdir(t *testing.T) {
+	params, err := compileModifyParams(ModProfile{Sets: []string{"0010,0010=ANON"}, Dicomdir: true})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	rootDir, outDir := t.TempDir(), t.TempDir()
+	subDir := filepath.Join(rootDir, "PAT", "STUDY")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	srcPath := filepath.Join(subDir, "img1.dcm")
+	writeModifyTestDICOM(t, srcPath)
+
+	zipPath := filepath.Join(outDir, "export.zip")
+	res := runModificationToZip(context.Background(), []string{srcPath}, rootDir, zipPath, params, nil, nil)
+	if res.Failed != 0 || res.Processed != 1 {
+		t.Fatalf("result = %+v, want 1 processed 0 failed", res)
+	}
+	if !res.DicomdirWritten || res.DicomdirError != "" {
+		t.Fatalf("DicomdirWritten=%v DicomdirError=%q, want written with no error", res.DicomdirWritten, res.DicomdirError)
+	}
+
+	zr, err := zip.OpenReader(zipPath)
+	if err != nil {
+		t.Fatalf("open zip: %v", err)
+	}
+	defer zr.Close()
+	if len(zr.File) != 2 {
+		names := make([]string, 0, len(zr.File))
+		for _, f := range zr.File {
+			names = append(names, f.Name)
+		}
+		t.Fatalf("zip entries = %v, want 2 (the file and DICOMDIR)", names)
+	}
+	var ddEntry *zip.File
+	for _, f := range zr.File {
+		if f.Name == "DICOMDIR" {
+			ddEntry = f
+		}
+	}
+	if ddEntry == nil {
+		t.Fatal("no DICOMDIR entry in the archive")
+	}
+	rc, err := ddEntry.Open()
+	if err != nil {
+		t.Fatalf("open DICOMDIR entry: %v", err)
+	}
+	data, err := io.ReadAll(rc)
+	rc.Close()
+	if err != nil {
+		t.Fatalf("read DICOMDIR entry: %v", err)
+	}
+	records, firstIdx, _ := parseDICOMDIR(t, data)
+	// patient → study → series → image: three .child hops down from the root.
+	studyIdx := records[firstIdx].child
+	seriesIdx := records[studyIdx].child
+	imageIdx := records[seriesIdx].child
+	imgRecs := walkSiblings(records, imageIdx)
+	if len(imgRecs) != 1 || records[imgRecs[0]].recordType != "IMAGE" {
+		t.Fatalf("image records = %+v, want exactly one IMAGE record", imgRecs)
+	}
+	if got := records[imgRecs[0]].fields[tag.ReferencedFileID]; filepath.ToSlash(filepath.Join(got...)) != "PAT/STUDY/img1.dcm" {
+		t.Errorf("ReferencedFileID = %v, want PAT/STUDY/img1.dcm", got)
+	}
+}
+
+// mustReadFile reads path or fails the test.
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return data
+}
+
 // A profile's transfer syntax converts the export while the de-identification
 // still applies, and the source in the download folder is left in its own
 // syntax — the whole point of converting here rather than on the retrieve.
@@ -723,51 +881,198 @@ func modifyTestPixels(t *testing.T, ds *sdicom.Dataset) []uint8 {
 	return nf.RawData
 }
 
-// TestExportRelPaths verifies the PHI-safe export layout: a study-level run
-// drops the patient and study folder names entirely, a patient-level run
-// replaces each study folder with a deterministic generic study-NN, and files
-// outside the expected layout (flat fallback) map to their bare file name.
-func TestExportRelPaths(t *testing.T) {
+// TestExportLayoutRelFor verifies the PHI-safe export layout: the export root
+// stands in for the patient folder (dropDirs 1) or patient+study (dropDirs
+// 2); every folder and the file name below it keep their source name unless
+// the export-name tags actually changed between before and after, in which
+// case that one component is rebuilt with the same rules organizeFilePath
+// uses for the download folder.
+func TestExportLayoutRelFor(t *testing.T) {
 	root := filepath.Join("dl")
 	patient := "DOE^JOHN (MRN12345)"
-	studyA := "CT ABDOMEN (20240101)"
-	studyB := "CT CHEST (20230601)"
-	fA1 := filepath.Join(root, patient, studyA, "AX W CONTRAST (2)", "1.dcm")
-	fA2 := filepath.Join(root, patient, studyA, "SCOUT (1)", "2.dcm")
-	fB1 := filepath.Join(root, patient, studyB, "AX (3)", "sub", "3.dcm")
-	flat := filepath.Join(root, "4.dcm")
-	outside := filepath.Join("elsewhere", "5.dcm")
+	studyOrig := "CT ABDOMEN (20240101)"
+	handMade := "My Renamed Study Folder"
+	series := "AX W CONTRAST (2)"
+	uidA, uidB := "1.2.840.10.1", "1.2.840.10.2"
 
-	// Study level: only the series structure survives.
-	rels := exportRelPaths([]string{fA1, fA2, flat}, root, true)
-	if got, want := rels[fA1], filepath.Join("AX W CONTRAST (2)", "1.dcm"); got != want {
-		t.Errorf("study-level rel = %q, want %q", got, want)
+	names := func(desc, date, sdesc, snum, uid string) exportNames {
+		return exportNames{studyDesc: desc, studyDate: date, seriesDesc: sdesc, seriesNumber: snum, sopUID: uid}
 	}
-	if got, want := rels[fA2], filepath.Join("SCOUT (1)", "2.dcm"); got != want {
-		t.Errorf("study-level rel = %q, want %q", got, want)
+	before := names("CT ABDOMEN", "20240101", "AX W CONTRAST", "2", uidA)
+
+	tests := []struct {
+		name     string
+		dropDirs int
+		src      string
+		before   exportNames
+		after    exportNames
+		want     string
+	}{
+		{"study level drops patient and study, keeps series", 2,
+			filepath.Join(root, patient, studyOrig, series, "1.dcm"), before, before,
+			filepath.Join(series, "1.dcm")},
+		{"patient level keeps an unaffected study folder verbatim", 1,
+			filepath.Join(root, patient, studyOrig, series, "1.dcm"), before, before,
+			filepath.Join(studyOrig, series, "1.dcm")},
+		{"a hand-renamed study folder survives when its tags are untouched", 1,
+			filepath.Join(root, patient, handMade, series, "1.dcm"), before, before,
+			filepath.Join(handMade, series, "1.dcm")},
+		{"a shifted StudyDate rebuilds only the study component", 1,
+			filepath.Join(root, patient, studyOrig, series, "1.dcm"), before,
+			names("CT ABDOMEN", "20240103", "AX W CONTRAST", "2", uidA),
+			filepath.Join("CT ABDOMEN (20240103)", series, "1.dcm")},
+		{"a replaced StudyDescription rebuilds the study component", 1,
+			filepath.Join(root, patient, studyOrig, series, "1.dcm"), before,
+			names("ANONYMIZED", "20240101", "AX W CONTRAST", "2", uidA),
+			filepath.Join("ANONYMIZED (20240101)", series, "1.dcm")},
+		{"a removed StudyDescription falls back to Unknown Study", 1,
+			filepath.Join(root, patient, studyOrig, series, "1.dcm"), before,
+			names("", "20240101", "AX W CONTRAST", "2", uidA),
+			filepath.Join("Unknown Study (20240101)", series, "1.dcm")},
+		{"a replaced SeriesDescription rebuilds only the series component", 2,
+			filepath.Join(root, patient, studyOrig, series, "1.dcm"), before,
+			names("CT ABDOMEN", "20240101", "SERIES", "2", uidA),
+			filepath.Join("SERIES (2)", "1.dcm")},
+		{"deeper nesting is preserved verbatim", 1,
+			filepath.Join(root, patient, studyOrig, series, "sub", "1.dcm"), before, before,
+			filepath.Join(studyOrig, series, "sub", "1.dcm")},
+		{"a changed SOP Instance UID renames the file", 2,
+			filepath.Join(root, patient, studyOrig, series, "1.dcm"), before,
+			names("CT ABDOMEN", "20240101", "AX W CONTRAST", "2", uidB),
+			filepath.Join(series, sanitize(uidB)+".dcm")},
+		{"an unchanged SOP Instance UID keeps the original file name", 2,
+			filepath.Join(root, patient, studyOrig, series, "1.dcm"), before, before,
+			filepath.Join(series, "1.dcm")},
+		{"the flat fallback maps to the bare file name", 1,
+			filepath.Join(root, "4.dcm"), before, before, "4.dcm"},
+		{"the flat fallback still renames on a changed UID", 1,
+			filepath.Join(root, "4.dcm"), before,
+			names("CT ABDOMEN", "20240101", "AX W CONTRAST", "2", uidB),
+			sanitize(uidB) + ".dcm"},
+		{"a path outside root maps to the bare file name", 1,
+			filepath.Join("elsewhere", "5.dcm"), before, before, "5.dcm"},
 	}
-	if got := rels[flat]; got != "4.dcm" {
-		t.Errorf("flat-fallback rel = %q, want 4.dcm", got)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			l := exportLayout{dropDirs: tc.dropDirs}
+			if got := l.relFor(tc.src, root, tc.before, tc.after); got != tc.want {
+				t.Errorf("relFor() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// writeExportLayoutFixture writes a minimal CT file carrying the identifiers
+// an export path is built from, for TestRunModificationExportLayout.
+func writeExportLayoutFixture(t *testing.T, path, studyUID, seriesUID, sopUID,
+	studyDesc, studyDate, seriesDesc, seriesNum string) {
+	t.Helper()
+	nf := frame.NewNativeFrame[uint8](8, 2, 2, 4, 1)
+	copy(nf.RawData, []uint8{10, 20, 30, 40})
+	pd, err := sdicom.NewElement(tag.PixelData, sdicom.PixelDataInfo{
+		IsEncapsulated: false,
+		Frames:         []*frame.Frame{{Encapsulated: false, NativeData: nf}},
+	})
+	if err != nil {
+		t.Fatalf("NewElement(PixelData): %v", err)
+	}
+	elems := []*sdicom.Element{
+		mustTestElement(t, tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.7"}),
+		mustTestElement(t, tag.MediaStorageSOPInstanceUID, []string{sopUID}),
+		mustTestElement(t, tag.TransferSyntaxUID, []string{tsExplicitVRLE}),
+		mustTestElement(t, tag.SOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.7"}),
+		mustTestElement(t, tag.SOPInstanceUID, []string{sopUID}),
+		mustTestElement(t, tag.PatientName, []string{"DOE^JANE"}),
+		mustTestElement(t, tag.PatientID, []string{"PID123"}),
+		mustTestElement(t, tag.PatientBirthDate, []string{"19800615"}),
+		mustTestElement(t, tag.Modality, []string{"CT"}),
+		mustTestElement(t, tag.StudyDate, []string{studyDate}),
+		mustTestElement(t, tag.StudyDescription, []string{studyDesc}),
+		mustTestElement(t, tag.SeriesDescription, []string{seriesDesc}),
+		mustTestElement(t, tag.SeriesNumber, []string{seriesNum}),
+		mustTestElement(t, tag.StudyInstanceUID, []string{studyUID}),
+		mustTestElement(t, tag.SeriesInstanceUID, []string{seriesUID}),
+		mustTestElement(t, tag.PhotometricInterpretation, []string{"MONOCHROME2"}),
+		mustTestElement(t, tag.Rows, []int{2}),
+		mustTestElement(t, tag.Columns, []int{2}),
+		mustTestElement(t, tag.BitsAllocated, []int{8}),
+		mustTestElement(t, tag.BitsStored, []int{8}),
+		mustTestElement(t, tag.HighBit, []int{7}),
+		mustTestElement(t, tag.PixelRepresentation, []int{0}),
+		mustTestElement(t, tag.SamplesPerPixel, []int{1}),
+		pd,
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer f.Close()
+	if err := sdicom.Write(f, sdicom.Dataset{Elements: elems},
+		sdicom.SkipVRVerification(), sdicom.SkipValueTypeVerification()); err != nil {
+		t.Fatalf("write test DICOM: %v", err)
+	}
+}
+
+// TestRunModificationExportLayout is the end-to-end counterpart to
+// TestExportLayoutRelFor: base-deident remaps UIDs but never touches
+// Study/SeriesDescription or Study/SeriesDate/Number, so a two-study export
+// keeps both studies' real folder names — never study-01/study-02 — while
+// every file is renamed after its remapped SOP Instance UID.
+func TestRunModificationExportLayout(t *testing.T) {
+	profiles := embeddedModConfigs(t)
+	resolved, err := resolveModProfile("base-deident", profiles)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	params, err := compileModifyParams(resolved)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
 	}
 
-	// Patient level: study folders become study-NN in sorted folder-name
-	// order (studyA sorts before studyB), deeper nesting is preserved.
-	rels = exportRelPaths([]string{fB1, fA1, outside}, root, false)
-	if got, want := rels[fA1], filepath.Join("study-01", "AX W CONTRAST (2)", "1.dcm"); got != want {
-		t.Errorf("patient-level rel = %q, want %q", got, want)
-	}
-	if got, want := rels[fB1], filepath.Join("study-02", "AX (3)", "sub", "3.dcm"); got != want {
-		t.Errorf("patient-level rel = %q, want %q", got, want)
-	}
-	if got := rels[outside]; got != "5.dcm" {
-		t.Errorf("outside-root rel = %q, want 5.dcm", got)
+	rootDir := t.TempDir()
+	patient := "DOE^JANE (PID123)"
+	studyA, seriesA := "CT ABDOMEN (20240101)", "AX W CONTRAST (2)"
+	studyB, seriesB := "CT CHEST (20230601)", "AX (3)"
+	srcA := filepath.Join(rootDir, patient, studyA, seriesA, "1.dcm")
+	srcB := filepath.Join(rootDir, patient, studyB, seriesB, "1.dcm")
+	writeExportLayoutFixture(t, srcA, "1.2.1", "1.2.1.1", "1.2.1.1.1", "CT ABDOMEN", "20240101", "AX W CONTRAST", "2")
+	writeExportLayoutFixture(t, srcB, "1.2.2", "1.2.2.1", "1.2.2.1.1", "CT CHEST", "20230601", "AX", "3")
+
+	outDir := t.TempDir()
+	layout := &exportLayout{dropDirs: 1}
+	res := runModification(context.Background(), []string{srcA, srcB}, rootDir, outDir, params, layout, nil)
+	if res.Failed != 0 || res.Processed != 2 {
+		t.Fatalf("result = %+v (%v), want 2 processed 0 failed", res, res.Failures)
 	}
 
-	// No PHI-bearing component may survive in any mapped path.
-	for _, m := range rels {
-		if strings.Contains(m, patient) || strings.Contains(m, studyA) || strings.Contains(m, studyB) {
-			t.Errorf("mapped path %q leaks a source folder name", m)
-		}
+	studyADir := filepath.Join(outDir, studyA, seriesA)
+	studyBDir := filepath.Join(outDir, studyB, seriesB)
+	entriesA, err := os.ReadDir(studyADir)
+	if err != nil || len(entriesA) != 1 {
+		t.Fatalf("read %s: %v (entries=%v)", studyADir, err, entriesA)
+	}
+	entriesB, err := os.ReadDir(studyBDir)
+	if err != nil || len(entriesB) != 1 {
+		t.Fatalf("read %s: %v (entries=%v)", studyBDir, err, entriesB)
+	}
+
+	dsA, err := sdicom.ParseFile(filepath.Join(studyADir, entriesA[0].Name()), nil)
+	if err != nil {
+		t.Fatalf("parse exported A: %v", err)
+	}
+	e, err := dsA.FindElementByTag(tag.SOPInstanceUID)
+	if err != nil {
+		t.Fatalf("SOPInstanceUID missing: %v", err)
+	}
+	remappedUID := strings.TrimSpace(sdicom.MustGetStrings(e.Value)[0])
+	if remappedUID == "1.2.1.1.1" {
+		t.Fatalf("SOPInstanceUID unchanged — remapuids should have replaced it")
+	}
+	if want := sanitize(remappedUID) + ".dcm"; entriesA[0].Name() != want {
+		t.Errorf("exported file name = %q, want %q (matching the remapped SOP Instance UID)", entriesA[0].Name(), want)
 	}
 }
 

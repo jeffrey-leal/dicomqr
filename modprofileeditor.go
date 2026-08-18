@@ -13,8 +13,8 @@ package main
 //
 // Anything without a control is preserved unchanged, so a hand-authored (or
 // dicomtool-authored) profile survives a round-trip through the editor:
-// dicomdir and verbose (never read by the engine), a top-level keepprivate
-// (honored only inside per-modality blocks), and any per-modality scalar.
+// verbose (never read by the engine), a top-level keepprivate (honored only
+// inside per-modality blocks), and any per-modality scalar.
 
 import (
 	"fmt"
@@ -164,6 +164,7 @@ type modProfileEditor struct {
 	remapCheck       *widget.Check
 	tsSelect         *widget.Select
 	zipCheck         *widget.Check
+	dicomdirCheck    *widget.Check
 	ignoreTypesEntry *widget.Entry
 	ignoreModsEntry  *widget.Entry
 	// perMod is the working copy edited through the per-modality sub-editor.
@@ -228,6 +229,9 @@ func newModProfileEditor(name string, p ModProfile, cfg ModProfileConfig) *modPr
 	e.zipCheck = widget.NewCheck("", nil)
 	e.zipCheck.SetChecked(p.Zip)
 
+	e.dicomdirCheck = widget.NewCheck("", nil)
+	e.dicomdirCheck.SetChecked(p.Dicomdir)
+
 	e.ignoreTypesEntry = widget.NewEntry()
 	e.ignoreTypesEntry.SetText(strings.Join(p.IgnoreTypes, ", "))
 	e.ignoreTypesEntry.SetPlaceHolder("e.g. SECONDARY, LOCALIZER")
@@ -241,8 +245,8 @@ func newModProfileEditor(name string, p ModProfile, cfg ModProfileConfig) *modPr
 }
 
 // validate checks every control and returns the (possibly renamed) profile to
-// save. updated starts as the original, so fields without controls (dicomdir,
-// verbose, top-level keepprivate) carry through untouched.
+// save. updated starts as the original, so fields without controls (verbose,
+// top-level keepprivate) carry through untouched.
 func (e *modProfileEditor) validate() (string, ModProfile, error) {
 	newName := strings.TrimSpace(e.nameEntry.Text)
 	if newName == "" {
@@ -283,6 +287,7 @@ func (e *modProfileEditor) validate() (string, ModProfile, error) {
 	updated.RemapUIDs = e.remapCheck.Checked
 	updated.TransferSyntax = transferSyntaxPrefFromLabel(e.tsSelect.Selected)
 	updated.Zip = e.zipCheck.Checked
+	updated.Dicomdir = e.dicomdirCheck.Checked
 	// The engine matches these filters against ImageType/Modality components
 	// case-insensitively; casing is stored as typed. CS values cannot contain
 	// commas, so the comma-joined display round-trips exactly.
@@ -445,7 +450,8 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 		widget.NewFormItem("Shift dates (days)", ed.shiftDays),
 		widget.NewFormItem("Fix VR", ed.fixvr),
 		widget.NewFormItem("Output transfer syntax", ed.tsSelect),
-		widget.NewFormItem("Zip export", ed.zipCheck))
+		widget.NewFormItem("Zip export", ed.zipCheck),
+		widget.NewFormItem("Include DICOMDIR", ed.dicomdirCheck))
 
 	filterCaption := widget.NewLabel("Files matching either comma-separated filter are skipped entirely.")
 	filterCaption.TextStyle = fyne.TextStyle{Italic: true}
@@ -536,9 +542,6 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 	var preserved []string
 	if p.KeepPrivate {
 		preserved = append(preserved, "keepprivate (honored only inside per-modality overrides)")
-	}
-	if p.Dicomdir {
-		preserved = append(preserved, "dicomdir")
 	}
 	if p.Verbose {
 		preserved = append(preserved, "verbose")

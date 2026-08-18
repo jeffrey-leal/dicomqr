@@ -63,9 +63,9 @@ func TestModProfileScalarValidators(t *testing.T) {
 }
 
 // TestModProfileEditorRoundTrip drives the editor over a maximal profile and
-// verifies edited fields land, control-less fields (dicomdir, verbose,
-// top-level keepprivate) survive untouched, and the result still round-trips
-// through the profile store unchanged.
+// verifies edited fields land, control-less fields (verbose, top-level
+// keepprivate) survive untouched, and the result still round-trips through
+// the profile store unchanged.
 func TestModProfileEditorRoundTrip(t *testing.T) {
 	test.NewApp()
 	p := ModProfile{
@@ -112,15 +112,15 @@ func TestModProfileEditorRoundTrip(t *testing.T) {
 	if want := []string{"SR", "PR"}; !reflect.DeepEqual(updated.IgnoreModalities, want) {
 		t.Errorf("IgnoreModalities = %v, want %v", updated.IgnoreModalities, want)
 	}
-	if !updated.KeepPrivate || !updated.Dicomdir || !updated.Verbose {
-		t.Errorf("control-less fields lost: keepprivate=%v dicomdir=%v verbose=%v",
-			updated.KeepPrivate, updated.Dicomdir, updated.Verbose)
+	if !updated.KeepPrivate || !updated.Verbose {
+		t.Errorf("control-less fields lost: keepprivate=%v verbose=%v",
+			updated.KeepPrivate, updated.Verbose)
 	}
 	if !reflect.DeepEqual(updated.PerModality, p.PerModality) {
 		t.Errorf("PerModality changed: %+v", updated.PerModality)
 	}
 	if updated.DOB != "19000101" || updated.UIDSuffix != "99" || updated.ShiftDays != "-30" ||
-		updated.FixVR != "correct" || !updated.Priv || !updated.Zip ||
+		updated.FixVR != "correct" || !updated.Priv || !updated.Zip || !updated.Dicomdir ||
 		updated.TransferSyntax != tsPrefImplicitLE {
 		t.Errorf("unedited controlled fields changed: %+v", updated)
 	}

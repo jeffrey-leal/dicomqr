@@ -1,8 +1,8 @@
 # dicomqr
 
-**User Manual  v1.15.0**
+**User Manual  v1.16.0**
 
-August 10, 2026
+August 18, 2026
 
 A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.
 
@@ -783,7 +783,7 @@ Linking one set value to another. A set value written as a tag in square bracket
 
 A reference only ever reads values this profile sets. It cannot read the value in the file being modified — that would copy the real patient name forward into whichever field referenced it, once per file and invisibly, which is the opposite of what a de-identification profile is for. References also do not chain: pointing at a field that is itself a reference is reported as an error rather than followed.
 
-The dicomdir and verbose flags, and any other hand-authored settings without a control, are preserved unchanged so dicomtool-authored profiles survive a round-trip through the editor. Both editors list such values in an italic note rather than hiding them: in an override the note distinguishes settings the modification engine ignores inside a per-modality block from profile-wide options that a hand-authored block still applies.
+The verbose flag, and any other hand-authored setting without a control, is preserved unchanged so a dicomtool-authored profile survives a round-trip through the editor. Both editors list such values in an italic note rather than hiding them: in an override the note distinguishes settings the modification engine ignores inside a per-modality block from profile-wide options that a hand-authored block still applies.
 
 Defaults:
 
@@ -792,9 +792,9 @@ Defaults:
 | Default output folder | Where modification exports are written. When set, the Modification dialog uses it directly — no folder picker appears; the dialog's Change… button overrides it for a single run. When empty, the dialog asks on the first run and saves that choice here. Must be outside the download folder — modified files are never mixed into the local index. |
 | Default export format | The file type listed first in the View Tags Export Tags… save dialog, and the format used when the typed filename has no extension (Section 8.8). |
 
-Running a modification (Local Browse right-click > Modification > profile) opens a confirmation window showing what the profile will do, with everything on it editable for that run alone. The window can be moved and resized, and its contents scroll, so a profile with a long list of set values or removed tags still shows its Modify… and Cancel buttons. The export is written to <output folder>\<export folder name>, and the export folder name is entered here. Its default comes from the profile: base-deident names the export after the new patient name, so typing a name into the Patient Name set field fills the Patient ID and the export folder name with it as you type. A profile that names no export default falls back to a profile-name-plus-timestamp suggestion. Any of these fields stops following the moment it is edited directly, so a suggested value can simply be overtyped. The original patient and study folder names are never reused, because they often contain PHI (patient name, MRN, study description, dates). Inside the export folder a study-level run keeps only the series subfolders, and a patient-level run replaces each study folder with a generic study-01, study-02, … in sorted order.
+Running a modification (Local Browse right-click > Modification > profile) opens a confirmation window showing what the profile will do, with everything on it editable for that run alone. The window can be moved and resized, and its contents scroll, so a profile with a long list of set values or removed tags still shows its Modify… and Cancel buttons. The export is written to <output folder>\<export folder name>, and the export folder name is entered here. Its default comes from the profile: base-deident names the export after the new patient name, so typing a name into the Patient Name set field fills the Patient ID and the export folder name with it as you type. A profile that names no export default falls back to a profile-name-plus-timestamp suggestion. Any of these fields stops following the moment it is edited directly, so a suggested value can simply be overtyped. The export folder name replaces the original patient folder — and, for a Study-level run, the study folder too — because a patient folder always identifies someone. Folders below it (the study folder on a Patient-level run, and every series folder) keep their original names, unless the profile deletes or replaces the value a name is built from — a removed Study Description, a replaced Series Description, a shifted Study Date — in which case just that folder is rebuilt from the new value, following the same naming the download folder itself uses. A file whose SOP Instance UID is remapped is renamed to match, so no original UID survives the export either.
 
-The dialog's Options section shows the effective settings and lets any of them be changed for this run only — nothing typed there is written back to the profile. It presents the same controls in the same order as the profile editor's Options section, Output transfer syntax included, so an export can be converted (or left as stored) without editing the profile it came from. The one control positioned differently is Zip export, which sits in this dialog's Export section beside the output folder and export folder name it changes.
+The dialog's Options section shows the effective settings and lets any of them be changed for this run only — nothing typed there is written back to the profile. It presents the same controls in the same order as the profile editor's Options section, Output transfer syntax included, so an export can be converted (or left as stored) without editing the profile it came from. The two controls positioned differently are Zip export and Include DICOMDIR, which sit in this dialog's Export section beside the output folder and export folder name they change.
 
 Converting on export, rather than on retrieve. A transfer syntax can be required in two independent places, and they answer different questions. The server profile's Transfer syntax (Section 4.1) constrains what a retrieve is allowed to receive, and converts on the way in; the modification profile's Output transfer syntax converts on the way out, when files are exported. Setting the server profile to 'As stored' and the modification profile to an uncompressed syntax keeps the download folder in the archive's own encoding — the original bytes, retrieved once — and pays the conversion cost only for the files actually exported. A file that will not convert is then one reported failure in an export that otherwise completes, instead of an object dropped during a retrieve. The trade-off is that only the retrieve side can stop a PACS sending something the application cannot read at all (JPEG-LS, RLE, MPEG); with no requirement in the server profile, such files can reach the download folder, where they can be neither displayed nor converted on export.
 
@@ -804,6 +804,8 @@ If any file fails during a run, the progress dialog is replaced by a dialog list
 
 Checking Zip export in the dialog (pre-checked when the profile's Zip export option is set) writes the run into a single compressed <output folder>\<export folder name>.zip instead of a folder, with the same PHI-safe layout inside the archive. The archive is assembled as a hidden temporary file and renamed into place when the run finishes, so a cancelled run keeps the files completed before the cancel, while a run that writes nothing — or fails while finalizing the archive — leaves no zip behind. An existing zip of the same name is replaced after confirmation.
 
+Checking Include DICOMDIR (pre-checked when the profile's Include DICOMDIR option is set) adds a DICOMDIR index to the export — a standard PS3.10 File-set directory listing every exported file's patient, study, series and instance, which lets a DICOM viewer or a CD/DVD-burning workflow browse the export without a database. It is built once the run finishes, from whichever files it actually wrote, so a cancelled or partially-failed run still gets an index of what it did write. With Zip export also checked, the index is written as a DICOMDIR entry inside the archive rather than a separate file. Unlike a failed conversion or a masking failure, a DICOMDIR that could not be written never marks the run as failed — the exported DICOM files themselves are unaffected — but the completion summary says so.
+
 
 ## 15  Status Bar
 
@@ -811,7 +813,7 @@ The status bar at the bottom of the window provides real-time feedback. A colour
 
 | Situation | Status bar text |
 |---|---|
-| Application started, not connected | `v1.15.0` |
+| Application started, not connected | `v1.16.0` |
 | Connecting to server | `Connecting…` |
 | Connected | `Connected: <AE>@<host>:<port>` |
 | Connection cancelled | `Connection cancelled` |

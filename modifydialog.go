@@ -30,12 +30,13 @@ import (
 const fixvrOffLabel = "(off)"
 
 // validateExportFolderName checks that name is usable as a single Windows
-// folder component. The name replaces the original patient/study folder names
-// in the export, so it is always typed by the user rather than derived from
-// the (PHI-bearing) source folders.
+// folder component. The name replaces the export root — the original patient
+// folder, and for a Study-level selection its study folder too — so it is
+// always typed by the user rather than derived from the (PHI-bearing) source
+// folder; everything below it keeps its source name (see exportLayout).
 func validateExportFolderName(name string) error {
 	if name == "" {
-		return fmt.Errorf("enter an export folder name — the original study folder name is not reused because it often contains PHI")
+		return fmt.Errorf("enter an export folder name — the original patient folder name is not reused because it often contains PHI")
 	}
 	if strings.ContainsAny(name, `\/:*?"<>|`) {
 		return fmt.Errorf(`the export folder name cannot contain any of \ / : * ? " < > |`)
@@ -69,7 +70,7 @@ func pathWithinDir(dir, root string) bool {
 // profileName to files (the local files of one Patient or Study node).
 // rootDir is the download-folder root the files live under; studyLevel is
 // true when the selection is a Study node, false for a Patient node — it
-// drives the PHI-safe output layout (see exportRelPaths).
+// drives the PHI-safe output layout (see exportLayout).
 func showModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabel string, files []string, rootDir string, studyLevel bool) {
 	if len(files) == 0 {
 		dialog.ShowInformation("Modification",
@@ -186,9 +187,10 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 
 	// Row order is the profile editor's, deliberately — the two Options blocks
 	// show the same fields and are read against each other, so they must not be
-	// ordered differently. The one field the editor has here and this dialog
-	// does not is Zip export: it lives in Export below, where the user is
-	// naming the output and can see what the checkbox changes.
+	// ordered differently. Two fields the editor has here and this dialog does
+	// not are Zip export and Include DICOMDIR: both live in Export below,
+	// where the user is naming the output and can see what the checkboxes
+	// change, rather than among the per-tag transforms.
 	optionsForm := widget.NewForm(
 		widget.NewFormItem("Birth date mask", dobEntry),
 		widget.NewFormItem("Remap UIDs", remapCheck),
@@ -449,14 +451,24 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	// The profile's zip field pre-checks the box; the checkbox remains the
 	// per-run override and is never written back to the profile.
 	zipCheck.SetChecked(resolved.Zip)
+	dicomdirCheck := widget.NewCheck("Add a DICOMDIR index", nil)
+	dicomdirCheck.SetChecked(resolved.Dicomdir)
 	exportForm := widget.NewForm(
 		widget.NewFormItem("Export folder name", exportNameEntry),
 		widget.NewFormItem("Output folder", container.NewBorder(nil, nil, nil, changeOutDirBtn, outDirLabel)),
 		widget.NewFormItem("Zip export", zipCheck),
+		widget.NewFormItem("Include DICOMDIR", dicomdirCheck),
 	)
+	exportReplaces := "the original patient folder name"
+	if studyLevel {
+		exportReplaces = "the original patient and study folder names"
+	}
 	exportNote := widget.NewLabel("Files are written under <output folder>\\<export folder name> — " +
 		"or, with Zip export, into a compressed <output folder>\\<export folder name>.zip. " +
-		"The original patient and study folder names are never reused — they often contain PHI.")
+		"The export folder name replaces " + exportReplaces + ", which often contain PHI. " +
+		"Folders below it keep their original names, except where this profile deletes or replaces the value a name is built from. " +
+		"Include DICOMDIR adds a PS3.10 File-set index listing every exported file, letting a DICOM viewer or a CD/DVD-burning " +
+		"workflow browse the export without a database — written as a DICOMDIR entry inside the archive when Zip export is also checked.")
 	exportNote.TextStyle = fyne.TextStyle{Italic: true}
 	exportNote.Wrapping = fyne.TextWrapWord
 	sections = append(sections, prefSection("Export", exportForm, exportNote))
@@ -514,6 +526,10 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 			edited.FixVR = sel
 		}
 		edited.TransferSyntax = transferSyntaxPrefFromLabel(tsSelect.Selected)
+		// Unlike Zip (a pure destination choice the run function decides
+		// between, never part of modifyParams), DICOMDIR is an engine-level
+		// option compileModifyParams reads — see modifyengine.go.
+		edited.Dicomdir = dicomdirCheck.Checked
 
 		params, err := compileModifyParams(edited)
 		if err != nil {
@@ -523,12 +539,18 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 
 		// startRun launches the modification into outBase\exportName — a folder
 		// tree, or a single .zip archive when Zip export is checked — using the
-		// PHI-safe layout (runs on the UI goroutine).
+		// PHI-safe layout (runs on the UI goroutine). The export root stands in
+		// for the patient folder alone, or patient+study for a study-level
+		// selection — see exportLayout.
+		dropDirs := 1
+		if studyLevel {
+			dropDirs = 2
+		}
+		outLayout := &exportLayout{dropDirs: dropDirs}
 		startRun := func(outBase string) {
 			if !validOutDir(outBase) {
 				return
 			}
-			rels := exportRelPaths(files, rootDir, studyLevel)
 			if zipCheck.Checked {
 				zipName := exportName
 				if !strings.EqualFold(filepath.Ext(zipName), ".zip") {
@@ -537,7 +559,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 				zipPath := filepath.Join(outBase, zipName)
 				begin := func() {
 					win.Close()
-					showModificationRunDialog(w, profileName, files, rootDir, zipPath, params, rels, true)
+					showModificationRunDialog(w, profileName, files, rootDir, zipPath, params, outLayout, true)
 				}
 				if _, serr := os.Stat(zipPath); serr == nil {
 					dialog.ShowConfirm("Zip file exists",
@@ -555,7 +577,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 			exportRoot := filepath.Join(outBase, exportName)
 			begin := func() {
 				win.Close()
-				showModificationRunDialog(w, profileName, files, rootDir, exportRoot, params, rels, false)
+				showModificationRunDialog(w, profileName, files, rootDir, exportRoot, params, outLayout, false)
 			}
 			if entries, rerr := os.ReadDir(exportRoot); rerr == nil && len(entries) > 0 {
 				dialog.ShowConfirm("Export folder exists",
@@ -625,12 +647,12 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 }
 
 // showModificationRunDialog runs the modification in the background with a
-// progress bar and cancel support, then shows the summary. rels maps each
-// file to its PHI-safe path under outDir (see exportRelPaths). With asZip,
+// progress bar and cancel support, then shows the summary. outLayout maps
+// each file to its PHI-safe path under outDir (see exportLayout). With asZip,
 // outDir is the path of the single .zip archive the run writes into instead
 // of a folder tree.
 func showModificationRunDialog(w fyne.Window, profileName string, files []string,
-	rootDir, outDir string, params modifyParams, rels map[string]string, asZip bool) {
+	rootDir, outDir string, params modifyParams, outLayout *exportLayout, asZip bool) {
 
 	total := len(files)
 	progressBar := widget.NewProgressBar()
@@ -666,9 +688,9 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 		}
 		var res modifyResult
 		if asZip {
-			res = runModificationToZip(ctx, files, rootDir, outDir, params, rels, onProgress)
+			res = runModificationToZip(ctx, files, rootDir, outDir, params, outLayout, onProgress)
 		} else {
-			res = runModification(ctx, files, rootDir, outDir, params, rels, onProgress)
+			res = runModification(ctx, files, rootDir, outDir, params, outLayout, onProgress)
 		}
 		logInfo("modify: %q finished — %d written, %d skipped, %d failed, %d recompressed after masking, %d lossy re-encoded lossless, %d decompressed for masking, cancelled=%v → %s",
 			profileName, res.Processed, res.Skipped, res.Failed, res.MaskRecompressed, res.MaskRecodedLossless, res.MaskDecompressed, res.Canceled, outDir)
@@ -718,6 +740,15 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 			if res.MaskUSFallback > 0 {
 				msg += fmt.Sprintf("; %d ultrasound file(s) declared no image region and were masked "+
 					"with the profile's rectangles instead — worth reviewing", res.MaskUSFallback)
+			}
+			// Informational, like the mask-outcome clauses above: the exported
+			// DICOM files are unaffected either way, so a DICOMDIR failure never
+			// routes through the hard-failure dialog below.
+			if res.DicomdirWritten {
+				msg += "; DICOMDIR index written"
+			}
+			if res.DicomdirError != "" {
+				msg += fmt.Sprintf("; DICOMDIR index could not be written (%s)", res.DicomdirError)
 			}
 			// Failures have to be impossible to walk past: an export missing
 			// files still looks finished, and a transfer-syntax conversion that

@@ -273,40 +273,9 @@ func (m *resultsModel) localFolderFor(id, downloadDir string) string {
 		return downloadDir
 	}
 
-	// Build folder name components using the same sanitize/truncate rules as
-	// organizeFilePath in storagescp.go (same package, so helpers are accessible).
-	patFolder := func(name, pid string) string {
-		f := sanitize(name)
-		if f == "" {
-			f = "Unknown Patient"
-		}
-		if pid != "" {
-			f += " (" + sanitize(pid) + ")"
-		}
-		return truncateRunes(f, 64)
-	}
-	studyFolder := func(desc, date string) string {
-		f := sanitize(desc)
-		if f == "" {
-			f = "Unknown Study"
-		}
-		if date != "" {
-			f += " (" + sanitize(date) + ")"
-		}
-		return truncateRunes(f, 64)
-	}
-	seriesFolder := func(desc, num string) string {
-		f := sanitize(desc)
-		if f == "" {
-			f = "Unknown Series"
-		}
-		if num != "" {
-			f += " (" + sanitize(num) + ")"
-		}
-		return truncateRunes(f, 64)
-	}
-
-	// Collect path components based on node kind.
+	// Folder name components use the same sanitize/truncate rules as
+	// organizeFilePath in storagescp.go (same package, so the helpers are
+	// accessible) — patientFolderName/studyFolderName/seriesFolderName.
 	var components []string
 	switch n.kind {
 	case kindSeries:
@@ -319,9 +288,9 @@ func (m *resultsModel) localFolderFor(id, downloadDir string) string {
 			return downloadDir
 		}
 		components = []string{
-			patFolder(pat.patientName, n.patientID),
-			studyFolder(study.studyDesc, study.studyDate),
-			seriesFolder(n.seriesDesc, n.seriesNumber),
+			patientFolderName(pat.patientName, n.patientID),
+			studyFolderName(study.studyDesc, study.studyDate),
+			seriesFolderName(n.seriesDesc, n.seriesNumber),
 		}
 	case kindStudy:
 		pat, ok := m.nodes["P:"+n.patientID]
@@ -329,11 +298,11 @@ func (m *resultsModel) localFolderFor(id, downloadDir string) string {
 			return downloadDir
 		}
 		components = []string{
-			patFolder(pat.patientName, n.patientID),
-			studyFolder(n.studyDesc, n.studyDate),
+			patientFolderName(pat.patientName, n.patientID),
+			studyFolderName(n.studyDesc, n.studyDate),
 		}
 	case kindPatient:
-		components = []string{patFolder(n.patientName, n.patientID)}
+		components = []string{patientFolderName(n.patientName, n.patientID)}
 	default:
 		return downloadDir
 	}

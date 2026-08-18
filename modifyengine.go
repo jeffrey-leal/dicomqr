@@ -29,7 +29,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,6 +74,13 @@ type modifyParams struct {
 	// masking may force a decompression the profile did not ask for.
 	maskRegions []MaskRegion
 	mayMask     bool
+	// dicomdir requests a DICOMDIR (PS3.10 File-set) index alongside the
+	// export — one per run, referencing every file actually written, built
+	// from dicomdirSource records the run collects as files succeed. Unlike
+	// zip (a pure destination choice made in modifydialog.go, never threaded
+	// through modifyParams) this is an engine-level option both
+	// runModification and runModificationToZip honor identically.
+	dicomdir bool
 }
 
 // compileModifyParams validates p and parses its tag references into a
@@ -174,6 +180,8 @@ func compileModifyParams(p ModProfile) (modifyParams, error) {
 	mp.maskRegions = p.MaskRegions
 	mp.mayMask = len(p.MaskRegions) > 0
 
+	mp.dicomdir = p.Dicomdir
+
 	if len(p.PerModality) > 0 {
 		normalized := make(map[string]ModProfile, len(p.PerModality))
 		for k, v := range p.PerModality {
@@ -201,9 +209,9 @@ func compileModifyParams(p ModProfile) (modifyParams, error) {
 		mp.dobMask != "" || mp.shiftDays != "" ||
 		mp.removePrivate || mp.removeOverlays || mp.fixvrMode != "" || mp.targetTS != "" ||
 		len(mp.ignoreTypes) > 0 || len(mp.ignoreModalities) > 0 ||
-		len(mp.perMod) > 0 || mp.remapUIDs || mp.mayMask
+		len(mp.perMod) > 0 || mp.remapUIDs || mp.mayMask || mp.dicomdir
 	if !hasAction {
-		return mp, errors.New("the profile contains no actionable parameter (set, remove, dob, shiftdays, noprivate, nooverlays, fixvr, remapuids, transfersyntax, maskregions)")
+		return mp, errors.New("the profile contains no actionable parameter (set, remove, dob, shiftdays, noprivate, nooverlays, fixvr, remapuids, transfersyntax, maskregions, dicomdir)")
 	}
 
 	return mp, nil
@@ -241,56 +249,109 @@ type modifyResult struct {
 	// and were masked with the profile's manual rectangles instead of their own
 	// stated geometry — a weaker guarantee, so the run says how many.
 	MaskUSFallback int
+	// DicomdirWritten reports whether a DICOMDIR (PS3.10 File-set) index was
+	// requested and written alongside the export.
+	DicomdirWritten bool
+	// DicomdirError holds the reason DICOMDIR generation failed when it was
+	// requested but not written. The exported DICOM files are unaffected —
+	// this never turns an otherwise successful run into a failed one, the same
+	// tier as the mask-outcome fields above.
+	DicomdirError string
 }
 
-// exportRelPaths maps each file to its output path relative to the export
-// root, replacing the PHI-bearing folder names the download-folder layout
-// embeds (patient folder = name + MRN; study folder = description + date).
-// For a study-level selection the patient and study components are dropped
-// entirely — the caller's export folder stands in for them. For a
-// patient-level selection each distinct study folder becomes a generic
-// "study-NN" (numbered in sorted folder-name order, so the mapping is
-// deterministic); series folders are kept, as series descriptions are the
-// scanner's protocol names. Files not in the expected layout (e.g. the flat
-// fallback for over-long paths) map to their bare file name.
-func exportRelPaths(files []string, rootDir string, studyLevel bool) map[string]string {
-	split := make(map[string][]string, len(files))
-	studySet := map[string]bool{}
-	for _, f := range files {
-		rel, err := filepath.Rel(rootDir, f)
-		if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
-			split[f] = []string{filepath.Base(f)}
-			continue
-		}
-		parts := strings.Split(rel, string(filepath.Separator))
-		split[f] = parts
-		if !studyLevel && len(parts) >= 3 {
-			studySet[filepath.Join(parts[0], parts[1])] = true
-		}
+// exportNames holds every value an export path component is built from, as a
+// file carried them at one moment — see readExportNames and exportLayout.
+type exportNames struct {
+	studyDesc, studyDate     string
+	seriesDesc, seriesNumber string
+	sopUID                   string
+}
+
+// readExportNames reads the tag values export path components are built
+// from. processFile calls it once right after parsing (the file's original
+// values) and again just before a successful return (the values after every
+// attribute step), so exportLayout.relFor can tell which components the
+// profile actually changed.
+func readExportNames(ds *sdicom.Dataset) exportNames {
+	return exportNames{
+		studyDesc:    datasetString(ds, tag.StudyDescription),
+		studyDate:    datasetString(ds, tag.StudyDate),
+		seriesDesc:   datasetString(ds, tag.SeriesDescription),
+		seriesNumber: datasetString(ds, tag.SeriesNumber),
+		sopUID:       datasetString(ds, tag.SOPInstanceUID),
 	}
-	studyNames := make([]string, 0, len(studySet))
-	for k := range studySet {
-		studyNames = append(studyNames, k)
+}
+
+func sameStudyName(a, b exportNames) bool {
+	return a.studyDesc == b.studyDesc && a.studyDate == b.studyDate
+}
+
+func sameSeriesName(a, b exportNames) bool {
+	return a.seriesDesc == b.seriesDesc && a.seriesNumber == b.seriesNumber
+}
+
+// renamedFile returns original unchanged unless the SOP Instance UID changed
+// between before and after, in which case the file is renamed after the new
+// UID (the original extension kept), so no original UID survives an export
+// that remapped it.
+func renamedFile(original string, before, after exportNames) string {
+	if after.sopUID == "" || after.sopUID == before.sopUID {
+		return original
 	}
-	sort.Strings(studyNames)
-	studyNum := make(map[string]string, len(studyNames))
-	for i, k := range studyNames {
-		studyNum[k] = fmt.Sprintf("study-%02d", i+1)
+	return sanitize(after.sopUID) + filepath.Ext(original)
+}
+
+// sourceRel maps srcPath to its path relative to rootDir, falling back to the
+// bare file name when it is not (usefully) inside rootDir. This is what a nil
+// *exportLayout uses outright, and what exportLayout.relFor starts from.
+func sourceRel(srcPath, rootDir string) string {
+	rel, err := filepath.Rel(rootDir, srcPath)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return filepath.Base(srcPath)
+	}
+	return rel
+}
+
+// exportLayout maps a source file's path into its path under the export
+// root. The export root already stands in for the leading dropDirs source
+// folder components — 1 (patient only) for a patient-level run, 2 (patient
+// and study) for a study-level run, see showModificationDialog — because the
+// user types that folder's name directly in the Modification dialog. Every
+// folder below it keeps its source name, unless the tag(s) that name is
+// built from changed between before and after, in which case the component
+// is rebuilt from the new values with the same rules organizeFilePath uses
+// to build the download folder; the file name is rebuilt from the SOP
+// Instance UID the same way. A nil *exportLayout (used by the engine's own
+// tests) skips all of this and mirrors sourceRel with no renaming.
+type exportLayout struct{ dropDirs int }
+
+// relFor returns f's path under the export root. before and after are the
+// export name fields as processFile read them right after parsing and right
+// before returning — see fileNotes.namesBefore/namesAfter.
+func (l exportLayout) relFor(srcPath, rootDir string, before, after exportNames) string {
+	rel := sourceRel(srcPath, rootDir)
+	parts := strings.Split(rel, string(filepath.Separator))
+	last := len(parts) - 1
+
+	// Shallower than patient/study/file — the flat fallback layout (a bare
+	// file name) lands here too, along with any path too short to carry a
+	// study or series component at all.
+	if last < 2 {
+		return renamedFile(parts[last], before, after)
 	}
 
-	rels := make(map[string]string, len(files))
-	for f, parts := range split {
-		switch {
-		case len(parts) < 3:
-			rels[f] = parts[len(parts)-1]
-		case studyLevel:
-			rels[f] = filepath.Join(parts[2:]...)
-		default:
-			n := studyNum[filepath.Join(parts[0], parts[1])]
-			rels[f] = filepath.Join(append([]string{n}, parts[2:]...)...)
-		}
+	// Absolute source index: 0 = patient, 1 = study, 2 = series, deeper =
+	// copied verbatim. index 1 is only ever the study folder (rather than
+	// the file itself) when there is at least one component after it;
+	// likewise index 2 for the series folder.
+	if l.dropDirs == 1 && !sameStudyName(before, after) {
+		parts[1] = studyFolderName(after.studyDesc, after.studyDate)
 	}
-	return rels
+	if last > 2 && !sameSeriesName(before, after) {
+		parts[2] = seriesFolderName(after.seriesDesc, after.seriesNumber)
+	}
+	parts[last] = renamedFile(parts[last], before, after)
+	return filepath.Join(parts[l.dropDirs:]...)
 }
 
 // zipSink serializes finished datasets into a single zip archive. Only the
@@ -315,20 +376,36 @@ func (z *zipSink) write(rel string, ds sdicom.Dataset, opts []sdicom.WriteOption
 	return bw.Flush()
 }
 
+// writeRaw serialises data directly into a new zip entry, with none of
+// write's dataset encoding — used for the DICOMDIR entry, whose bytes are
+// already a complete, offset-patched DICOM file (see dicomdir.go).
+func (z *zipSink) writeRaw(rel string, data []byte) error {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	w, err := z.zw.Create(filepath.ToSlash(rel))
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(data)
+	return err
+}
+
 // runModification applies params to every file in files, writing results under
-// outDir. Each file's output path within outDir comes from rels (as built by
-// exportRelPaths); a nil rels falls back to the file's path relative to
-// rootDir (mirroring the download-folder layout). Per-file failures are
-// collected and never abort the run; progress is reported after every file.
-// Cancelling ctx stops feeding new files; files already in flight complete.
+// outDir. Each file's output path within outDir comes from layout (built from
+// processFile's before/after exportNames — see exportLayout.relFor); a nil
+// layout falls back to the file's path relative to rootDir (mirroring the
+// download-folder layout), which is what the engine's own tests use. Per-file
+// failures are collected and never abort the run; progress is reported after
+// every file. Cancelling ctx stops feeding new files; files already in flight
+// complete.
 func runModification(ctx context.Context, files []string, rootDir, outDir string,
-	params modifyParams, rels map[string]string, progress func(done, total int)) modifyResult {
-	return runModificationImpl(ctx, files, rootDir, outDir, params, rels, progress, nil)
+	params modifyParams, layout *exportLayout, progress func(done, total int)) modifyResult {
+	return runModificationImpl(ctx, files, rootDir, outDir, params, layout, progress, nil)
 }
 
 // runModificationToZip runs the same pipeline as runModification but writes
 // every output into a single zip archive at zipPath, with entry paths laid
-// out exactly as the folder export would be (rels, forward-slashed). The
+// out exactly as the folder export would be (layout, forward-slashed). The
 // archive is built as a hidden temp file and renamed into place when the run
 // ends with at least one file written — including a cancelled run, which
 // keeps the files completed before the cancel, mirroring folder-mode
@@ -336,7 +413,7 @@ func runModification(ctx context.Context, files []string, rootDir, outDir string
 // finalize or rename failure converts the run's written count into failures,
 // since the archive holding those files is lost with it.
 func runModificationToZip(ctx context.Context, files []string, rootDir, zipPath string,
-	params modifyParams, rels map[string]string, progress func(done, total int)) modifyResult {
+	params modifyParams, layout *exportLayout, progress func(done, total int)) modifyResult {
 
 	fail := func(err error) modifyResult {
 		logError("modify: zip export %s failed: %v", zipPath, err)
@@ -353,7 +430,7 @@ func runModificationToZip(ctx context.Context, files []string, rootDir, zipPath 
 	tmpPath := tmp.Name()
 	zw := zip.NewWriter(tmp)
 
-	res := runModificationImpl(ctx, files, rootDir, "", params, rels, progress, &zipSink{zw: zw})
+	res := runModificationImpl(ctx, files, rootDir, "", params, layout, progress, &zipSink{zw: zw})
 
 	ferr := zw.Close()
 	if cerr := tmp.Close(); ferr == nil {
@@ -368,6 +445,10 @@ func runModificationToZip(ctx context.Context, files []string, rootDir, zipPath 
 		res.Failures = append(res.Failures, modifyFailure{File: zipPath, Error: "finalize zip: " + ferr.Error()})
 		res.Failed += res.Processed
 		res.Processed = 0
+		// The archive itself is gone, so any DICOMDIR entry it held goes with
+		// it — a written-then-lost index must not be reported as written.
+		res.DicomdirWritten = false
+		res.DicomdirError = ""
 		return res
 	}
 	if res.Processed == 0 {
@@ -380,28 +461,11 @@ func runModificationToZip(ctx context.Context, files []string, rootDir, zipPath 
 // written to its own file under outDir; with a zsink every output goes into
 // the archive instead and outDir is unused.
 func runModificationImpl(ctx context.Context, files []string, rootDir, outDir string,
-	params modifyParams, rels map[string]string, progress func(done, total int), zsink *zipSink) modifyResult {
+	params modifyParams, layout *exportLayout, progress func(done, total int), zsink *zipSink) modifyResult {
 
 	var res modifyResult
 	if len(files) == 0 {
 		return res
-	}
-
-	type fileJob struct{ path, rel string }
-	jobs := make([]fileJob, 0, len(files))
-	for _, f := range files {
-		rel := ""
-		if rels != nil {
-			rel = rels[f]
-		}
-		if rel == "" {
-			r, err := filepath.Rel(rootDir, f)
-			if err != nil || r == "." || strings.HasPrefix(r, "..") {
-				r = filepath.Base(f)
-			}
-			rel = r
-		}
-		jobs = append(jobs, fileJob{f, rel})
 	}
 
 	// Write options are constant for the run; computing them once keeps the
@@ -418,13 +482,13 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 	// Modest worker pool: the pipeline is disk-bound for typical studies and
 	// the UI goroutine should keep breathing room (dicomtool, a batch CLI,
 	// uses the full CPU count).
-	numWorkers := min(runtime.NumCPU(), 4, len(jobs))
+	numWorkers := min(runtime.NumCPU(), 4, len(files))
 
 	var (
 		mu   sync.Mutex
 		done int
 	)
-	total := len(jobs)
+	total := len(files)
 	recordFailure := func(path string, err error) {
 		logError("modify: failed %s: %v", path, err)
 		mu.Lock()
@@ -433,17 +497,35 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 		mu.Unlock()
 	}
 
-	jobCh := make(chan fileJob)
+	// DICOMDIR sources are collected from the in-memory transformed dataset of
+	// every successfully written file, under their own mutex — ddSources is
+	// only ever read after wg.Wait(), but is written concurrently by every
+	// worker as files finish.
+	var (
+		ddMu      sync.Mutex
+		ddSources []dicomdirSource
+	)
+	recordDicomdirSource := func(ds sdicom.Dataset, rel string) {
+		if !params.dicomdir {
+			return
+		}
+		src := extractDicomdirSource(&ds, rel)
+		ddMu.Lock()
+		ddSources = append(ddSources, src)
+		ddMu.Unlock()
+	}
+
+	jobCh := make(chan string)
 	var wg sync.WaitGroup
 	for range numWorkers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for job := range jobCh {
+			for path := range jobCh {
 				func() {
-					srcFile, ferr := openDICOMFile(job.path)
+					srcFile, ferr := openDICOMFile(path)
 					if ferr != nil {
-						recordFailure(job.path, fmt.Errorf("open: %w", ferr))
+						recordFailure(path, fmt.Errorf("open: %w", ferr))
 						return
 					}
 					if srcFile == nil { // no DICM magic — not a DICOM file
@@ -454,7 +536,7 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 					}
 					skipped, ds, notes, perr := processFile(srcFile, params, uidRemap)
 					if perr != nil {
-						recordFailure(job.path, fmt.Errorf("process: %w", perr))
+						recordFailure(path, fmt.Errorf("process: %w", perr))
 						return
 					}
 					if notes.maskRecompressErr != "" {
@@ -462,25 +544,25 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 						// rather than a failure — but the reason must be on
 						// record, since the encoding differs from the source's.
 						logWarn("modify: %s masked, but %s — exported as %s instead",
-							job.path, notes.maskRecompressErr, transferSyntaxLabel(tsExplicitVRLE))
+							path, notes.maskRecompressErr, transferSyntaxLabel(tsExplicitVRLE))
 					}
 					if notes.maskRecompressed {
 						logInfo("modify: %s recompressed to its original transfer syntax after masking",
-							job.path)
+							path)
 						mu.Lock()
 						res.MaskRecompressed++
 						mu.Unlock()
 					}
 					if notes.maskRecodedLossless {
 						logInfo("modify: %s re-encoded to %s after masking — its own syntax is lossy, and the lossless encode adds no further loss",
-							job.path, transferSyntaxLabel(tsJPEG2000LL))
+							path, transferSyntaxLabel(tsJPEG2000LL))
 						mu.Lock()
 						res.MaskRecodedLossless++
 						mu.Unlock()
 					}
 					if notes.maskDecompressed {
 						logInfo("modify: %s decompressed to %s so its burned-in pixels could be masked",
-							job.path, transferSyntaxLabel(tsExplicitVRLE))
+							path, transferSyntaxLabel(tsExplicitVRLE))
 						mu.Lock()
 						res.MaskDecompressed++
 						mu.Unlock()
@@ -490,7 +572,7 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 						// geometry because it did not state its own, which is a
 						// weaker guarantee than the rest of the export carries.
 						logWarn("modify: %s declares no calibrated ultrasound region — masked with the profile's rectangles instead",
-							job.path)
+							path)
 						mu.Lock()
 						res.MaskUSFallback++
 						mu.Unlock()
@@ -501,24 +583,29 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 						mu.Unlock()
 						return
 					}
+					rel := sourceRel(path, rootDir)
+					if layout != nil {
+						rel = layout.relFor(path, rootDir, notes.namesBefore, notes.namesAfter)
+					}
 					if zsink != nil {
-						if zerr := zsink.write(job.rel, ds, writeOpts); zerr != nil {
-							recordFailure(job.path, fmt.Errorf("zip write: %w", zerr))
+						if zerr := zsink.write(rel, ds, writeOpts); zerr != nil {
+							recordFailure(path, fmt.Errorf("zip write: %w", zerr))
 						} else {
 							mu.Lock()
 							res.Processed++
 							mu.Unlock()
+							recordDicomdirSource(ds, rel)
 						}
 						return
 					}
-					outFile := filepath.Join(outDir, job.rel)
+					outFile := filepath.Join(outDir, rel)
 					if merr := os.MkdirAll(filepath.Dir(outFile), 0o755); merr != nil {
-						recordFailure(job.path, fmt.Errorf("create output dir: %w", merr))
+						recordFailure(path, fmt.Errorf("create output dir: %w", merr))
 						return
 					}
 					f, cerr := os.Create(outFile)
 					if cerr != nil {
-						recordFailure(job.path, fmt.Errorf("create output file: %w", cerr))
+						recordFailure(path, fmt.Errorf("create output file: %w", cerr))
 						return
 					}
 					bw := bufio.NewWriterSize(f, 1<<20)
@@ -527,15 +614,16 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 					clerr := f.Close()
 					switch {
 					case werr != nil:
-						recordFailure(job.path, fmt.Errorf("write: %w", werr))
+						recordFailure(path, fmt.Errorf("write: %w", werr))
 					case fherr != nil:
-						recordFailure(job.path, fmt.Errorf("flush: %w", fherr))
+						recordFailure(path, fmt.Errorf("flush: %w", fherr))
 					case clerr != nil:
-						recordFailure(job.path, fmt.Errorf("close: %w", clerr))
+						recordFailure(path, fmt.Errorf("close: %w", clerr))
 					default:
 						mu.Lock()
 						res.Processed++
 						mu.Unlock()
+						recordDicomdirSource(ds, rel)
 					}
 				}()
 				mu.Lock()
@@ -550,16 +638,46 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 	}
 
 feed:
-	for _, job := range jobs {
+	for _, path := range files {
 		select {
 		case <-ctx.Done():
 			res.Canceled = true
 			break feed
-		case jobCh <- job:
+		case jobCh <- path:
 		}
 	}
 	close(jobCh)
 	wg.Wait()
+
+	// DICOMDIR is built once, after every worker has finished, from whichever
+	// files actually succeeded — a cancelled or partially-failed run still
+	// gets an index for what it did write, matching runModificationToZip's
+	// existing partial-success semantics for the archive itself.
+	if params.dicomdir && len(ddSources) > 0 {
+		data, err := buildDICOMDIRBytes(ddSources)
+		switch {
+		case err != nil:
+			res.DicomdirError = err.Error()
+			logWarn("modify: DICOMDIR generation failed: %v", err)
+		case zsink != nil:
+			if werr := zsink.writeRaw("DICOMDIR", data); werr != nil {
+				res.DicomdirError = werr.Error()
+				logWarn("modify: writing DICOMDIR into the archive failed: %v", werr)
+			} else {
+				res.DicomdirWritten = true
+				logInfo("modify: DICOMDIR index written into the archive")
+			}
+		default:
+			if werr := writeDICOMDIRFile(outDir, data); werr != nil {
+				res.DicomdirError = werr.Error()
+				logWarn("modify: writing DICOMDIR failed: %v", werr)
+			} else {
+				res.DicomdirWritten = true
+				logInfo("modify: DICOMDIR index written to %s", outDir)
+			}
+		}
+	}
+
 	return res
 }
 
@@ -750,8 +868,15 @@ func filterKeep(removals []tag.Tag, keep []tag.Tag) []tag.Tag {
 // src is always closed.
 // fileNotes records what processFile had to do beyond the profile's literal
 // instructions — things the run reports because the export differs from what
-// the profile alone describes.
+// the profile alone describes — plus what it observed, for the caller to
+// route the output through exportLayout.
 type fileNotes struct {
+	// namesBefore/namesAfter are the export path components' source tag
+	// values as the file carried them right after parsing and again right
+	// before a successful return, so exportLayout.relFor can tell which
+	// folder-name and file-name components the profile actually changed.
+	// Left zero on a skip or failure, neither of which reaches relFor.
+	namesBefore, namesAfter exportNames
 	// maskDecompressed: compressed pixel data was decompressed so masking could
 	// write to it, without the profile requesting a conversion, and could not
 	// be recompressed (lossy source, or recompression failed) — the file left
@@ -797,6 +922,7 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 	if err != nil {
 		return false, ds, notes, fmt.Errorf("parse: %w", err)
 	}
+	notes.namesBefore = readExportNames(&ds)
 
 	// Masking runs last but keys on the file as it arrived, so its identity is
 	// captured here, before anything below can rewrite it. UID remapping
@@ -991,6 +1117,7 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 		}
 	}
 
+	notes.namesAfter = readExportNames(&ds)
 	return false, ds, notes, nil
 }
 

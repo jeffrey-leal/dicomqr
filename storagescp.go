@@ -377,44 +377,60 @@ func (s *StorageSCP) handleCStore(
 	return dimse.Success
 }
 
+// patientFolderName, studyFolderName and seriesFolderName build one path
+// component of the organized hierarchy from its source tag values: a
+// placeholder when the descriptive part is empty, sanitized, with the second
+// part appended in parentheses only when it is present, truncated to 64 runes
+// (Phase 3-F). organizeFilePath, resultsModel.localFolderFor and the
+// modification engine's export layout (modifyengine.go) all build path
+// components through these — one authority for what a folder is called,
+// rather than three copies that could drift.
+func patientFolderName(name, id string) string {
+	if name == "" {
+		name = "Unknown Patient"
+	}
+	f := sanitize(name)
+	if id != "" {
+		f += " (" + sanitize(id) + ")"
+	}
+	return truncateRunes(f, 64)
+}
+
+func studyFolderName(desc, date string) string {
+	if desc == "" {
+		desc = "Unknown Study"
+	}
+	f := sanitize(desc)
+	if date != "" {
+		f += " (" + sanitize(date) + ")"
+	}
+	return truncateRunes(f, 64)
+}
+
+func seriesFolderName(desc, number string) string {
+	if desc == "" {
+		desc = "Unknown Series"
+	}
+	f := sanitize(desc)
+	if number != "" {
+		f += " (" + sanitize(number) + ")"
+	}
+	return truncateRunes(f, 64)
+}
+
 // organizeFilePath builds the destination path for a received DICOM file using
 // the fixed structure:
 //
 //	<downloadDir>/<Patient Name> (MRN)/<Study Description> (StudyDate)/<Series Description> (SeriesNumber)/<sopInstanceUID>.dcm
 func organizeFilePath(downloadDir, patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber, sopInstanceUID string) string {
-	if patientName == "" {
-		patientName = "Unknown Patient"
-	}
-	patFolder := sanitize(patientName)
-	if patientID != "" {
-		patFolder += " (" + sanitize(patientID) + ")"
-	}
-
-	if studyDesc == "" {
-		studyDesc = "Unknown Study"
-	}
-	studyFolder := sanitize(studyDesc)
-	if studyDate != "" {
-		studyFolder += " (" + sanitize(studyDate) + ")"
-	}
-
-	if seriesDesc == "" {
-		seriesDesc = "Unknown Series"
-	}
-	seriesFolder := sanitize(seriesDesc)
-	if seriesNumber != "" {
-		seriesFolder += " (" + sanitize(seriesNumber) + ")"
-	}
+	patFolder := patientFolderName(patientName, patientID)
+	studyFolder := studyFolderName(studyDesc, studyDate)
+	seriesFolder := seriesFolderName(seriesDesc, seriesNumber)
 
 	filename := sanitize(sopInstanceUID) + ".dcm"
 	if filename == ".dcm" {
 		filename = fmt.Sprintf("%d.dcm", time.Now().UnixNano())
 	}
-
-	// Truncate each component to 64 runes (Phase 3-F).
-	patFolder = truncateRunes(patFolder, 64)
-	studyFolder = truncateRunes(studyFolder, 64)
-	seriesFolder = truncateRunes(seriesFolder, 64)
 
 	full := filepath.Join(downloadDir, patFolder, studyFolder, seriesFolder, filename)
 	// Fall back to flat layout when the full path would exceed 255 characters.
