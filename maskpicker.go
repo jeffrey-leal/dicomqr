@@ -50,7 +50,7 @@ func loadMaskFrame(path string) (image.Image, *sdicom.Dataset, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	ds, err := sdicom.ParseFile(path, nil, sdicom.SkipPixelData())
+	ds, err := safeParseFile(path, nil, sdicom.SkipPixelData())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -252,7 +252,7 @@ func scanMaskSeries(files []string, progress func(done, total int)) (series []ma
 		go func() {
 			defer wg.Done()
 			for path := range jobs {
-				ds, err := sdicom.ParseFile(path, nil, sdicom.SkipPixelData())
+				ds, err := safeParseFile(path, nil, sdicom.SkipPixelData())
 				mu.Lock()
 				done++
 				d := done

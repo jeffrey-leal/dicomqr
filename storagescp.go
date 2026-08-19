@@ -393,7 +393,7 @@ func patientFolderName(name, id string) string {
 	if id != "" {
 		f += " (" + sanitize(id) + ")"
 	}
-	return truncateRunes(f, 64)
+	return safePathComponent(truncateRunes(f, 64))
 }
 
 func studyFolderName(desc, date string) string {
@@ -404,7 +404,7 @@ func studyFolderName(desc, date string) string {
 	if date != "" {
 		f += " (" + sanitize(date) + ")"
 	}
-	return truncateRunes(f, 64)
+	return safePathComponent(truncateRunes(f, 64))
 }
 
 func seriesFolderName(desc, number string) string {
@@ -415,7 +415,30 @@ func seriesFolderName(desc, number string) string {
 	if number != "" {
 		f += " (" + sanitize(number) + ")"
 	}
-	return truncateRunes(f, 64)
+	return safePathComponent(truncateRunes(f, 64))
+}
+
+// safePathComponent defuses a folder name that is nothing but dots. "." and
+// ".." are directory references, not names: sanitize passes them through (they
+// hold none of the characters it strips), and filepath.Join then Cleans them,
+// so a PatientName of ".." used to place the received file one level ABOVE the
+// download folder. Every DICOM string that names a folder here comes straight
+// out of a file the application did not write.
+//
+// The whole-string dot test rather than an exact "." / ".." match also covers
+// "..." and longer runs, which Windows cannot create as a directory at all. No
+// real patient name, study description or series description is all dots, so
+// this can never rename a legitimate folder — which matters, because renaming
+// one would orphan everything already downloaded under it.
+//
+// The "_" prefix is the same defusing sanitize already applies to reserved
+// device names. It is applied after truncation, since truncating a long value
+// could otherwise produce an all-dots component from one that was not.
+func safePathComponent(s string) string {
+	if s == "" || strings.Trim(s, ".") != "" {
+		return s
+	}
+	return "_" + s
 }
 
 // organizeFilePath builds the destination path for a received DICOM file using
@@ -435,6 +458,19 @@ func organizeFilePath(downloadDir, patientName, patientID, studyDesc, studyDate,
 	full := filepath.Join(downloadDir, patFolder, studyFolder, seriesFolder, filename)
 	// Fall back to flat layout when the full path would exceed 255 characters.
 	if len(full) > 255 {
+		full = filepath.Join(downloadDir, filename)
+	}
+	// Second layer under safePathComponent: make containment a property of this
+	// function rather than of having got the character rules exactly right. The
+	// components are built from tag values in a file the application did not
+	// write, and everything downstream — the catalog, the tree, delete, export —
+	// assumes the result is inside the download folder.
+	//
+	// The downloadDir != "" guard keeps an unconfigured folder — where every
+	// path is relative and nothing is "inside" anything — from logging this per
+	// received file; that case is already degenerate and reported elsewhere.
+	if downloadDir != "" && !pathWithinDir(filepath.Dir(full), downloadDir) {
+		logWarn("scp: %q would place a file outside the download folder — using the flat layout instead", full)
 		full = filepath.Join(downloadDir, filename)
 	}
 	return full
@@ -483,6 +519,11 @@ func truncateRunes(s string, maxRunes int) string {
 // modalities (group 0x0040+) are never visited. Returns empty strings on any
 // parse failure, which causes the caller to fall back to a flat layout.
 func scpParseMetadata(path string) (patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber string) {
+	// handleCStore recovers panics for the whole C-STORE handler, but saveGetFile
+	// reaches this from the C-GET callback with no such cover, so the boundary
+	// belongs here as well. Whatever was read before the panic is returned: a
+	// partial folder name is the same outcome a partial parse already gives.
+	defer recoverParserPanic(path)
 	f, err := os.Open(path)
 	if err != nil {
 		return

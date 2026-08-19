@@ -499,7 +499,7 @@ const stylesXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 
 func buildContent(d Formatter) {
 
-	d.Cover("dicomqr", "User Manual  v1.16.0",
+	d.Cover("dicomqr", "User Manual  v1.17.0",
 		time.Now().Format("January 2, 2006"),
 		"A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.")
 
@@ -714,7 +714,8 @@ func buildContent(d Formatter) {
 
 	d.H2("8.1  The Persistent Index")
 	d.P("The Local Browse tree is backed by a persistent index — a SQLite database file (`.dicomqr-index.db`) stored inside the download folder — so the Patient > Study > Series tree from the previous session appears immediately at startup, with no rescan. The index updates automatically when a retrieve or an import adds files, and each download folder carries its own index with it.")
-	d.P("Click Scan to rebuild the index from what is actually on disk: dicomqr walks the download directory, parses each `.dcm` file (skipping pixel data for speed), and repopulates both the tree and the index. The status label shows progress and a file count. Use Scan whenever files were added to the folder outside the application. The folder button opens the download directory in Windows Explorer.")
+	d.P("Click Scan to bring the tree and the index into line with what is actually on disk. dicomqr walks the download directory and reads only the files that are new, or whose size or timestamp shows they have changed since they were last read — every other file is already described in the index and does not need opening again. On a folder nothing has been added to, that makes a scan a matter of seconds even when the files are not already in the operating system's cache. The status line reports each stage and finishes by saying what changed, for example Found 12 studies, 100 series — 43 added, 2 removed. Use Scan whenever files were added to the folder outside the application.")
+	d.P("Click Rebuild to read every file again and replace the index outright. Scan trusts what the index already says about a file, so Rebuild is the answer when it is the index you doubt rather than the folder — after copying files in by hand while the application was closed, for instance, or if the tree ever looks wrong in a way a Scan does not put right. It takes as long as a scan used to. If a scan cannot read part of the folder — a permissions problem, or a drive that has gone away mid-scan — it leaves the index alone rather than treating the files it could not see as deleted, and says so in the Activity Log. The folder button opens the download directory in Windows Explorer.")
 	d.P("If files are removed outside the application, clicking or right-clicking an affected patient, study, or series verifies its files in the background and prunes the missing entries from both the tree and the index automatically.")
 
 	d.H2("8.2  Filtering and Navigation")
@@ -1004,7 +1005,7 @@ func buildContent(d Formatter) {
 		{"Set values", "The tags whose values are replaced, one row each: the tag on the left, the value on the right, listed in the order the profile stores them — tags added through the picker join at the end. Choose tags… opens the tag picker to add rows (and, by unchecking, remove them). An empty value blanks the element rather than setting it. A value of [GGGG,EEEE] copies whatever this profile sets that tag to — see below. Values are checked against the tag's DICOM value representation on save, so a date field will not accept a word."},
 		{"Remove tags", "Tags deleted from every file — one per line, each shown with its name (0008,0080  Institution Name). Choose… opens the tag picker (see below) instead of typing tag numbers."},
 		{"Keep tags", "Tags retained even when the base profile removes them, shown in the same way. Choose… opens the tag picker."},
-		{"Birth date mask", "8-character positional pattern applied to Patient Birth Date: digit positions replace, any other character preserves the original digit (e.g. YYYY0101 keeps the year and sets January 1st). Empty = no masking."},
+		{"Birth date mask", "8-character positional pattern applied to Patient Birth Date: digit positions replace, any other character preserves the original digit (e.g. YYYY0101 keeps the year and sets January 1st). Empty = no masking. The mask rewrites the Patient Birth Date at the top of the file and nothing else — see the note below about Original Attributes Sequence."},
 		{"Remap UIDs", "Replace every site-generated UID with a fresh consistent value — the same source UID always maps to the same replacement within a run, keeping cross-references intact. Standard and structural UIDs are never touched. This replaces the retired UID suffix option: a profile still carrying a uid entry — hand-authored, or shared from dicomtool — is refused when run, with a message naming Remap UIDs as the replacement. The entry itself is preserved in profiles.json and disclosed by the editor, never silently dropped: quietly ignoring it would export original UIDs from a profile whose author asked for them changed."},
 		{"Remove private tags", "Delete all private (odd-group) tags."},
 		{"Remove overlay planes", "Delete every overlay-plane group (6000–60FE). Overlay Data is a bitmap drawn over the image, and some equipment burns patient text into it; Remove private tags never touches these groups (they are even-numbered) and pixel masking writes only the image's own pixels, so this option is the one way to clear them. Off unless asked for, so a profile shared with dicomtool keeps its meaning."},
@@ -1016,6 +1017,8 @@ func buildContent(d Formatter) {
 		{"Ignore modalities", "Comma-separated values; a file whose Modality (0008,0060) matches one is skipped entirely."},
 		{"Pixel masking", "Areas of the image itself blanked in the export — see below. Add region adds a row; each row is a rectangle in percentages of the image, or the Outside ultrasound region rule, which takes its geometry from the file."},
 	})
+	d.P("The birth date mask and Original Attributes Sequence. The mask replaces the Patient Birth Date recorded at the top of the file. That is all an ordinary image carries — patient details are not repeated inside the nested structures that make up the rest of a DICOM file. There is one exception. A study that has already been de-identified somewhere else may carry an Original Attributes Sequence (0400,0561), which is a record of what that earlier process changed, and it holds the values as they were before. A real birth date can sit in that record while the visible Patient Birth Date reads as masked.")
+	d.P("Both the profile editor and the Modification dialog show a note beside the Birth date mask when a profile masks the birth date without removing 0400,0561, naming the tag to add to Remove tags. It is advice, not an obstacle: most studies carry no such sequence, and neither the editor nor a run is blocked. The shipped profiles already remove it, so the note appears only on a profile written by hand or brought over from dicomtool. After a run, the completion summary reports how many exported files actually still carried a birth date inside a sequence — counted from the files themselves rather than inferred from the profile, so it is a statement about that export rather than a warning about a possibility.")
 	d.H3("14.3.1  Masking Burned-In Patient Information")
 	d.P("Some images carry patient identity in the pixels rather than in the tags: ultrasound machines print a banner across the top of every frame, and secondary captures are often photographs of a screen that included one. No tag rule can reach that text — removing Patient's Name from the header leaves the name that was drawn into the image. Pixel masking blanks those areas in the exported copy. The files in the download folder are never altered.")
 	d.P("A region is either a rectangle or the Outside ultrasound region rule.")
@@ -1067,7 +1070,7 @@ func buildContent(d Formatter) {
 	d.P("The status bar at the bottom of the window provides real-time feedback. A coloured LED indicator (gray / amber / green) precedes the status text.")
 	d.Table([]Row{
 		{"Situation", "Status bar text"},
-		{"Application started, not connected", "`v1.16.0`"},
+		{"Application started, not connected", "`v1.17.0`"},
 		{"Connecting to server", "`Connecting…`"},
 		{"Connected", "`Connected: <AE>@<host>:<port>`"},
 		{"Connection cancelled", "`Connection cancelled`"},

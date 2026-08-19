@@ -3,12 +3,15 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -62,40 +65,162 @@ type fileMeta struct {
 	seriesDesc   string
 }
 
-// parseLocalFileMeta parses one DICOM file (skipping pixel data) and returns
-// its hierarchy metadata. ok is false when the file is unparsable or missing
-// the Study/Series Instance UIDs.
-func parseLocalFileMeta(path string) (m fileMeta, ok bool) {
-	ds, parseErr := sdicom.ParseFile(path, nil, sdicom.SkipPixelData())
-	if parseErr != nil {
+// localMetaTags are the identifying values the folder scan and the catalog
+// index a file by — the only reason either one opens it. Named once here
+// because both parse paths below need the same set.
+var localMetaTags = map[tag.Tag]bool{
+	tag.PatientName:       true,
+	tag.PatientID:         true,
+	tag.StudyInstanceUID:  true,
+	tag.StudyDate:         true,
+	tag.StudyDescription:  true,
+	tag.AccessionNumber:   true,
+	tag.ModalitiesInStudy: true,
+	tag.SeriesInstanceUID: true,
+	tag.Modality:          true,
+	tag.SeriesNumber:      true,
+	tag.SeriesDescription: true,
+}
+
+// localMetaMaxGroup is the highest group any of those tags lives in, and so the
+// point past which scanLocalFileMeta stops reading.
+//
+// Derived rather than written as 0x0020 on purpose. It is the one way this
+// optimisation could rot: a tag added to the set above in a higher group would
+// otherwise sit beyond where the scan stops looking and read as absent from
+// every file, silently. Deriving it extends the scan instead.
+var localMetaMaxGroup = func() uint16 {
+	var max uint16
+	for t := range localMetaTags {
+		if t.Group > max {
+			max = t.Group
+		}
+	}
+	return max
+}()
+
+// parseLocalFileMeta reads one DICOM file's hierarchy metadata. ok is false when
+// the file is unparsable or carries no Study/Series Instance UID.
+//
+// The streaming path is tried first and answers from the first few kilobytes.
+// The full parse behind it exists for files that do not order their tags as the
+// standard requires — see scanLocalFileMeta and fullLocalFileMeta.
+func parseLocalFileMeta(path string) (fileMeta, bool) {
+	if m, ok := scanLocalFileMeta(path); ok {
+		return m, true
+	}
+	return fullLocalFileMeta(path)
+}
+
+// scanLocalFileMeta reads only as far as the identifying tags, stopping once the
+// stream is past localMetaMaxGroup — the technique scpParseMetadata uses on the
+// receive path.
+//
+// This is what keeps a folder scan proportional to the number of files rather
+// than to their size. A full parse cannot do that even with SkipPixelData: the
+// library's Reader.Skip is io.CopyN(io.Discard, …), not a seek, so it still
+// pulls every pixel byte off the disk to throw it away. Measured over 1,500
+// files totalling 13 GB, this reads 6.4 MB instead of all of it and finishes in
+// 649 ms instead of 12.4 s.
+func scanLocalFileMeta(path string) (fileMeta, bool) {
+	// This path uses NewParser rather than safeParseFile, so it carries the
+	// deferrable form of the parse-panic boundary itself (see dicomsafe.go).
+	defer recoverParserPanic(path)
+
+	f, err := os.Open(path)
+	if err != nil {
+		return fileMeta{}, false
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fileMeta{}, false
+	}
+	p, err := sdicom.NewParser(f, info.Size(), nil, sdicom.SkipPixelData())
+	if err != nil {
 		return fileMeta{}, false
 	}
 
-	getString := func(t tag.Tag) string {
-		e, findErr := ds.FindElementByTag(t)
-		if findErr != nil {
-			return ""
+	vals := make(map[tag.Tag]string, len(localMetaTags))
+	for {
+		elem, err := p.Next()
+		if err != nil {
+			break
 		}
-		strs := sdicom.MustGetStrings(e.Value)
-		if len(strs) == 0 {
-			return ""
+		if elem.Tag.Group > localMetaMaxGroup {
+			break
 		}
-		return strings.TrimSpace(strs[0])
+		if localMetaTags[elem.Tag] {
+			vals[elem.Tag] = firstElementString(elem)
+		}
 	}
+	return buildFileMeta(path, vals, info.Size(), info.ModTime().Unix())
+}
 
-	m = fileMeta{
+// fullLocalFileMeta parses the whole file and looks the tags up by name — the
+// original implementation, kept as the fallback for a file whose tags are not in
+// ascending order.
+//
+// The standard requires that order and every file measured so far honours it,
+// but a file that does not would lose an identifier under the streaming scan,
+// and a file with no identifiers is dropped from the tree entirely. Falling back
+// costs nothing on a conformant file (it never runs) and only ever re-reads one
+// that would otherwise have gone missing.
+func fullLocalFileMeta(path string) (fileMeta, bool) {
+	ds, parseErr := safeParseFile(path, nil, sdicom.SkipPixelData())
+	if parseErr != nil {
+		return fileMeta{}, false
+	}
+	vals := make(map[tag.Tag]string, len(localMetaTags))
+	for t := range localMetaTags {
+		if e, findErr := ds.FindElementByTag(t); findErr == nil {
+			vals[t] = firstElementString(e)
+		}
+	}
+	var size, mtime int64
+	if info, statErr := os.Stat(path); statErr == nil {
+		size, mtime = info.Size(), info.ModTime().Unix()
+	}
+	return buildFileMeta(path, vals, size, mtime)
+}
+
+// firstElementString reads an element's first string value, trimmed, or "" when
+// it holds something else.
+//
+// A checked assertion rather than sdicom.MustGetStrings, which panics: the old
+// lookup called it after the parse had returned, so it sat outside the parse
+// boundary's recover and a file storing one of these tags under an unexpected VR
+// would take down whichever goroutine was scanning.
+func firstElementString(e *sdicom.Element) string {
+	if e == nil || e.Value == nil {
+		return ""
+	}
+	strs, ok := e.Value.GetValue().([]string)
+	if !ok || len(strs) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(strs[0])
+}
+
+// buildFileMeta assembles the collected values, applying the rules both parse
+// paths share: a file with no Study or Series Instance UID cannot be placed in
+// the tree, and a missing Modality falls back to Modalities in Study.
+func buildFileMeta(path string, vals map[tag.Tag]string, size, mtime int64) (fileMeta, bool) {
+	m := fileMeta{
 		path:         path,
-		patientName:  getString(tag.PatientName),
-		patientID:    getString(tag.PatientID),
-		studyUID:     getString(tag.StudyInstanceUID),
-		studyDate:    getString(tag.StudyDate),
-		studyDesc:    getString(tag.StudyDescription),
-		accession:    getString(tag.AccessionNumber),
-		modalities:   getString(tag.ModalitiesInStudy),
-		seriesUID:    getString(tag.SeriesInstanceUID),
-		modality:     getString(tag.Modality),
-		seriesNumber: getString(tag.SeriesNumber),
-		seriesDesc:   getString(tag.SeriesDescription),
+		patientName:  vals[tag.PatientName],
+		patientID:    vals[tag.PatientID],
+		studyUID:     vals[tag.StudyInstanceUID],
+		studyDate:    vals[tag.StudyDate],
+		studyDesc:    vals[tag.StudyDescription],
+		accession:    vals[tag.AccessionNumber],
+		modalities:   vals[tag.ModalitiesInStudy],
+		seriesUID:    vals[tag.SeriesInstanceUID],
+		modality:     vals[tag.Modality],
+		seriesNumber: vals[tag.SeriesNumber],
+		seriesDesc:   vals[tag.SeriesDescription],
+		size:         size,
+		mtime:        mtime,
 	}
 	if m.studyUID == "" || m.seriesUID == "" {
 		return fileMeta{}, false
@@ -103,35 +228,211 @@ func parseLocalFileMeta(path string) (m fileMeta, ok bool) {
 	if m.modality == "" {
 		m.modality = m.modalities
 	}
-	if info, statErr := os.Stat(path); statErr == nil {
-		m.size = info.Size()
-		m.mtime = info.ModTime().Unix()
-	}
 	return m, true
 }
 
-// scanLocalFolder walks dir and returns studies, series, and a map of
-// seriesUID → file paths for every .dcm file found.
-func scanLocalFolder(dir string, progress func(int)) ([]localStudy, []localSeries, map[string][]string, error) {
-	type seriesKey struct{ studyUID, seriesUID string }
+// scanProgressInterval is how often a scan may report progress.
+//
+// Paced by time rather than by a file count, because the callers hand the
+// report to fyne.Do and Fyne's queue is unbounded and never blocks: a
+// per-N-files trigger emits at whatever rate the scan happens to run at, and
+// the UI goroutine has to drain every one of them. That was survivable while a
+// scan of 13,000 files took 14 seconds; once the scan dropped to under a
+// second the same 500-odd updates arrived in a burst, each one re-texting a
+// label whose width changes — which on Windows repaints the whole window frame
+// (see stableMin) — and the callback that actually populates the tree sat in
+// the queue behind all of them. The tree looked like it took seconds to appear
+// when it took no time at all.
+//
+// Ten a second is faster than anyone reads and slow enough to cost nothing. A
+// var so tests can drive the throttle without needing thousands of files.
+var scanProgressInterval = 100 * time.Millisecond
 
+// scanDefaultWorkers is how many files a scan reads at once.
+//
+// A cold scan is bound by seek latency, not by bandwidth or by CPU: measured on
+// a RAID-0 array of spinning disks, 35,489 files took 5½ minutes — 9.3 ms per
+// file, one mechanical seek each — while the same scan warm took 10 seconds.
+// After the early-exit change the scan reads only a few KB per file, so those
+// minutes are almost entirely waiting for the head to arrive. Issuing several
+// reads at once lets the drive (and, on an array, several spindles) overlap that
+// waiting.
+//
+// Eight rather than the CPU count, which is what the modification engine and the
+// mask scan key on: those pools are bound by compute and memory, where exceeding
+// the core count buys nothing. These workers are asleep on the disk, so the right
+// quantity is roughly the queue depth the storage can keep busy, and the CPU
+// count is not that number.
+//
+// Deliberately provisional. Cold conditions are not reproducible on a machine
+// with enough RAM to cache the corpus after one read, so this default is reasoned
+// rather than measured; DICOMQR_SCAN_WORKERS is how it gets settled against real
+// storage.
+const scanDefaultWorkers = 8
+
+// scanWorkers resolves the worker count for a scan of n files.
+func scanWorkers(n int) int {
+	w := scanDefaultWorkers
+	if v := os.Getenv("DICOMQR_SCAN_WORKERS"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+			w = parsed
+		}
+	}
+	return max(1, min(w, 64, n))
+}
+
+// scanResult is one file's parse, kept at its position in the walk order.
+type scanResult struct {
+	path string
+	m    fileMeta
+	ok   bool
+}
+
+// scanPhase names what a scan is doing, so the status line can distinguish the
+// two very different halves. On a folder whose files have not changed the walk
+// *is* the operation — every file is skipped — and a scan that says nothing
+// while it runs is the one that looks like it never started.
+type scanPhase int
+
+const (
+	// scanPhaseWalk is enumerating the folder; the total is not yet known, so
+	// progress reports it as 0.
+	scanPhaseWalk scanPhase = iota
+	// scanPhaseRead is parsing files, with a known total.
+	scanPhaseRead
+)
+
+// scanEntry is one file as the walk found it — the path plus the stamp an
+// incremental scan compares against the index.
+type scanEntry struct {
+	path  string
+	size  int64
+	mtime int64
+}
+
+// walkDicomFiles enumerates the .dcm files under dir.
+//
+// WalkDir rather than Walk: Walk calls Lstat on every entry, while WalkDir
+// hands back a DirEntry whose Info on Windows returns the data the directory
+// enumeration already produced (os.dirEntry.Info returns a cached *fileStat, no
+// syscall). So size and mtime — exactly what an incremental scan needs to
+// compare — arrive for free, and a stat per file goes away.
+//
+// failed counts entries the walk could not read. A single unreadable subtree
+// must not fail a scan, but the count matters to the caller: files under it are
+// absent from the result and are indistinguishable from files that have been
+// deleted, so nothing may be pruned on the strength of a walk that hit errors.
+func walkDicomFiles(dir string, progress func(phase scanPhase, done, total int)) (entries []scanEntry, failed int, err error) {
+	var lastReport time.Time
+	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			failed++
+			return nil
+		}
+		if d.IsDir() || !strings.EqualFold(filepath.Ext(path), ".dcm") {
+			return nil
+		}
+		e := scanEntry{path: path}
+		if info, infoErr := d.Info(); infoErr == nil {
+			e.size, e.mtime = info.Size(), info.ModTime().Unix()
+		} else {
+			failed++
+		}
+		entries = append(entries, e)
+
+		// Paced here rather than by a ticker: the walk has no workers to count
+		// for it, and the count is the only thing moving.
+		if progress != nil && scanProgressInterval > 0 && time.Since(lastReport) >= scanProgressInterval {
+			lastReport = time.Now()
+			progress(scanPhaseWalk, len(entries), 0)
+		}
+		return nil
+	})
+	return entries, failed, err
+}
+
+// parseFilesParallel reads each path's metadata on a worker pool and returns
+// the results in the order the paths were given.
+//
+// The ordering is the point. First-write-wins study and series metadata, and
+// the file order inside a series, are both what the tree presents, so they must
+// not depend on which worker happened to finish first: parallelism changes when
+// the reading happens, never what comes out of it. Each worker writes its own
+// index, so the slice needs no lock and the caller can merge in order.
+func parseFilesParallel(paths []string, progress func(phase scanPhase, done, total int)) []scanResult {
+	results := make([]scanResult, len(paths))
+	total := len(paths)
+	if total == 0 {
+		return results
+	}
+	var done atomic.Int64
+
+	// One reporter goroutine publishes while the workers only count — the same
+	// split clipBuffer uses. Posting from every worker would put an update in
+	// flight per file, which is what previously buried the tree's own callback
+	// behind hundreds of queued repaints.
+	stopReporting := make(chan struct{})
+	reporterDone := make(chan struct{})
+	if progress != nil && scanProgressInterval > 0 {
+		go func() {
+			defer close(reporterDone)
+			ticker := time.NewTicker(scanProgressInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopReporting:
+					return
+				case <-ticker.C:
+					progress(scanPhaseRead, int(done.Load()), total)
+				}
+			}
+		}()
+	} else {
+		close(reporterDone)
+	}
+
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range scanWorkers(total) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= total {
+					return
+				}
+				m, ok := parseLocalFileMeta(paths[i])
+				results[i] = scanResult{path: paths[i], m: m, ok: ok}
+				done.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	close(stopReporting)
+	<-reporterDone
+	// The ticker can miss the end, so close the contract explicitly: the last
+	// thing a caller sees is done == total.
+	if progress != nil {
+		progress(scanPhaseRead, total, total)
+	}
+	return results
+}
+
+// mergeScanResults assembles parsed files into the tree's shapes, in the order
+// given — see parseFilesParallel on why the order is load-bearing.
+func mergeScanResults(results []scanResult) ([]localStudy, []localSeries, map[string][]string) {
+	type seriesKey struct{ studyUID, seriesUID string }
 	studyMap := make(map[string]localStudy)
 	seriesMap := make(map[seriesKey]*localSeries)
 	filesByUID := make(map[string][]string) // seriesUID → paths
-	fileCount := 0
 
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil || info.IsDir() {
-			return nil
+	for _, r := range results {
+		if !r.ok {
+			continue
 		}
-		if !strings.EqualFold(filepath.Ext(path), ".dcm") {
-			return nil
-		}
-
-		m, ok := parseLocalFileMeta(path)
-		if !ok {
-			return nil
-		}
+		m := r.m
 
 		if _, exists := studyMap[m.studyUID]; !exists {
 			studyMap[m.studyUID] = localStudy{
@@ -159,14 +460,8 @@ func scanLocalFolder(dir string, progress func(int)) ([]localStudy, []localSerie
 			}
 		}
 
-		filesByUID[m.seriesUID] = append(filesByUID[m.seriesUID], path)
-
-		fileCount++
-		if progress != nil && fileCount%25 == 0 {
-			progress(fileCount)
-		}
-		return nil
-	})
+		filesByUID[m.seriesUID] = append(filesByUID[m.seriesUID], r.path)
+	}
 
 	var studies []localStudy
 	for _, s := range studyMap {
@@ -176,7 +471,129 @@ func scanLocalFolder(dir string, progress func(int)) ([]localStudy, []localSerie
 	for _, sr := range seriesMap {
 		series = append(series, *sr)
 	}
+	sortScanHierarchy(studies, series)
+	return studies, series, filesByUID
+}
+
+// sortScanHierarchy orders the returned slices by UID.
+//
+// They come out of maps, whose iteration order Go randomises, so two scans of
+// an unchanged folder returned the same studies in a different order — before
+// any of this was parallel. Harmless in the two places they go (the tree
+// re-sorts on insert by its own key, and the catalog does not care), but a
+// function whose output order varies run to run is a trap for the next caller,
+// and ordering a hundred series costs nothing. By UID rather than by anything
+// displayed, so the order is stable whatever the metadata says.
+func sortScanHierarchy(studies []localStudy, series []localSeries) {
+	sort.Slice(studies, func(i, j int) bool { return studies[i].studyUID < studies[j].studyUID })
+	sort.Slice(series, func(i, j int) bool {
+		if series[i].studyUID != series[j].studyUID {
+			return series[i].studyUID < series[j].studyUID
+		}
+		return series[i].seriesUID < series[j].seriesUID
+	})
+}
+
+// scanLocalFolder walks dir and returns studies, series, and a map of
+// seriesUID → file paths for every .dcm file found, reading every file.
+//
+// This is the full scan: the Import tab's source folder has no index to compare
+// against, and Rebuild uses it deliberately. Local Browse's Scan goes through
+// syncLocalFolder instead, which reads only what changed.
+func scanLocalFolder(dir string, progress func(phase scanPhase, done, total int)) ([]localStudy, []localSeries, map[string][]string, error) {
+	entries, _, err := walkDicomFiles(dir, progress)
+	paths := make([]string, len(entries))
+	for i, e := range entries {
+		paths[i] = e.path
+	}
+	studies, series, filesByUID := mergeScanResults(parseFilesParallel(paths, progress))
 	return studies, series, filesByUID, err
+}
+
+// filesToRemove returns the indexed paths that are no longer on disk.
+//
+// walkFailed is decisive: when the walk could not read part of the tree, the
+// files under it are missing from onDisk and look exactly like deleted ones.
+// Pruning then would strip live files out of the index on the strength of a
+// permissions error or a disconnected mount, so nothing is removed at all. An
+// index that is briefly stale is recoverable; one that has silently dropped a
+// study is not obviously wrong until someone goes looking for it.
+func filesToRemove(stamps map[string]fileStamp, onDisk map[string]bool, walkFailed bool) []string {
+	if walkFailed {
+		return nil
+	}
+	var gone []string
+	for path := range stamps {
+		if !onDisk[path] {
+			gone = append(gone, path)
+		}
+	}
+	sort.Strings(gone)
+	return gone
+}
+
+// syncCounts reports what a sync changed, which is the interesting part of its
+// result — "nothing moved" is a different outcome from "43 files added".
+type syncCounts struct{ added, removed, unchanged int }
+
+// syncLocalFolder brings the index into line with the folder and returns the
+// hierarchy, reading only files that are new or whose size or modification time
+// no longer matches what was indexed.
+//
+// This is what makes a re-scan proportional to the folder's *changes* rather
+// than its size: dicomqr writes each file once and never edits it, so an
+// unchanged folder needs no file opened at all and the walk is the whole cost.
+//
+// Falls back to a full scan when there is no index to compare against — a sync
+// that cannot read the index is simply a scan.
+func syncLocalFolder(cat *catalog, dir string, progress func(phase scanPhase, done, total int)) (
+	[]localStudy, []localSeries, map[string][]string, syncCounts, error) {
+
+	entries, failed, err := walkDicomFiles(dir, progress)
+	if err != nil {
+		return nil, nil, nil, syncCounts{}, err
+	}
+
+	stamps, stampErr := cat.fileStamps()
+	if cat == nil || stampErr != nil {
+		if stampErr != nil {
+			logWarn("catalog: reading file stamps failed, falling back to a full scan: %v", stampErr)
+		}
+		studies, series, files, scanErr := scanLocalFolder(dir, progress)
+		return studies, series, files, syncCounts{added: len(entries)}, scanErr
+	}
+
+	onDisk := make(map[string]bool, len(entries))
+	var toParse []string
+	counts := syncCounts{}
+	for _, e := range entries {
+		onDisk[e.path] = true
+		if st, known := stamps[e.path]; known && st.size == e.size && st.mtime == e.mtime {
+			counts.unchanged++
+			continue
+		}
+		toParse = append(toParse, e.path)
+	}
+	gone := filesToRemove(stamps, onDisk, failed > 0)
+	if failed > 0 {
+		logWarn("scan: %d folder entries could not be read — leaving the index alone rather than "+
+			"treating their files as deleted", failed)
+	}
+
+	var metas []fileMeta
+	for _, r := range parseFilesParallel(toParse, progress) {
+		if r.ok {
+			metas = append(metas, r.m)
+		}
+	}
+	counts.added = cat.upsertMetas(metas)
+	counts.removed = cat.removePaths(gone)
+
+	// The index now matches the folder, so the hierarchy comes from the one
+	// place that knows it rather than being merged a second way here.
+	studies, series, files, loadErr := cat.load()
+	sortScanHierarchy(studies, series)
+	return studies, series, files, counts, loadErr
 }
 
 // filesForNode collects the file paths for a tree node from the seriesFiles map.
@@ -733,10 +1150,21 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 		}()
 	}
 
-	doScan = func() {
+	// scanProgressText renders a progress report for the status line. The walk
+	// has no total to work towards, so it counts; the read phase has one.
+	scanProgressText := func(phase scanPhase, done, total int) string {
+		if phase == scanPhaseWalk {
+			return fmt.Sprintf("Checking %d files…", done)
+		}
+		return fmt.Sprintf("Reading %d of %d changed files…", done, total)
+	}
+
+	// beginScan resets the tree for a fresh scan of the download folder,
+	// returning the folder or "" when there is none configured.
+	beginScan := func() string {
 		dir := cfg.DownloadDir
 		if dir == "" {
-			return
+			return ""
 		}
 		scanDir = dir
 		model.clear()
@@ -744,32 +1172,80 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 		seriesFiles = make(map[string][]string)
 		tree.Refresh()
 		scanStatusLbl.SetText("Scanning…")
+		return dir
+	}
 
+	// finishScan puts the results on screen. extra names what a sync changed;
+	// a rebuild leaves it empty, having read everything by definition.
+	finishScan := func(dir string, studies []localStudy, series []localSeries,
+		files map[string][]string, extra string, err error) {
+		if err != nil {
+			scanStatusLbl.SetText("Scan error: " + err.Error())
+			return
+		}
+		applyData(studies, series, files)
+		noun := "studies"
+		if len(studies) == 1 {
+			noun = "study"
+		}
+		msg := fmt.Sprintf("Found %d %s, %d series in %s",
+			len(studies), noun, len(series), filepath.Base(dir))
+		if extra != "" {
+			msg += " — " + extra
+		}
+		scanStatusLbl.SetText(msg)
+	}
+
+	// doScan brings the index into line with the folder, reading only files
+	// that are new or whose size or timestamp has changed. On a folder nothing
+	// has happened to, that opens no files at all — the walk is the whole cost.
+	doScan = func() {
+		dir := beginScan()
+		if dir == "" {
+			return
+		}
 		go func() {
-			studies, series, files, err := scanLocalFolder(dir, func(n int) {
-				fyne.Do(func() { scanStatusLbl.SetText(fmt.Sprintf("Scanning… %d files read", n)) })
-			})
-			if err == nil {
-				if dbErr := cat.replaceAll(studies, series, files); dbErr != nil {
-					logError("catalog: replace after scan: %v", dbErr)
-				}
+			studies, series, files, counts, err := syncLocalFolder(cat, dir,
+				func(phase scanPhase, done, total int) {
+					text := scanProgressText(phase, done, total)
+					fyne.Do(func() { scanStatusLbl.SetText(text) })
+				})
+			// What changed is the useful part of a sync's result; "nothing" is
+			// as much an answer as a list of files.
+			extra := "no changes"
+			if counts.added > 0 || counts.removed > 0 {
+				extra = fmt.Sprintf("%d added, %d removed", counts.added, counts.removed)
 			}
-			fyne.Do(func() {
-				if err != nil {
-					scanStatusLbl.SetText("Scan error: " + err.Error())
-					return
-				}
-				applyData(studies, series, files)
-				noun := "studies"
-				if len(studies) == 1 {
-					noun = "study"
-				}
-				scanStatusLbl.SetText(fmt.Sprintf("Found %d %s, %d series in %s",
-					len(studies), noun, len(series), filepath.Base(dir)))
-			})
+			fyne.Do(func() { finishScan(dir, studies, series, files, extra, err) })
 		}()
 	}
 	scanBtn := widget.NewButton("Scan", doScan)
+
+	// Rebuild re-reads every file and replaces the index outright — what Scan
+	// used to do. It stays reachable because Scan now trusts the index, and
+	// suspecting the index is exactly why somebody presses Scan.
+	rebuildBtn := widget.NewButton("Rebuild", func() {
+		dir := beginScan()
+		if dir == "" {
+			return
+		}
+		go func() {
+			studies, series, files, err := scanLocalFolder(dir,
+				func(phase scanPhase, done, total int) {
+					text := scanProgressText(phase, done, total)
+					if phase == scanPhaseRead {
+						text = fmt.Sprintf("Reading %d of %d files…", done, total)
+					}
+					fyne.Do(func() { scanStatusLbl.SetText(text) })
+				})
+			if err == nil {
+				if dbErr := cat.replaceAll(studies, series, files); dbErr != nil {
+					logError("catalog: replace after rebuild: %v", dbErr)
+				}
+			}
+			fyne.Do(func() { finishScan(dir, studies, series, files, "index rebuilt", err) })
+		}()
+	})
 
 	openFolderBtn := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {
 		if cfg.DownloadDir == "" {
@@ -780,7 +1256,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 
 	dirBar := container.NewBorder(nil, nil,
 		widget.NewLabel("Folder:"),
-		container.NewHBox(openFolderBtn, scanBtn),
+		container.NewHBox(openFolderBtn, scanBtn, rebuildBtn),
 		folderLabel,
 	)
 

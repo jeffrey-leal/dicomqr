@@ -104,9 +104,7 @@ func loadMaskBenchStudy(t *testing.T) maskBenchStudy {
 			sopUID:   strings.TrimSpace(datasetFirstString(&ds, tag.SOPInstanceUID)),
 		}
 		_, f.calibrated = ultrasoundRegionBounds(&ds)
-		spp := datasetInt(&ds, tag.SamplesPerPixel, 1)
-		bytesPerSample := int64(datasetInt(&ds, tag.BitsAllocated, 8)+7) / 8
-		f.rawBytes = int64(f.cols) * int64(f.rows) * int64(spp) * bytesPerSample * int64(f.frames)
+		f.rawBytes = projectedPixelBytes(&ds)
 
 		if study.rawBytes+f.rawBytes > budget && len(study.files) > 0 {
 			skipped++

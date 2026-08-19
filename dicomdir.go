@@ -19,6 +19,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -393,9 +394,17 @@ func buildDICOMDIRBytes(sources []dicomdirSource) ([]byte, error) {
 			len(recs), len(positions))
 	}
 
-	// Patch root-level first / last record pointers.
-	patchUL32(data, 0, len(data), patFirstRecord, uint32(positions[0]))
-	patchUL32(data, 0, len(data), patLastRecord, uint32(positions[lastPatIdx]))
+	// Every patch below must land. Each offset element is emitted unconditionally
+	// by buildDicomdirDataset and the four record builders — a leaf record still
+	// carries both pointers, holding 0 — so there is no call here that is allowed
+	// to find nothing. A miss means the writer no longer encodes a UL element the
+	// way these patterns describe, and the result would be a file-set that reads
+	// as empty rather than one that fails, so it ends the build instead.
+	patched := patchUL32(data, 0, len(data), patFirstRecord, uint32(positions[0])) &&
+		patchUL32(data, 0, len(data), patLastRecord, uint32(positions[lastPatIdx]))
+	if !patched {
+		return nil, errors.New("DICOMDIR: root directory record offsets not found in the encoded output")
+	}
 
 	// Patch the next-sibling and first-child pointers inside each item.
 	for i, rec := range recs {
@@ -414,8 +423,11 @@ func buildDICOMDIRBytes(sources []dicomdirSource) ([]byte, error) {
 			childOff = uint32(positions[rec.child])
 		}
 
-		patchUL32(data, start, end, patNextRecord, nextOff)
-		patchUL32(data, start, end, patLowerLevel, childOff)
+		if !patchUL32(data, start, end, patNextRecord, nextOff) ||
+			!patchUL32(data, start, end, patLowerLevel, childOff) {
+			return nil, fmt.Errorf("DICOMDIR: record %d of %d is missing its offset fields in the encoded output",
+				i+1, len(recs))
+		}
 	}
 
 	return data, nil
@@ -467,16 +479,29 @@ func findSequenceItemPositions(data []byte) []int {
 
 // patchUL32 locates the first occurrence of pattern within data[start:end] and
 // overwrites the four bytes immediately following it with value (little-endian).
-func patchUL32(data []byte, start, end int, pattern []byte, value uint32) {
+// It reports whether the pattern was found.
+//
+// The caller must treat false as fatal. pattern is the literal Explicit VR LE
+// header of a UL element, so this function asserts a byte-level encoding it
+// cannot itself verify — and the failure is the quiet kind: an unpatched offset
+// stays 0, which is a structurally valid DICOMDIR whose records simply cannot be
+// reached, since offset 0 means "no record". Such a file parses, carries every
+// name and UID intact, and reads as an empty file-set. Nothing downstream would
+// notice, which is why a miss has to end the build rather than be skipped.
+func patchUL32(data []byte, start, end int, pattern []byte, value uint32) bool {
 	if end > len(data) {
 		end = len(data)
 	}
 	idx := bytes.Index(data[start:end], pattern)
 	if idx < 0 {
-		return
+		return false
 	}
 	off := start + idx + len(pattern)
+	if off+4 > len(data) {
+		return false
+	}
 	binary.LittleEndian.PutUint32(data[off:off+4], value)
+	return true
 }
 
 // ----------------------------------------------------------------------------

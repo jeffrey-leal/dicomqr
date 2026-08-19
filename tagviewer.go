@@ -648,14 +648,10 @@ func (tr *tagTreeRow) hideTooltip() {
 
 // parseDICOMTags parses one file for tag review: full element tree, pixel data
 // skipped, lenient about the common standard violations the download folder can
-// contain. Recovers parser panics so one malformed file cannot crash the app.
-func parseDICOMTags(path string) (ds sdicom.Dataset, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("parser panic: %v", r)
-		}
-	}()
-	return sdicom.ParseFile(path, nil,
+// contain. Parser panics are handled by safeParseFile (dicomsafe.go), so one
+// malformed file cannot crash the app.
+func parseDICOMTags(path string) (sdicom.Dataset, error) {
+	return safeParseFile(path, nil,
 		sdicom.SkipPixelData(),
 		sdicom.AllowMismatchPixelDataLength(),
 		sdicom.AllowMissingMetaElementGroupLength(),

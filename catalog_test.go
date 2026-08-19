@@ -249,4 +249,60 @@ func TestCatalogNilSafety(t *testing.T) {
 	if _, _, _, err := c.load(); err != nil {
 		t.Errorf("nil load: %v", err)
 	}
+	if stamps, err := c.fileStamps(); err != nil || len(stamps) != 0 {
+		t.Errorf("nil fileStamps: %v %v", stamps, err)
+	}
+	if n := c.upsertMetas([]fileMeta{{path: "x"}}); n != 0 {
+		t.Errorf("nil upsertMetas: %d", n)
+	}
+}
+
+// TestCatalogStampsRoundTrip covers the two columns the incremental scan rests
+// on. They have been written since the index was added and never read back, so
+// this is the first thing that depends on them being right.
+func TestCatalogStampsRoundTrip(t *testing.T) {
+	c, _ := openTestCatalog(t)
+
+	metas := []fileMeta{
+		{path: `C:\dl\a.dcm`, studyUID: "1.2", seriesUID: "1.2.1", size: 111, mtime: 222},
+		{path: `C:\dl\b.dcm`, studyUID: "1.2", seriesUID: "1.2.1", size: 333, mtime: 444},
+	}
+	if n := c.upsertMetas(metas); n != len(metas) {
+		t.Fatalf("upsertMetas wrote %d rows, want %d", n, len(metas))
+	}
+
+	stamps, err := c.fileStamps()
+	if err != nil {
+		t.Fatalf("fileStamps: %v", err)
+	}
+	if len(stamps) != len(metas) {
+		t.Fatalf("stamps = %d, want %d", len(stamps), len(metas))
+	}
+	for _, m := range metas {
+		st, ok := stamps[m.path]
+		if !ok {
+			t.Errorf("%s missing from the stamps", m.path)
+			continue
+		}
+		if st.size != m.size || st.mtime != m.mtime {
+			t.Errorf("%s stamp = %+v, want size %d mtime %d", m.path, st, m.size, m.mtime)
+		}
+	}
+
+	// A re-upsert with a new stamp replaces rather than duplicates — this is
+	// what a changed file does on the next scan.
+	metas[0].size = 999
+	if n := c.upsertMetas(metas[:1]); n != 1 {
+		t.Fatalf("re-upsert wrote %d rows, want 1", n)
+	}
+	stamps, err = c.fileStamps()
+	if err != nil {
+		t.Fatalf("fileStamps after re-upsert: %v", err)
+	}
+	if len(stamps) != len(metas) {
+		t.Errorf("stamps = %d after a re-upsert, want %d — the row was duplicated", len(stamps), len(metas))
+	}
+	if stamps[metas[0].path].size != 999 {
+		t.Errorf("size = %d, want the updated 999", stamps[metas[0].path].size)
+	}
 }

@@ -201,6 +201,26 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		widget.NewFormItem("Output transfer syntax", tsSelect),
 	)
 
+	// Birth-date advisory, under the row it is about. resolved already carries
+	// the merged base chain, so only the mask itself can change the answer here
+	// — the removal list on this panel is read-only — which is why a mask typed
+	// for a single run raises the note too.
+	dobAdvisoryLabel := widget.NewLabel("")
+	dobAdvisoryLabel.TextStyle = fyne.TextStyle{Italic: true}
+	dobAdvisoryLabel.Wrapping = fyne.TextWrapWord
+	refreshDOBAdvisory := func() {
+		candidate := resolved
+		candidate.DOB = strings.TrimSpace(dobEntry.Text)
+		if text := modProfileDOBAdvisory(candidate); text != "" {
+			dobAdvisoryLabel.SetText(text)
+			dobAdvisoryLabel.Show()
+			return
+		}
+		dobAdvisoryLabel.Hide()
+	}
+	refreshDOBAdvisory()
+	dobEntry.OnChanged = func(string) { refreshDOBAdvisory() }
+
 	// Tags removed — read-only list (already keep-filtered by base resolution).
 	removeLines := make([]string, 0, len(resolved.Removes))
 	for _, r := range resolved.Removes {
@@ -230,7 +250,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	if len(setRows) > 0 {
 		sections = append(sections, prefSection("Set values", setForm))
 	}
-	sections = append(sections, prefSection("Options", optionsForm))
+	sections = append(sections, prefSection("Options", optionsForm, dobAdvisoryLabel))
 
 	// Pixel masking. The regions are disclosed because this is the one part of a
 	// profile that alters the image rather than the header and cannot be undone
@@ -740,6 +760,16 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 			if res.MaskUSFallback > 0 {
 				msg += fmt.Sprintf("; %d ultrasound file(s) declared no image region and were masked "+
 					"with the profile's rectangles instead — worth reviewing", res.MaskUSFallback)
+			}
+			// The birth date mask rewrites the top-level element only, so a copy
+			// nested in a sequence — Original Attributes Sequence being the one
+			// that really carries one — survives it. Reported from what the run
+			// actually found rather than from the profile's shape, so it is a
+			// fact about this export rather than a warning about a possibility.
+			if res.NestedDOBKept > 0 {
+				msg += fmt.Sprintf("; %d file(s) still carry a birth date inside a sequence — "+
+					"the birth date mask reaches the top-level field only, so removing 0400,0561 "+
+					"(Original Attributes Sequence) is what clears it", res.NestedDOBKept)
 			}
 			// Informational, like the mask-outcome clauses above: the exported
 			// DICOM files are unaffected either way, so a DICOMDIR failure never

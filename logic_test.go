@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -100,6 +101,69 @@ func TestOrganizeFilePath_LongPathFallback(t *testing.T) {
 	// The flat fallback places the file directly under downloadDir.
 	if !strings.HasPrefix(got, base) {
 		t.Errorf("organizeFilePath long path: expected prefix %q, got %q", base, got)
+	}
+}
+
+// ── safePathComponent ─────────────────────────────────────────────────────────
+
+func TestSafePathComponent(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		// Directory references, defused.
+		{".", "_."},
+		{"..", "_.."},
+		{"...", "_..."},
+		{"....", "_...."},
+		// Everything else passes through untouched — including names that merely
+		// contain or end in a dot, which are legitimate and must keep the folder
+		// name they already have on disk.
+		{"Doe^John", "Doe^John"},
+		{"J. Smith Jr.", "J. Smith Jr."},
+		{".hidden", ".hidden"},
+		{"..leading", "..leading"},
+		{"1.2.840", "1.2.840"},
+		{"", ""},
+	}
+	for _, tc := range tests {
+		if got := safePathComponent(tc.in); got != tc.want {
+			t.Errorf("safePathComponent(%q) = %q; want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestOrganizeFilePath_NoTraversal is the regression test for a received file
+// escaping the download folder. sanitize strips none of the characters in ".."
+// (there are none to strip), so before safePathComponent a PatientName of ".."
+// resolved through filepath.Join's Clean and wrote one directory ABOVE the
+// download folder. Every component is checked: any one of them can traverse.
+func TestOrganizeFilePath_NoTraversal(t *testing.T) {
+	base := `C:\Downloads`
+	prefix := base + `\`
+
+	cases := []struct {
+		name                   string
+		patient, study, series string
+	}{
+		{"patient dotdot", "..", "Chest CT", "Series 1"},
+		{"study dotdot", "Doe^John", "..", "Series 1"},
+		{"series dotdot", "Doe^John", "Chest CT", ".."},
+		{"patient dot", ".", "Chest CT", "Series 1"},
+		{"every component", "..", "..", ".."},
+		{"triple dot", "...", "...", "..."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Empty ID/date/number so each component is the bare value under test;
+			// a parenthesised suffix would make it harmless on its own.
+			got := organizeFilePath(base, tc.patient, "", tc.study, "", tc.series, "", "1.2.3")
+			if !strings.HasPrefix(got, prefix) {
+				t.Errorf("organizeFilePath escaped the download folder: %q", got)
+			}
+			if strings.Contains(got, string(filepath.Separator)+".."+string(filepath.Separator)) {
+				t.Errorf("organizeFilePath left a traversal component in %q", got)
+			}
+		})
 	}
 }
 

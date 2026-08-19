@@ -8,6 +8,79 @@ import (
 	"github.com/suyashkumar/dicom/pkg/tag"
 )
 
+// TestProjectedPixelBytes covers the figure the modification pool sizes itself
+// by. The multi-frame case is the one that matters: it is the difference
+// between a file that looks small on disk and one that needs hundreds of
+// megabytes decoded.
+func TestProjectedPixelBytes(t *testing.T) {
+	build := func(t *testing.T, elems ...*sdicom.Element) sdicom.Dataset {
+		t.Helper()
+		return sdicom.Dataset{Elements: elems}
+	}
+
+	t.Run("single-frame 8-bit greyscale", func(t *testing.T) {
+		ds := build(t,
+			mustTestElement(t, tag.Columns, []int{512}),
+			mustTestElement(t, tag.Rows, []int{512}),
+			mustTestElement(t, tag.BitsAllocated, []int{8}),
+			mustTestElement(t, tag.SamplesPerPixel, []int{1}),
+		)
+		if got, want := projectedPixelBytes(&ds), int64(512*512); got != want {
+			t.Errorf("= %d, want %d", got, want)
+		}
+	})
+
+	t.Run("16-bit doubles it", func(t *testing.T) {
+		ds := build(t,
+			mustTestElement(t, tag.Columns, []int{512}),
+			mustTestElement(t, tag.Rows, []int{512}),
+			mustTestElement(t, tag.BitsAllocated, []int{16}),
+			mustTestElement(t, tag.SamplesPerPixel, []int{1}),
+		)
+		if got, want := projectedPixelBytes(&ds), int64(512*512*2); got != want {
+			t.Errorf("= %d, want %d", got, want)
+		}
+	})
+
+	t.Run("colour triples it", func(t *testing.T) {
+		ds := build(t,
+			mustTestElement(t, tag.Columns, []int{640}),
+			mustTestElement(t, tag.Rows, []int{480}),
+			mustTestElement(t, tag.BitsAllocated, []int{8}),
+			mustTestElement(t, tag.SamplesPerPixel, []int{3}),
+		)
+		if got, want := projectedPixelBytes(&ds), int64(640*480*3); got != want {
+			t.Errorf("= %d, want %d", got, want)
+		}
+	})
+
+	// The case the budget exists for: a 240-frame acquisition is three orders of
+	// magnitude past a single frame, and NumberOfFrames is stored as IS (a
+	// string), which datasetInt has to tolerate.
+	t.Run("multi-frame scales by NumberOfFrames", func(t *testing.T) {
+		ds := build(t,
+			mustTestElement(t, tag.Columns, []int{1024}),
+			mustTestElement(t, tag.Rows, []int{1024}),
+			mustTestElement(t, tag.BitsAllocated, []int{16}),
+			mustTestElement(t, tag.SamplesPerPixel, []int{1}),
+			mustTestElement(t, tag.NumberOfFrames, []string{"240"}),
+		)
+		want := int64(1024) * 1024 * 2 * 240
+		if got := projectedPixelBytes(&ds); got != want {
+			t.Errorf("= %d MB, want %d MB", got>>20, want>>20)
+		}
+	})
+
+	// A report or key-object selection has no pixels, so it weighs nothing —
+	// the honest answer rather than a guessed default.
+	t.Run("no pixel geometry weighs nothing", func(t *testing.T) {
+		ds := build(t, mustTestElement(t, tag.PatientName, []string{"DOE^JANE"}))
+		if got := projectedPixelBytes(&ds); got != 0 {
+			t.Errorf("= %d, want 0", got)
+		}
+	})
+}
+
 func TestIsUncompressedOnDisk(t *testing.T) {
 	for uid, want := range map[string]bool{
 		"1.2.840.10008.1.2":      true,  // Implicit VR LE

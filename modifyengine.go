@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -249,6 +250,12 @@ type modifyResult struct {
 	// and were masked with the profile's manual rectangles instead of their own
 	// stated geometry — a weaker guarantee, so the run says how many.
 	MaskUSFallback int
+	// NestedDOBKept counts exported files that still carry a birth date inside
+	// a sequence after a birth-date mask was applied. The mask rewrites the
+	// top-level element only, so this is the evidence — as opposed to the
+	// profile-shape advisory in the editors — that an export actually carries
+	// more than the profile implies.
+	NestedDOBKept int
 	// DicomdirWritten reports whether a DICOMDIR (PS3.10 File-set) index was
 	// requested and written alongside the export.
 	DicomdirWritten bool
@@ -484,6 +491,19 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 	// uses the full CPU count).
 	numWorkers := min(runtime.NumCPU(), 4, len(files))
 
+	// A run that can decompress is admitted by weight as well as by count. Four
+	// workers is the right width for tag edits, where a file costs what it costs
+	// on disk, but decompressing a multi-frame acquisition can cost a hundred
+	// times that — and running out of memory kills the export outright instead
+	// of failing one file. A run that touches no pixels gets no limiter and
+	// behaves exactly as before, down to not paying for the header read below.
+	var budget *memBudget
+	if params.mayMask || params.targetTS != "" {
+		budget = newMemBudget(modifyMemoryBudget)
+		logInfo("modify: memory budget %d MB for in-flight pixel data across %d worker(s)",
+			modifyMemoryBudget>>20, numWorkers)
+	}
+
 	var (
 		mu   sync.Mutex
 		done int
@@ -523,6 +543,41 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 			defer wg.Done()
 			for path := range jobCh {
 				func() {
+					// partial is the output file while it is mid-write, so a
+					// panic can take the half-written file with it rather than
+					// leaving a truncated study member in the export. The handle
+					// has to be closed before the remove: Windows will not delete
+					// an open file, and a panic skips the normal Close.
+					var partial *os.File
+
+					// Backstop. safeParse already turns a parse panic into an
+					// ordinary per-file error, but decoding, masking, re-encoding
+					// and writing all reach library and cgo code that can panic
+					// on a malformed file too — and on a worker goroutine that
+					// kills the process. The engine already has a "this file
+					// failed, the run continues" concept, so a panic becomes one
+					// more entry in the failure dialog, naming the file.
+					//
+					// A zip run is the one case this cannot fully clean up: the
+					// archive keeps whatever fragment of the entry was written
+					// before the panic. The file is still reported as failed, so
+					// a member that will not open is accounted for rather than
+					// silently present.
+					//
+					// recordFailure takes mu, which is safe here: every mu
+					// critical section in this closure is a bare counter
+					// increment, so a panic can never be raised while it is held.
+					defer func() {
+						if r := recover(); r != nil {
+							if partial != nil {
+								name := partial.Name()
+								partial.Close()
+								os.Remove(name)
+							}
+							recordFailure(path, fmt.Errorf("panic: %v\n%s", r, debug.Stack()))
+						}
+					}()
+
 					srcFile, ferr := openDICOMFile(path)
 					if ferr != nil {
 						recordFailure(path, fmt.Errorf("open: %w", ferr))
@@ -534,7 +589,21 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 						mu.Unlock()
 						return
 					}
-					skipped, ds, notes, perr := processFile(srcFile, params, uidRemap)
+					// Weigh the file before allocating anything for it. The
+					// header read never touches pixel data, so it stays cheap
+					// on exactly the large files this exists to hold back, and
+					// the reservation is held until the write has finished —
+					// the decoded frames stay alive until sdicom.Write has
+					// serialised them.
+					//
+					// A header that will not parse weighs nothing and goes
+					// through: processFile will fail it properly a moment
+					// later, and inventing a weight for a file we cannot read
+					// would be worse than not gating it.
+					if budget != nil {
+						defer budget.acquire(fileMemoryWeight(path))()
+					}
+					skipped, ds, notes, perr := processFileFn(srcFile, params, uidRemap)
 					if perr != nil {
 						recordFailure(path, fmt.Errorf("process: %w", perr))
 						return
@@ -577,6 +646,16 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 						res.MaskUSFallback++
 						mu.Unlock()
 					}
+					if notes.nestedDOBKept {
+						// Warning, not info: the export carries a birth date the
+						// profile's mask did not reach, which is the one thing a
+						// masked export is assumed not to contain.
+						logWarn("modify: %s still carries a birth date inside a sequence — the birth date mask rewrites the top-level element only",
+							path)
+						mu.Lock()
+						res.NestedDOBKept++
+						mu.Unlock()
+					}
 					if skipped {
 						mu.Lock()
 						res.Skipped++
@@ -608,10 +687,15 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 						recordFailure(path, fmt.Errorf("create output file: %w", cerr))
 						return
 					}
+					// From here until the write completes, this file is
+					// incomplete on disk; the deferred recover closes and removes
+					// it if the encode panics.
+					partial = f
 					bw := bufio.NewWriterSize(f, 1<<20)
 					werr := sdicom.Write(bw, ds, writeOpts...)
 					fherr := bw.Flush()
 					clerr := f.Close()
+					partial = nil
 					switch {
 					case werr != nil:
 						recordFailure(path, fmt.Errorf("write: %w", werr))
@@ -898,9 +982,78 @@ type fileNotes struct {
 	// maskUSFallback: an ultrasound image declared no calibrated region, so the
 	// profile's manual rectangles masked it instead of its own stated geometry.
 	maskUSFallback bool
+	// nestedDOBKept: a birth-date mask was applied and a birth date still
+	// survives inside a sequence in the exported file — see hasNestedTag.
+	nestedDOBKept bool
 }
 
+// hasNestedTag reports whether t appears anywhere BELOW the top level of
+// elements, descending through sequence items to any depth. The top level is
+// deliberately excluded: the caller is asking what the recursing transforms
+// would have reached and the non-recursing ones did not.
+func hasNestedTag(elements []*sdicom.Element, t tag.Tag) bool {
+	for _, elem := range elements {
+		if elem.Value == nil || elem.Value.ValueType() != sdicom.Sequences {
+			continue
+		}
+		items, ok := elem.Value.GetValue().([]*sdicom.SequenceItemValue)
+		if !ok {
+			continue
+		}
+		for _, item := range items {
+			sub, ok := item.GetValue().([]*sdicom.Element)
+			if !ok {
+				continue
+			}
+			for _, e := range sub {
+				if e.Tag == t {
+					return true
+				}
+			}
+			if hasNestedTag(sub, t) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// modifyMemoryOverheadFactor scales a file's projected pixel size into what
+// processing it actually costs at peak. Masking a compressed file holds three
+// things at once: the frames decompressPixelData decoded, the frames
+// recompressPixelData encoded from them, and — via pixelStateSnapshot — the
+// original codestream, kept so a file nothing masked can be restored
+// byte-identical. The decoded frames dominate, and the rest come to roughly as
+// much again, so the projection is about half the real peak.
+const modifyMemoryOverheadFactor = 2
+
+// fileMemoryWeight is what one file should reserve from the run's budget: the
+// memory its pixels will occupy decoded, with the overhead above. Reads the
+// header only (SkipPixelData never touches the pixels), so it stays cheap on
+// precisely the files it is there to weigh. Returns 0 for a file it cannot read
+// or one with no pixel data — see the call site.
+func fileMemoryWeight(path string) int64 {
+	ds, err := safeParseFile(path, nil, sdicom.SkipPixelData())
+	if err != nil {
+		return 0
+	}
+	return projectedPixelBytes(&ds) * modifyMemoryOverheadFactor
+}
+
+// processFileFn is the per-file transform the worker pool calls, a variable so
+// tests can substitute a panicking implementation and prove the worker's
+// backstop turns it into a recorded failure — the same seam encodeMaskedFrame
+// uses in recompress.go.
+var processFileFn = processFile
+
 func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped bool, ds sdicom.Dataset, notes fileNotes, err error) {
+	// Backstop for the panic path: the parser panics on some malformed
+	// datasets, and the handle has to be released then too — which is what
+	// makes the "src is always closed" contract above true. The explicit close
+	// after the parse still runs on every normal path, so the handle is not
+	// held open across the transform; closing twice is harmless.
+	defer src.Close()
+
 	// Copy to locals: per-modality overrides layer onto these per file, and p's
 	// slices are shared across concurrent workers.
 	edits := p.edits
@@ -913,11 +1066,10 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 
 	info, err := src.Stat()
 	if err != nil {
-		src.Close()
 		return false, ds, notes, fmt.Errorf("stat: %w", err)
 	}
 	br := bufio.NewReaderSize(src, 1<<20)
-	ds, err = sdicom.Parse(br, info.Size(), nil)
+	ds, err = safeParse(br, info.Size(), src.Name(), nil)
 	src.Close()
 	if err != nil {
 		return false, ds, notes, fmt.Errorf("parse: %w", err)
@@ -1115,6 +1267,15 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 				}
 			}
 		}
+	}
+
+	// Measured on the finished dataset, so it reports what actually ships: a
+	// profile that removed Original Attributes Sequence no longer counts, and
+	// neither does one that never asked for the birth date to be masked — a
+	// nested birth date is only a surprise when the top-level one was rewritten.
+	// Gating on dobMask also keeps the extra traversal off every other run.
+	if dobMask != "" && hasNestedTag(ds.Elements, tag.PatientBirthDate) {
+		notes.nestedDOBKept = true
 	}
 
 	notes.namesAfter = readExportNames(&ds)

@@ -1099,12 +1099,22 @@ func parseDicomFile(path string) (*parsedDicom, error) {
 		}
 		collected <- fs
 	}()
-	ds, err := sdicom.ParseFile(path, frameCh)
+	ds, err := safeParseFile(path, frameCh)
 	if err != nil {
-		// The library closes frameCh only on success. After ParseFile returns
-		// no sender remains, so closing here is safe and lets the collector
-		// goroutine finish instead of blocking forever on the open channel.
-		close(frameCh)
+		// The library closes frameCh on success, and leaves it open when it
+		// returns an error or panics. After it returns no sender remains, so
+		// closing here lets the collector goroutine finish instead of blocking
+		// forever on the open channel.
+		//
+		// The recover is for the one path where the library has already closed
+		// it and still reports failure: Parser.Next closes the channel before
+		// returning ErrorEndOfDICOM, which parseInternal propagates as an error.
+		// Closing again would panic — on a goroutine that may not be the main
+		// one — so the double close is absorbed rather than risked.
+		func() {
+			defer func() { _ = recover() }()
+			close(frameCh)
+		}()
 		<-collected
 		return nil, err
 	}

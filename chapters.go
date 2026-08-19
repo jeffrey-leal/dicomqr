@@ -112,7 +112,7 @@ func totalChapterFrames(chapters []chapter) int {
 func scanChapters(paths []string, progress func(done int)) []chapter {
 	chapters := make([]chapter, len(paths))
 	for i, p := range paths {
-		ds, err := sdicom.ParseFile(p, nil, sdicom.SkipPixelData())
+		ds, err := safeParseFile(p, nil, sdicom.SkipPixelData())
 		if err != nil {
 			chapters[i] = chapterFromHeader(i, p, nil)
 		} else {

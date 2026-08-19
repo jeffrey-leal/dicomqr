@@ -132,6 +132,64 @@ func TestBuildDICOMDIRBytesEmpty(t *testing.T) {
 	}
 }
 
+// oneImageDicomdirSources is the smallest complete hierarchy: one patient, one
+// study, one series, one image — four directory records.
+func oneImageDicomdirSources() []dicomdirSource {
+	return []dicomdirSource{{
+		rel: "STUDY1/SERIES1/img1.dcm", patientID: "PAT1", patientName: "ONE^PATIENT",
+		studyUID: "1.2.1", studyDate: "20240101", studyID: "S1",
+		seriesUID: "1.2.1.1", modality: "CT", seriesNumber: "1",
+		sopClass: "1.2.840.10008.5.1.4.1.1.7", sopInstance: "1.2.1.1.1",
+		transferSyntax: tsExplicitVRLE, instanceNum: "1",
+	}}
+}
+
+// TestBuildDICOMDIRUnpatchableOffsetFails covers the guard on patchUL32.
+//
+// The pat* patterns are the literal Explicit VR LE headers of the offset
+// elements, so the builder asserts a byte-level encoding it cannot verify.
+// Corrupting one stands in for the writer encoding a UL element differently —
+// a library upgrade, or a switch to implicit VR. Without the guard the offsets
+// would silently stay 0, which is a structurally valid DICOMDIR that parses,
+// carries every name and UID, and reads as an EMPTY file-set: exactly the
+// failure a "no error" test would miss. The build must fail instead.
+//
+// These subtests reassign package-level vars, so they must not run in parallel.
+func TestBuildDICOMDIRUnpatchableOffsetFails(t *testing.T) {
+	corrupt := []byte{0xDE, 0xAD, 0xBE, 0xEF, 0x55, 0x4C, 0x04, 0x00}
+
+	for _, tc := range []struct {
+		name string
+		pat  *[]byte
+	}{
+		{"root first-record pointer", &patFirstRecord},
+		{"root last-record pointer", &patLastRecord},
+		{"per-record next-sibling pointer", &patNextRecord},
+		{"per-record first-child pointer", &patLowerLevel},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			original := *tc.pat
+			t.Cleanup(func() { *tc.pat = original })
+			*tc.pat = corrupt
+
+			data, err := buildDICOMDIRBytes(oneImageDicomdirSources())
+			if err == nil {
+				t.Fatalf("build succeeded with an unpatchable %s — an index whose offsets "+
+					"stayed 0 would ship as an empty file-set", tc.name)
+			}
+			if data != nil {
+				t.Errorf("build returned %d bytes alongside its error; a half-patched index must not escape", len(data))
+			}
+		})
+	}
+
+	// With every pattern restored the same fixture must build cleanly, so the
+	// subtests above prove the guard rather than a broken fixture.
+	if _, err := buildDICOMDIRBytes(oneImageDicomdirSources()); err != nil {
+		t.Fatalf("build failed with the patterns restored: %v", err)
+	}
+}
+
 // TestBuildDICOMDIRBytesTree builds a two-patient hierarchy — one patient
 // with two series (one two images deep, so a series has more than one child
 // and a study has more than one series), the other a single image — and

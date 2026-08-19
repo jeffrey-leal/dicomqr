@@ -557,6 +557,46 @@ func validateDOBMask(s string) (string, error) {
 	return s, nil
 }
 
+// origAttrsSeqTag is (0400,0561) Original Attributes Sequence.
+var origAttrsSeqTag = tag.Tag{Group: 0x0400, Element: 0x0561}
+
+// modProfileDOBAdvisory returns the warning for a profile that masks the birth
+// date but leaves the one sequence that is known to nest a copy of it, or ""
+// when there is nothing to say.
+//
+// The birth-date mask rewrites the top-level (0010,0030) only — unlike removals,
+// date shifting, UID remapping and Set values, which all recurse. In ordinary
+// image objects that is enough: patient demographics live in the top-level
+// Patient Module and the sequences that reference a patient carry identifiers,
+// not birth dates. The exception is Original Attributes Sequence, whose nested
+// Modified Attributes Sequence (0400,0550) holds the values an earlier
+// de-identification changed — so a study processed once before can carry the
+// real birth date there while the top-level field reads as masked. Removing
+// 0400,0561 takes its nested contents with it, which is why the shipped
+// base-deident profile is not exposed.
+//
+// p must be RESOLVED — base chain merged and Keep applied — because a derived
+// profile inherits the removal from its base, and a Keep list can cancel it.
+//
+// Only the profile-level Removes list is examined. A per-modality override's
+// removals apply to that modality alone, so an override carrying this tag would
+// still leave every other modality exposed.
+func modProfileDOBAdvisory(p ModProfile) string {
+	if strings.TrimSpace(p.DOB) == "" {
+		return ""
+	}
+	want := tagMatchKey(formatTagRef(origAttrsSeqTag))
+	for _, r := range p.Removes {
+		if tagMatchKey(r) == want {
+			return ""
+		}
+	}
+	return "This profile masks the birth date but does not remove Original Attributes Sequence " +
+		"(0400,0561). A study that has already been de-identified once stores the values that were " +
+		"changed inside that sequence, so an original birth date can leave in the export even though " +
+		"the top-level field is masked. Add 0400,0561 to Remove tags to close it."
+}
+
 // A Set value of exactly "[GGGG,EEEE]" is a reference: it means "whatever this
 // same profile sets that tag to". It exists so a profile can state a
 // relationship it used to be given — the Modification dialog hardcoded Patient

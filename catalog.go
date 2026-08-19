@@ -215,6 +215,85 @@ func upsertMeta(tx *sql.Tx, m fileMeta) error {
 	return err
 }
 
+// fileStamp is what the index remembers about a file's contents without
+// reading them: enough to tell whether the copy on disk is still the one that
+// was parsed.
+type fileStamp struct{ size, mtime int64 }
+
+// fileStamps returns every indexed file's path and stamp.
+//
+// These two columns have been written on every scan and ingest since the index
+// was added and never read back. They are what lets a re-scan skip a file: an
+// entry whose size and modification time still match the index cannot have
+// changed since it was parsed, so there is nothing to learn by opening it.
+//
+// Resolution is one second, since that is what the index stores. A file
+// rewritten within the same second to exactly the same length would look
+// unchanged — which dicomqr never does to its own downloads, and which is what
+// the Rebuild action exists to recover from.
+func (c *catalog) fileStamps() (map[string]fileStamp, error) {
+	stamps := make(map[string]fileStamp)
+	if c == nil {
+		return stamps, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.db == nil {
+		return stamps, nil
+	}
+	rows, err := c.db.Query(`SELECT path, size, mtime FROM instances`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var path string
+		var st fileStamp
+		if err := rows.Scan(&path, &st.size, &st.mtime); err != nil {
+			return nil, err
+		}
+		stamps[path] = st
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return stamps, nil
+}
+
+// upsertMetas indexes files that have already been parsed, returning how many
+// rows were written.
+//
+// The counterpart to ingestPaths, which parses the files itself and serially.
+// A scan has already parsed its changed files, on a worker pool; handing it
+// paths instead of results would throw that work away and do it again. Both
+// exist because the callers genuinely differ: the retrieve and import hooks
+// hold only paths, a scan holds results.
+func (c *catalog) upsertMetas(metas []fileMeta) int {
+	if c == nil || len(metas) == 0 {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.db == nil {
+		return 0
+	}
+	tx, err := c.db.Begin()
+	if err != nil {
+		return 0
+	}
+	defer tx.Rollback()
+	n := 0
+	for _, m := range metas {
+		if upsertMeta(tx, m) == nil {
+			n++
+		}
+	}
+	if tx.Commit() != nil {
+		return 0
+	}
+	return n
+}
+
 // ingestPaths parses the given DICOM files and upserts them into the index.
 // Files that fail to parse are skipped. Returns the number of files indexed.
 // Parsing happens before the catalog lock is taken so long ingests do not

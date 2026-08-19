@@ -312,6 +312,54 @@ func (e *modProfileEditor) validate() (string, ModProfile, error) {
 	return newName, updated, nil
 }
 
+// dobAdvisory returns the birth-date-mask warning for the profile as the
+// controls currently stand, or "" when there is nothing to say. See
+// modProfileDOBAdvisory.
+//
+// It reads the live controls rather than the profile as loaded so the note
+// clears the moment the user adds the missing removal, and it resolves through
+// the base chain — a derived profile inherits its base's Removes, so judging
+// this editor's own list alone would warn about every profile built on
+// base-deident.
+//
+// Unparsable Remove lines are skipped rather than failing: an advisory must not
+// depend on the field being valid yet, and a broken tag is validate()'s to
+// report. A base chain that will not resolve likewise yields no advisory.
+func (e *modProfileEditor) dobAdvisory() string {
+	dob, err := validateDOBMask(e.dob.Text)
+	if err != nil || dob == "" {
+		return ""
+	}
+	candidate := e.orig
+	candidate.DOB = dob
+	candidate.Removes = nil
+	for _, line := range strippedTagLines(e.fields.removes.Text) {
+		if ref, ok := canonicalTagRef(line); ok {
+			candidate.Removes = append(candidate.Removes, ref)
+		}
+	}
+	if sel := e.baseSelect.Selected; sel == "" || sel == modProfileNoBaseLabel {
+		candidate.Base = ""
+	} else {
+		candidate.Base = sel
+	}
+
+	// Resolve under a name that cannot collide with a base reference, so a
+	// profile whose own name appears in the chain cannot read as circular.
+	const probe = "\x00probe"
+	temp := maps.Clone(e.cfg)
+	if temp == nil {
+		temp = ModProfileConfig{}
+	}
+	delete(temp, e.origName)
+	temp[probe] = candidate
+	resolved, rerr := resolveModProfile(probe, temp)
+	if rerr != nil {
+		return ""
+	}
+	return modProfileDOBAdvisory(resolved)
+}
+
 // perModalitySummary renders the one-line list entry for a per-modality
 // override, e.g. "CT  (2 set, 1 remove, dob, priv)".
 func perModalitySummary(code string, p ModProfile) string {
@@ -453,6 +501,27 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 		widget.NewFormItem("Zip export", ed.zipCheck),
 		widget.NewFormItem("Include DICOMDIR", ed.dicomdirCheck))
 
+	// The birth-date advisory sits under the row it is about, and is recomputed
+	// from the two controls that can change the answer — the mask itself and the
+	// Remove tags list — so adding 0400,0561 clears it without reopening. The
+	// tag picker writes the Remove field with SetText, which Fyne routes through
+	// OnChanged; were that ever not the case the note would simply refresh on
+	// the next keystroke or reopen.
+	dobAdvisoryLabel := widget.NewLabel("")
+	dobAdvisoryLabel.TextStyle = fyne.TextStyle{Italic: true}
+	dobAdvisoryLabel.Wrapping = fyne.TextWrapWord
+	refreshDOBAdvisory := func() {
+		if text := ed.dobAdvisory(); text != "" {
+			dobAdvisoryLabel.SetText(text)
+			dobAdvisoryLabel.Show()
+			return
+		}
+		dobAdvisoryLabel.Hide()
+	}
+	refreshDOBAdvisory()
+	ed.dob.OnChanged = func(string) { refreshDOBAdvisory() }
+	ed.fields.removes.OnChanged = func(string) { refreshDOBAdvisory() }
+
 	filterCaption := widget.NewLabel("Files matching either comma-separated filter are skipped entirely.")
 	filterCaption.TextStyle = fyne.TextStyle{Italic: true}
 	filterCaption.Wrapping = fyne.TextWrapWord
@@ -460,7 +529,7 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 		widget.NewFormItem("Ignore image types", ed.ignoreTypesEntry),
 		widget.NewFormItem("Ignore modalities", ed.ignoreModsEntry))
 
-	optionsSection := prefSection("Options", optionsForm)
+	optionsSection := prefSection("Options", optionsForm, dobAdvisoryLabel)
 	filtersSection := prefSection("File filters", filterCaption, filtersForm)
 
 	// Pixel masking gets its own section rather than a row in Options: it is

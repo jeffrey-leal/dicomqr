@@ -31,6 +31,7 @@ func seriesModality(paths []string) string {
 	if len(paths) == 0 {
 		return ""
 	}
+	defer recoverParserPanic(paths[0])
 	f, err := os.Open(paths[0])
 	if err != nil {
 		return ""
@@ -85,7 +86,7 @@ type srDoc struct {
 // parseSRFile parses a DICOM SR/KO/AU file and returns structured header info
 // plus a flat list of content entries ready for rendering.
 func parseSRFile(path string) (srDoc, error) {
-	ds, err := sdicom.ParseFile(path, nil)
+	ds, err := safeParseFile(path, nil)
 	if err != nil {
 		return srDoc{}, err
 	}

@@ -219,7 +219,7 @@ func transcodeDICOMFileToTemp(path, targetTS, tmpDir string) (string, bool, erro
 		return "", false, err
 	}
 
-	ds, err := sdicom.ParseFile(path, nil)
+	ds, err := safeParseFile(path, nil)
 	if err != nil {
 		return "", false, fmt.Errorf("parse: %w", err)
 	}
@@ -425,6 +425,34 @@ func newNativeFromSamples(bitsAlloc, rows, cols, spp int, sample func(i int) int
 		return nf, nil
 	}
 	return nil, fmt.Errorf("unsupported BitsAllocated %d", bitsAlloc)
+}
+
+// projectedPixelBytes estimates what a file's pixel data will occupy in memory
+// once decoded, from its header alone — Columns × Rows × SamplesPerPixel ×
+// ceil(BitsAllocated/8) × NumberOfFrames.
+//
+// It exists because decompressed size, not file size, is what a run has to be
+// sized against: decompressPixelData holds every frame of a file at once, and a
+// multi-frame acquisition that is a few tens of megabytes on disk can be
+// hundreds decoded. The mask benchmark has admitted files against this figure
+// since it was written; runModificationImpl weighs its worker pool by it.
+//
+// Returns 0 for a dataset with no pixel geometry (a report, a key-object
+// selection, or a header that would not parse), which is the honest answer:
+// nothing about it says how much memory its pixels need, because it has none.
+func projectedPixelBytes(ds *sdicom.Dataset) int64 {
+	cols := int64(datasetInt(ds, tag.Columns, 0))
+	rows := int64(datasetInt(ds, tag.Rows, 0))
+	if cols <= 0 || rows <= 0 {
+		return 0
+	}
+	spp := int64(datasetInt(ds, tag.SamplesPerPixel, 1))
+	bytesPerSample := int64(datasetInt(ds, tag.BitsAllocated, 8)+7) / 8
+	frames := int64(datasetInt(ds, tag.NumberOfFrames, 1))
+	if spp <= 0 || bytesPerSample <= 0 || frames <= 0 {
+		return 0
+	}
+	return cols * rows * spp * bytesPerSample * frames
 }
 
 // datasetInt reads the first integer value of a tag, tolerating the IS

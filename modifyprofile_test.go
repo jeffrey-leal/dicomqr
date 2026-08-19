@@ -100,6 +100,71 @@ func TestMergeCancelsKeepAcrossSpellings(t *testing.T) {
 	}
 }
 
+// TestModProfileDOBAdvisory covers the safeguard for the one thing the
+// birth-date mask cannot reach: a copy nested inside Original Attributes
+// Sequence. Every case here is driven through resolveModProfile, because the
+// advisory is only correct against a resolved profile — the base supplies the
+// removal for most real profiles, and a Keep list can take it away again.
+func TestModProfileDOBAdvisory(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  ModProfileConfig
+		want bool // an advisory is expected
+	}{
+		{"no dob mask, no removal",
+			ModProfileConfig{"p": {Removes: []string{"0010,1000"}}}, false},
+		{"dob mask without the removal",
+			ModProfileConfig{"p": {DOB: "YYYY0101"}}, true},
+		{"dob mask with the removal, padded",
+			ModProfileConfig{"p": {DOB: "YYYY0101", Removes: []string{"0400,0561"}}}, false},
+		// Spelling must not matter: the profile code compares parsed tags.
+		{"dob mask with the removal, short form",
+			ModProfileConfig{"p": {DOB: "YYYY0101", Removes: []string{"400,561"}}}, false},
+		{"removal inherited from the base",
+			ModProfileConfig{
+				"base": {Removes: []string{"0400,0561"}},
+				"p":    {Base: "base", DOB: "YYYY0101"},
+			}, false},
+		// The case that makes resolving mandatory: the child cancels the base's
+		// removal, so the sequence survives and the advisory must come back.
+		{"keep cancels the base's removal",
+			ModProfileConfig{
+				"base": {Removes: []string{"0400,0561"}},
+				"p":    {Base: "base", DOB: "YYYY0101", Keep: []string{"400,561"}},
+			}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resolved, err := resolveModProfile("p", tc.cfg)
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			got := modProfileDOBAdvisory(resolved)
+			if (got != "") != tc.want {
+				t.Errorf("advisory = %q, want present=%v", got, tc.want)
+			}
+			if tc.want && !strings.Contains(got, "0400,0561") {
+				t.Errorf("advisory does not name the tag to remove: %q", got)
+			}
+		})
+	}
+}
+
+// The shipped profiles remove Original Attributes Sequence, so neither may
+// raise the advisory — if that removal is ever dropped from defaults this test
+// is what says so.
+func TestEmbeddedDefaultsRaiseNoDOBAdvisory(t *testing.T) {
+	profiles := embeddedModConfigs(t)
+	for name := range profiles {
+		resolved, err := resolveModProfile(name, profiles)
+		if err != nil {
+			t.Fatalf("resolve %s: %v", name, err)
+		}
+		if adv := modProfileDOBAdvisory(resolved); adv != "" {
+			t.Errorf("shipped profile %q raises the birth-date advisory: %s", name, adv)
+		}
+	}
+}
+
 // The same applies to Set values, which are matched on the tag half alone so an
 // override replaces the base's value rather than appending a second Set.
 func TestMergeSetOverrideAcrossSpellings(t *testing.T) {

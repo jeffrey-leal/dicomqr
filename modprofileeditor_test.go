@@ -422,6 +422,44 @@ func TestPerModalityEditorSave(t *testing.T) {
 }
 
 // TestPerModalityEditorPreservesUnhonoredFields verifies a hand-authored block
+// TestModProfileEditorDOBAdvisory drives the editor's birth-date advisory over
+// the live controls, which is the whole point of it being computed there: the
+// note has to clear as soon as the user adds the removal, without reopening.
+func TestModProfileEditorDOBAdvisory(t *testing.T) {
+	test.NewApp()
+
+	// A mask with no removal, and no base to supply one.
+	cfg := ModProfileConfig{"p": {DOB: "YYYY0101"}}
+	ed := newModProfileEditor("p", cfg["p"], cfg)
+	if ed.dobAdvisory() == "" {
+		t.Fatal("no advisory for a profile that masks the birth date and keeps 0400,0561")
+	}
+
+	// Adding the removal to the live field clears it.
+	ed.fields.removes.SetText("0400,0561")
+	if adv := ed.dobAdvisory(); adv != "" {
+		t.Errorf("advisory survived the removal being added: %s", adv)
+	}
+
+	// Clearing the mask clears it too, removal or not.
+	ed.fields.removes.SetText("")
+	ed.dob.SetText("")
+	if adv := ed.dobAdvisory(); adv != "" {
+		t.Errorf("advisory shown for a profile with no birth date mask: %s", adv)
+	}
+
+	// A base supplying the removal is enough — the advisory must resolve the
+	// chain, not just read this editor's own list.
+	inherited := ModProfileConfig{
+		"base": {Removes: []string{"0400,0561"}},
+		"p":    {Base: "base", DOB: "YYYY0101"},
+	}
+	ed2 := newModProfileEditor("p", inherited["p"], inherited)
+	if adv := ed2.dobAdvisory(); adv != "" {
+		t.Errorf("advisory shown though the base removes 0400,0561: %s", adv)
+	}
+}
+
 // keeps every field the sub-editor has no controls for: both the profile-wide
 // scalars (which the engine still applies per modality) and the ones the
 // engine ignores inside an override.

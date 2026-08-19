@@ -685,6 +685,258 @@ func TestRunModificationToZipDicomdir(t *testing.T) {
 	}
 }
 
+// TestRunModificationSurvivesPanic drives the worker pool's per-file backstop.
+// The DICOM parser panics rather than erroring on some malformed datasets, and
+// the pool runs on background goroutines where an escaped panic kills the whole
+// application mid-export. A panicking file must instead become one recorded
+// failure while every other file in the run still exports.
+//
+// The panic is injected through processFileFn rather than by crafting a file
+// that really panics the library: which corruption panics is a property of the
+// library, not of this code, and a fixture chosen today could quietly stop
+// panicking on an upgrade — leaving a test that passes without testing anything.
+func TestRunModificationSurvivesPanic(t *testing.T) {
+	rootDir, outDir := t.TempDir(), t.TempDir()
+	goodPath := filepath.Join(rootDir, "good.dcm")
+	badPath := filepath.Join(rootDir, "bad.dcm")
+	writeModifyTestDICOM(t, goodPath)
+	writeModifyTestDICOM(t, badPath)
+
+	real := processFileFn
+	t.Cleanup(func() { processFileFn = real })
+	processFileFn = func(src *os.File, p modifyParams, r *uidRemapper) (bool, sdicom.Dataset, fileNotes, error) {
+		// Close before panicking: the real implementation defers its close, and
+		// an open handle would block t.TempDir cleanup on Windows.
+		name := src.Name()
+		src.Close()
+		if filepath.Base(name) == "bad.dcm" {
+			panic("synthetic parser panic")
+		}
+		f, err := os.Open(name)
+		if err != nil {
+			t.Fatalf("reopen %s: %v", name, err)
+		}
+		return real(f, p, r)
+	}
+
+	params, err := compileModifyParams(ModProfile{Sets: []string{"0010,0010=ANON"}})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	res := runModification(context.Background(), []string{goodPath, badPath}, rootDir, outDir, params, nil, nil)
+
+	if res.Processed != 1 || res.Failed != 1 {
+		t.Fatalf("result = %+v, want 1 processed and 1 failed", res)
+	}
+	if len(res.Failures) != 1 || !strings.Contains(res.Failures[0].Error, "panic") {
+		t.Fatalf("failures = %+v, want one naming the panic", res.Failures)
+	}
+	if !strings.Contains(res.Failures[0].File, "bad.dcm") {
+		t.Errorf("failure names %q, want the panicking file", res.Failures[0].File)
+	}
+	// The run continued: the other file is in the export, the panicking one is
+	// not. A file that failed must never leave a partial behind.
+	if _, err := os.Stat(filepath.Join(outDir, "good.dcm")); err != nil {
+		t.Errorf("the surviving file was not exported: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outDir, "bad.dcm")); !os.IsNotExist(err) {
+		t.Errorf("the panicking file left something in the export: %v", err)
+	}
+}
+
+// TestHasNestedTag pins the "below the top level" meaning: an element present
+// only at the top level must NOT count, since that is exactly the one the
+// birth-date mask already rewrites.
+func TestHasNestedTag(t *testing.T) {
+	nested := []*sdicom.Element{
+		mustTestElement(t, tag.PatientBirthDate, []string{"19800615"}),
+		mustTestElement(t, tag.Tag{Group: 0x0400, Element: 0x0561}, [][]*sdicom.Element{{
+			mustTestElement(t, tag.Tag{Group: 0x0400, Element: 0x0550}, [][]*sdicom.Element{{
+				mustTestElement(t, tag.PatientBirthDate, []string{"19800615"}),
+			}}),
+		}}),
+	}
+	if !hasNestedTag(nested, tag.PatientBirthDate) {
+		t.Error("a birth date two sequences deep was not found")
+	}
+
+	topOnly := []*sdicom.Element{
+		mustTestElement(t, tag.PatientBirthDate, []string{"19800615"}),
+		mustTestElement(t, tag.PatientName, []string{"DOE^JANE"}),
+	}
+	if hasNestedTag(topOnly, tag.PatientBirthDate) {
+		t.Error("a top-level-only birth date counted as nested")
+	}
+}
+
+// writeNestedDOBFixture writes a DICOM file carrying a birth date both at the
+// top level and inside an Original Attributes Sequence — the shape a study
+// that has already been de-identified once arrives in.
+func writeNestedDOBFixture(t *testing.T, path string) {
+	t.Helper()
+	writeModifyTestDICOM(t, path)
+	ds, err := sdicom.ParseFile(path, nil)
+	if err != nil {
+		t.Fatalf("parse fixture: %v", err)
+	}
+	origAttrs := mustTestElement(t, tag.Tag{Group: 0x0400, Element: 0x0561}, [][]*sdicom.Element{{
+		mustTestElement(t, tag.Tag{Group: 0x0400, Element: 0x0550}, [][]*sdicom.Element{{
+			mustTestElement(t, tag.PatientBirthDate, []string{"19800615"}),
+		}}),
+	}})
+	ds.Elements = append(ds.Elements, origAttrs)
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer f.Close()
+	if err := sdicom.Write(f, ds, sdicom.SkipVRVerification(), sdicom.SkipValueTypeVerification()); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+}
+
+// TestRunModificationNestedDOB: the birth-date mask rewrites the top-level
+// element only, so a copy inside Original Attributes Sequence survives it. The
+// run must say so — and must stop saying so once the profile removes the
+// sequence, which is the fix the advisory points at.
+func TestRunModificationNestedDOB(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		profile ModProfile
+		want    int
+	}{
+		{"mask without the removal", ModProfile{DOB: "YYYY0101"}, 1},
+		{"mask with the removal",
+			ModProfile{DOB: "YYYY0101", Removes: []string{"0400,0561"}}, 0},
+		// No mask requested, so a nested birth date is not a surprise and the
+		// traversal is skipped entirely.
+		{"no mask", ModProfile{Sets: []string{"0010,0010=ANON"}}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rootDir, outDir := t.TempDir(), t.TempDir()
+			srcPath := filepath.Join(rootDir, "nested.dcm")
+			writeNestedDOBFixture(t, srcPath)
+
+			params, err := compileModifyParams(tc.profile)
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			res := runModification(context.Background(), []string{srcPath}, rootDir, outDir, params, nil, nil)
+			if res.Processed != 1 || res.Failed != 0 {
+				t.Fatalf("result = %+v (%v), want the file exported", res, res.Failures)
+			}
+			if res.NestedDOBKept != tc.want {
+				t.Errorf("NestedDOBKept = %d, want %d", res.NestedDOBKept, tc.want)
+			}
+			// Whatever the count, the file still exports — this is a disclosure,
+			// not a failure.
+			out, err := sdicom.ParseFile(filepath.Join(outDir, "nested.dcm"), nil)
+			if err != nil {
+				t.Fatalf("parse export: %v", err)
+			}
+			if tc.profile.DOB != "" {
+				e, ferr := out.FindElementByTag(tag.PatientBirthDate)
+				if ferr != nil {
+					t.Fatal("top-level birth date missing from the export")
+				}
+				if got := strings.TrimSpace(sdicom.MustGetStrings(e.Value)[0]); got != "19800101" {
+					t.Errorf("top-level birth date = %q, want it masked to 19800101", got)
+				}
+			}
+		})
+	}
+}
+
+// TestRunModificationMemoryBudgetEquivalence is the test that matters for the
+// memory gating: it must change *when* work happens, never *what* is produced.
+//
+// The budget is squeezed to a single byte, so every file is clamped to the whole
+// budget and the pool is forced to run them strictly one at a time — the extreme
+// of the gating path. The exports must still be byte-identical to the same run
+// at the normal budget.
+func TestRunModificationMemoryBudgetEquivalence(t *testing.T) {
+	// A transfer-syntax conversion is enough to arm the limiter (params.targetTS
+	// non-empty), without needing a compressed fixture.
+	profile := ModProfile{
+		Sets:           []string{"0010,0010=ANON"},
+		TransferSyntax: tsPrefImplicitLE,
+	}
+
+	run := func(t *testing.T, budget int64) map[string][]byte {
+		t.Helper()
+		original := modifyMemoryBudget
+		t.Cleanup(func() { modifyMemoryBudget = original })
+		modifyMemoryBudget = budget
+
+		rootDir, outDir := t.TempDir(), t.TempDir()
+		var paths []string
+		for _, name := range []string{"a.dcm", "b.dcm", "c.dcm", "d.dcm", "e.dcm"} {
+			p := filepath.Join(rootDir, name)
+			writeModifyTestDICOM(t, p)
+			paths = append(paths, p)
+		}
+
+		params, err := compileModifyParams(profile)
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		res := runModification(context.Background(), paths, rootDir, outDir, params, nil, nil)
+		if res.Processed != len(paths) || res.Failed != 0 {
+			t.Fatalf("result = %+v (%v), want all %d exported", res, res.Failures, len(paths))
+		}
+
+		out := map[string][]byte{}
+		entries, err := os.ReadDir(outDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			out[e.Name()] = mustReadFile(t, filepath.Join(outDir, e.Name()))
+		}
+		return out
+	}
+
+	normal := run(t, modifyMemoryBudget)
+	squeezed := run(t, 1)
+
+	if len(normal) != len(squeezed) {
+		t.Fatalf("file counts differ: %d at the normal budget, %d squeezed", len(normal), len(squeezed))
+	}
+	for name, want := range normal {
+		got, ok := squeezed[name]
+		if !ok {
+			t.Errorf("%s missing from the squeezed run", name)
+			continue
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("%s differs between budgets (%d vs %d bytes) — gating must not change output",
+				name, len(got), len(want))
+		}
+	}
+}
+
+// TestFileMemoryWeight: the weight the pool reserves is the projected pixel size
+// with the overhead factor, and an unreadable file weighs nothing rather than
+// being guessed at.
+func TestFileMemoryWeight(t *testing.T) {
+	dir := t.TempDir()
+
+	dicomPath := filepath.Join(dir, "ok.dcm")
+	writeModifyTestDICOM(t, dicomPath) // 2×2, 8-bit, 1 sample
+	if got, want := fileMemoryWeight(dicomPath), int64(2*2*modifyMemoryOverheadFactor); got != want {
+		t.Errorf("weight = %d, want %d", got, want)
+	}
+
+	junkPath := filepath.Join(dir, "junk.dcm")
+	if err := os.WriteFile(junkPath, []byte("not a dicom file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := fileMemoryWeight(junkPath); got != 0 {
+		t.Errorf("weight of an unreadable file = %d, want 0", got)
+	}
+}
+
 // mustReadFile reads path or fails the test.
 func mustReadFile(t *testing.T, path string) []byte {
 	t.Helper()

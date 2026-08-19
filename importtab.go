@@ -21,7 +21,7 @@ import (
 // Returns (dest, true, nil) when the file was copied, (dest, false, nil) when
 // it was already present, or ("", false, err) on failure.
 func importOneFile(srcPath, downloadDir string) (dest string, copied bool, err error) {
-	ds, parseErr := sdicom.ParseFile(srcPath, nil, sdicom.SkipPixelData())
+	ds, parseErr := safeParseFile(srcPath, nil, sdicom.SkipPixelData())
 	if parseErr != nil {
 		return "", false, parseErr
 	}
@@ -175,8 +175,15 @@ func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, 
 		scanStatusLbl.SetText("Scanning…")
 
 		go func() {
-			studies, series, files, err := scanLocalFolder(dir, func(n int) {
-				fyne.Do(func() { scanStatusLbl.SetText(fmt.Sprintf("Scanning… %d files read", n)) })
+			studies, series, files, err := scanLocalFolder(dir, func(phase scanPhase, done, total int) {
+				// An import source folder has no index to compare against, so
+				// every file is read; only the phase distinguishes the two
+				// halves of the wait.
+				text := fmt.Sprintf("Reading %d of %d files…", done, total)
+				if phase == scanPhaseWalk {
+					text = fmt.Sprintf("Checking %d files…", done)
+				}
+				fyne.Do(func() { scanStatusLbl.SetText(text) })
 			})
 			fyne.Do(func() {
 				if err != nil {

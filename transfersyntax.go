@@ -136,6 +136,10 @@ func fileMetaIdentity(path string) (dicomFileIdentity, error) {
 // dataset itself — pixel data, deep SR sequences — is never touched. Returns
 // "" when the file cannot be parsed.
 func fileTransferSyntaxUID(path string) string {
+	// NewParser reads the File Meta group eagerly, so the panic risk is in the
+	// constructor rather than in a Next loop. An unreadable file yields "" here
+	// exactly as a parse error does.
+	defer recoverParserPanic(path)
 	f, err := os.Open(path)
 	if err != nil {
 		return ""

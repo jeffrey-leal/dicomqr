@@ -27,7 +27,7 @@ import (
 	"github.com/grailbio/go-dicom/dicomlog"
 )
 
-const version = "1.16.0"
+const version = "1.17.0"
 
 // LED colours for connection and SCP state indicators.
 var (
@@ -1183,7 +1183,19 @@ func main() {
 			}
 
 			// For C-GET: callback writes each received instance to the download folder.
-			getCallback := func(txUID, scUID, siUID string, data []byte) error {
+			getCallback := func(txUID, scUID, siUID string, data []byte) (err error) {
+				// The netdicom library runs this on its own goroutine, where an
+				// escaped panic would kill the process. saveGetFile parses the
+				// received object and may transcode it — the same work
+				// handleCStore wraps for the C-STORE side, so it gets the same
+				// boundary here. The sub-operation fails and the retrieve
+				// continues, exactly as a save error does.
+				defer func() {
+					if r := recover(); r != nil {
+						logError("c-get: PANIC saving %s: %v\n%s", siUID, r, debug.Stack())
+						err = fmt.Errorf("receiver internal error: %v", r)
+					}
+				}()
 				path, converted, skippedFile, saveErr := saveGetFile(cfg.DownloadDir, txUID, scUID, siUID, data, requiredTS)
 				if saveErr != nil {
 					logError("c-get: save file: %v", saveErr)
