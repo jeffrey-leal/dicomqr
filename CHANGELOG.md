@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.18.0] — 2026-08-21
+
+### Added
+
+- **Modification exports can be written flat** — a new "Flat export" option (Modification & Export profile editor, and the Modification dialog's Export section alongside Zip export and Include DICOMDIR) writes every file directly into the export root, or the archive root with Zip export also checked, instead of the usual patient/study/series folders. A source file name relies on that folder structure for context, so a flat file is named after its SOP Instance UID instead — the same identifier the download folder itself uses — which means no two files can collide just because the folders that used to keep them apart are gone; with Remap UIDs also on, that is the new UID, so no original UID appears anywhere in the export. Composes with Include DICOMDIR exactly as the hierarchical layout does, just with a single-component path to each file
+
+### Changed
+
+- **The folder icon beside the download folder path now reads "Open in Explorer"** (Local Browse and the Retrieve panel). It only ever opened a plain Explorer window on the download folder — it was never a folder picker — but as an unlabelled icon next to the path it read as one, especially beside Preferences' and the Import tab's "Browse…" buttons, which really do open a picker. The label now says what it does instead of implying what it doesn't
+
 ## [1.17.0] — 2026-08-19
 
 ### Added

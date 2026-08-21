@@ -1247,7 +1247,10 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 		}()
 	})
 
-	openFolderBtn := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {
+	// Reveals the download folder in Explorer — a plain folder view, not a
+	// picker. Labelled so it can't be mistaken for the Preferences and Import
+	// tab "Browse…" buttons, which do open a picker to choose a folder.
+	openFolderBtn := widget.NewButtonWithIcon("Open in Explorer", theme.FolderOpenIcon(), func() {
 		if cfg.DownloadDir == "" {
 			return
 		}

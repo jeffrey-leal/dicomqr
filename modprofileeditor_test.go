@@ -80,6 +80,7 @@ func TestModProfileEditorRoundTrip(t *testing.T) {
 		Dicomdir:         true,
 		Verbose:          true,
 		Zip:              true,
+		Flat:             true,
 		IgnoreTypes:      []string{"SECONDARY"},
 		IgnoreModalities: []string{"SR"},
 		FixVR:            "correct",
@@ -120,7 +121,7 @@ func TestModProfileEditorRoundTrip(t *testing.T) {
 		t.Errorf("PerModality changed: %+v", updated.PerModality)
 	}
 	if updated.DOB != "19000101" || updated.UIDSuffix != "99" || updated.ShiftDays != "-30" ||
-		updated.FixVR != "correct" || !updated.Priv || !updated.Zip || !updated.Dicomdir ||
+		updated.FixVR != "correct" || !updated.Priv || !updated.Zip || !updated.Flat || !updated.Dicomdir ||
 		updated.TransferSyntax != tsPrefImplicitLE {
 		t.Errorf("unedited controlled fields changed: %+v", updated)
 	}

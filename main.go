@@ -27,7 +27,7 @@ import (
 	"github.com/grailbio/go-dicom/dicomlog"
 )
 
-const version = "1.17.0"
+const version = "1.18.0"
 
 // LED colours for connection and SCP state indicators.
 var (
@@ -1011,7 +1011,10 @@ func main() {
 	folderLabel := widget.NewLabel(cfg.DownloadDir)
 	folderLabel.Truncation = fyne.TextTruncateEllipsis
 
-	openFolderBtn := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {
+	// Reveals the download folder in Explorer — a plain folder view, not a
+	// picker. Labelled so it can't be mistaken for the Preferences and Import
+	// tab "Browse…" buttons, which do open a picker to choose a folder.
+	openFolderBtn := widget.NewButtonWithIcon("Open in Explorer", theme.FolderOpenIcon(), func() {
 		if cfg.DownloadDir == "" {
 			return
 		}

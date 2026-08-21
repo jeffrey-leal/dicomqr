@@ -164,6 +164,7 @@ type modProfileEditor struct {
 	remapCheck       *widget.Check
 	tsSelect         *widget.Select
 	zipCheck         *widget.Check
+	flatCheck        *widget.Check
 	dicomdirCheck    *widget.Check
 	ignoreTypesEntry *widget.Entry
 	ignoreModsEntry  *widget.Entry
@@ -229,6 +230,9 @@ func newModProfileEditor(name string, p ModProfile, cfg ModProfileConfig) *modPr
 	e.zipCheck = widget.NewCheck("", nil)
 	e.zipCheck.SetChecked(p.Zip)
 
+	e.flatCheck = widget.NewCheck("", nil)
+	e.flatCheck.SetChecked(p.Flat)
+
 	e.dicomdirCheck = widget.NewCheck("", nil)
 	e.dicomdirCheck.SetChecked(p.Dicomdir)
 
@@ -287,6 +291,7 @@ func (e *modProfileEditor) validate() (string, ModProfile, error) {
 	updated.RemapUIDs = e.remapCheck.Checked
 	updated.TransferSyntax = transferSyntaxPrefFromLabel(e.tsSelect.Selected)
 	updated.Zip = e.zipCheck.Checked
+	updated.Flat = e.flatCheck.Checked
 	updated.Dicomdir = e.dicomdirCheck.Checked
 	// The engine matches these filters against ImageType/Modality components
 	// case-insensitively; casing is stored as typed. CS values cannot contain
@@ -499,6 +504,7 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 		widget.NewFormItem("Fix VR", ed.fixvr),
 		widget.NewFormItem("Output transfer syntax", ed.tsSelect),
 		widget.NewFormItem("Zip export", ed.zipCheck),
+		widget.NewFormItem("Flat export", ed.flatCheck),
 		widget.NewFormItem("Include DICOMDIR", ed.dicomdirCheck))
 
 	// The birth-date advisory sits under the row it is about, and is recomputed
@@ -762,6 +768,9 @@ func perModalityPreservedNote(p ModProfile) fyne.CanvasObject {
 	}
 	if p.Zip {
 		ignored = append(ignored, "zip")
+	}
+	if p.Flat {
+		ignored = append(ignored, "flat")
 	}
 	if p.TransferSyntax != "" {
 		ignored = append(ignored, "transfersyntax")

@@ -187,10 +187,10 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 
 	// Row order is the profile editor's, deliberately — the two Options blocks
 	// show the same fields and are read against each other, so they must not be
-	// ordered differently. Two fields the editor has here and this dialog does
-	// not are Zip export and Include DICOMDIR: both live in Export below,
-	// where the user is naming the output and can see what the checkboxes
-	// change, rather than among the per-tag transforms.
+	// ordered differently. Three fields the editor has here and this dialog
+	// does not are Zip export, Flat export and Include DICOMDIR: all three
+	// live in Export below, where the user is naming the output and can see
+	// what the checkboxes change, rather than among the per-tag transforms.
 	optionsForm := widget.NewForm(
 		widget.NewFormItem("Birth date mask", dobEntry),
 		widget.NewFormItem("Remap UIDs", remapCheck),
@@ -471,26 +471,44 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	// The profile's zip field pre-checks the box; the checkbox remains the
 	// per-run override and is never written back to the profile.
 	zipCheck.SetChecked(resolved.Zip)
+	flatCheck := widget.NewCheck("Write every file into the export root, with no patient/study/series folders", nil)
+	flatCheck.SetChecked(resolved.Flat)
 	dicomdirCheck := widget.NewCheck("Add a DICOMDIR index", nil)
 	dicomdirCheck.SetChecked(resolved.Dicomdir)
 	exportForm := widget.NewForm(
 		widget.NewFormItem("Export folder name", exportNameEntry),
 		widget.NewFormItem("Output folder", container.NewBorder(nil, nil, nil, changeOutDirBtn, outDirLabel)),
 		widget.NewFormItem("Zip export", zipCheck),
+		widget.NewFormItem("Flat export", flatCheck),
 		widget.NewFormItem("Include DICOMDIR", dicomdirCheck),
 	)
 	exportReplaces := "the original patient folder name"
 	if studyLevel {
 		exportReplaces = "the original patient and study folder names"
 	}
-	exportNote := widget.NewLabel("Files are written under <output folder>\\<export folder name> — " +
-		"or, with Zip export, into a compressed <output folder>\\<export folder name>.zip. " +
-		"The export folder name replaces " + exportReplaces + ", which often contain PHI. " +
-		"Folders below it keep their original names, except where this profile deletes or replaces the value a name is built from. " +
-		"Include DICOMDIR adds a PS3.10 File-set index listing every exported file, letting a DICOM viewer or a CD/DVD-burning " +
-		"workflow browse the export without a database — written as a DICOMDIR entry inside the archive when Zip export is also checked.")
+	exportNote := widget.NewLabel("")
 	exportNote.TextStyle = fyne.TextStyle{Italic: true}
 	exportNote.Wrapping = fyne.TextWrapWord
+	// Flat export replaces the paragraph about folders below the export root
+	// keeping their source names with one describing the flat layout instead
+	// — a static note would otherwise contradict whichever way the box is
+	// checked, the same reasoning behind refreshDOBAdvisory below.
+	refreshExportNote := func() {
+		text := "Files are written under <output folder>\\<export folder name> — " +
+			"or, with Zip export, into a compressed <output folder>\\<export folder name>.zip. " +
+			"The export folder name replaces " + exportReplaces + ", which often contain PHI. "
+		if flatCheck.Checked {
+			text += "Flat export is checked: every file is written directly into the export root (or the archive root), " +
+				"named after its SOP Instance UID rather than kept under its source name, with no patient/study/series folders. "
+		} else {
+			text += "Folders below it keep their original names, except where this profile deletes or replaces the value a name is built from. "
+		}
+		text += "Include DICOMDIR adds a PS3.10 File-set index listing every exported file, letting a DICOM viewer or a CD/DVD-burning " +
+			"workflow browse the export without a database — written as a DICOMDIR entry inside the archive when Zip export is also checked."
+		exportNote.SetText(text)
+	}
+	refreshExportNote()
+	flatCheck.OnChanged = func(bool) { refreshExportNote() }
 	sections = append(sections, prefSection("Export", exportForm, exportNote))
 
 	cancelBtn := widget.NewButton("Cancel", func() { win.Close() })
@@ -546,9 +564,9 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 			edited.FixVR = sel
 		}
 		edited.TransferSyntax = transferSyntaxPrefFromLabel(tsSelect.Selected)
-		// Unlike Zip (a pure destination choice the run function decides
-		// between, never part of modifyParams), DICOMDIR is an engine-level
-		// option compileModifyParams reads — see modifyengine.go.
+		// Unlike Zip and Flat (pure destination-shape choices read directly
+		// into outLayout below, never part of modifyParams), DICOMDIR is an
+		// engine-level option compileModifyParams reads — see modifyengine.go.
 		edited.Dicomdir = dicomdirCheck.Checked
 
 		params, err := compileModifyParams(edited)
@@ -566,7 +584,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		if studyLevel {
 			dropDirs = 2
 		}
-		outLayout := &exportLayout{dropDirs: dropDirs}
+		outLayout := &exportLayout{dropDirs: dropDirs, flat: flatCheck.Checked, names: &flatNames{}}
 		startRun := func(outBase string) {
 			if !validOutDir(outBase) {
 				return

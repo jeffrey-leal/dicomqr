@@ -330,7 +330,80 @@ func sourceRel(srcPath, rootDir string) string {
 // to build the download folder; the file name is rebuilt from the SOP
 // Instance UID the same way. A nil *exportLayout (used by the engine's own
 // tests) skips all of this and mirrors sourceRel with no renaming.
-type exportLayout struct{ dropDirs int }
+//
+// flat drops every folder below the root: every file is written directly
+// into the export root (or the archive root, with Zip export), named after
+// its SOP Instance UID rather than kept under its source name — the
+// hierarchy a source name relied on for context is exactly what flat
+// removes, so keeping the source name would reintroduce the collisions the
+// hierarchy existed to prevent (two series each holding a "1.dcm", say).
+// names deduplicates what flatFileName cannot rule out by construction.
+type exportLayout struct {
+	dropDirs int
+	flat     bool
+	names    *flatNames
+}
+
+// flatNames deduplicates the file names a flat exportLayout hands out. A SOP
+// Instance UID is unique per instance, so a collision here means a
+// genuinely duplicated instance, or a file with no SOP Instance UID at all
+// falling back to its (possibly non-unique) source name — rare either way.
+// The second file to claim a name gets a " (2)" suffix rather than silently
+// overwriting the first (folder mode) or landing as an indistinguishable
+// second archive entry (zip mode); which of the two duplicates gets the
+// suffix depends on worker completion order, but both are still written in
+// full. A nil *flatNames reserves nothing and returns every name unchanged —
+// what a flat exportLayout gets if it does not set one, and what every
+// non-flat exportLayout uses implicitly by never calling reserve at all.
+type flatNames struct {
+	mu    sync.Mutex
+	taken map[string]bool
+}
+
+func (n *flatNames) reserve(name string) string {
+	if n == nil {
+		return name
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.taken == nil {
+		n.taken = make(map[string]bool)
+	}
+	key := strings.ToLower(name)
+	if !n.taken[key] {
+		n.taken[key] = true
+		return name
+	}
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(name, ext)
+	for i := 2; ; i++ {
+		candidate := fmt.Sprintf("%s (%d)%s", base, i, ext)
+		if key := strings.ToLower(candidate); !n.taken[key] {
+			n.taken[key] = true
+			return candidate
+		}
+	}
+}
+
+// flatFileName names a flat-mode export entry after its SOP Instance UID —
+// the same naming organizeFilePath already gives every file in the download
+// folder, so a source file's existing name and its flat-export name coincide
+// in the ordinary case. Flat mode applies it unconditionally, not only when
+// the UID changed as renamedFile does, since the folder context a kept
+// source name relied on no longer exists in a flat export to disambiguate
+// it. The extension is always literal ".dcm" rather than derived from the
+// source path, which also means the result can never be nothing but dots —
+// unlike a folder name (see safePathComponent) a bare sanitize(sopUID)
+// could be, and the fixed suffix means this never needs that guard. fallback
+// (renamedFile's ordinary result) covers the one case a SOP Instance UID
+// cannot: a file that does not carry one at all.
+func flatFileName(after exportNames, fallback string) string {
+	name := sanitize(after.sopUID) + ".dcm"
+	if name == ".dcm" {
+		return fallback
+	}
+	return name
+}
 
 // relFor returns f's path under the export root. before and after are the
 // export name fields as processFile read them right after parsing and right
@@ -340,9 +413,13 @@ func (l exportLayout) relFor(srcPath, rootDir string, before, after exportNames)
 	parts := strings.Split(rel, string(filepath.Separator))
 	last := len(parts) - 1
 
-	// Shallower than patient/study/file — the flat fallback layout (a bare
-	// file name) lands here too, along with any path too short to carry a
-	// study or series component at all.
+	if l.flat {
+		return l.names.reserve(flatFileName(after, renamedFile(parts[last], before, after)))
+	}
+
+	// Shallower than patient/study/file — the shallow-source fallback (a
+	// bare file name) lands here too, along with any path too short to
+	// carry a study or series component at all.
 	if last < 2 {
 		return renamedFile(parts[last], before, after)
 	}

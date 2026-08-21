@@ -13,7 +13,7 @@ package main
 // preserved.
 //
 // The JSON format and merge semantics otherwise follow dicomtool, with these
-// deliberate divergences: `zip`, `transfersyntax` and `nooverlays` are
+// deliberate divergences: `zip`, `flat`, `transfersyntax` and `nooverlays` are
 // dicomqr-only (dicomtool ignores unknown keys); dicomtool's `maskrows` is
 // unsupported here, dropped on load and stripped on save; the `uid` suffix
 // option is removed — the value is preserved through load and save but a
@@ -42,9 +42,10 @@ var defaultModProfilesJSON []byte
 // ModProfile holds a named collection of modification parameters. Fields map
 // directly to the equivalent dicomtool modify command-line parameters; the
 // JSON keys are identical to dicomtool's Profile so the stores interoperate,
-// except: Zip is dicomqr-only (dicomtool's zip is a CLI-run parameter, not a
-// profile field), TransferSyntax is dicomqr-only (dicomtool has no equivalent),
-// and dicomtool's maskrows has no field here by design.
+// except: Zip and Flat are dicomqr-only (dicomtool's zip is a CLI-run
+// parameter, not a profile field, and has no flat equivalent at all),
+// TransferSyntax is dicomqr-only (dicomtool has no equivalent), and
+// dicomtool's maskrows has no field here by design.
 type ModProfile struct {
 	Base    string   `json:"base,omitempty"`
 	Sets    []string `json:"set,omitempty"`
@@ -75,6 +76,16 @@ type ModProfile struct {
 	// (dicomdir.go, modifyengine.go). Profile-wide only, like Zip and
 	// TransferSyntax — there is no per-modality meaning for a run-level index.
 	Dicomdir bool `json:"dicomdir,omitempty"`
+
+	// Flat writes every exported file directly into the export root (or the
+	// archive root, with Zip also set) instead of the PHI-safe patient/study/
+	// series hierarchy exportLayout otherwise builds — the shape a CD/DVD
+	// workflow or a database-free viewer expects. Dropping the folders removes
+	// the context a source file name relied on, so a flat export is named
+	// after the file's SOP Instance UID instead (the value after Remap UIDs
+	// runs, if it does) — see exportLayout.relFor. dicomqr-only, like Zip and
+	// Dicomdir; profile-wide for the same reason Dicomdir is.
+	Flat bool `json:"flat,omitempty"`
 
 	// NoOverlays removes every overlay-plane group (6000–60FE, even) on export.
 	// Overlay Data (60xx,3000) is a bitmap channel a vendor can burn patient
@@ -327,6 +338,7 @@ func mergeModProfiles(base, override ModProfile) ModProfile {
 	result.Dicomdir = base.Dicomdir || override.Dicomdir
 	result.Verbose = base.Verbose || override.Verbose
 	result.Zip = base.Zip || override.Zip
+	result.Flat = base.Flat || override.Flat
 	result.RemapUIDs = base.RemapUIDs || override.RemapUIDs
 
 	// Every tag comparison below goes through tagMatchKey, which parses the
