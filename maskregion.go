@@ -55,6 +55,10 @@ const (
 type MaskScope struct {
 	// SOPInstanceUID restricts a region to exactly one image.
 	SOPInstanceUID string `json:"sopinstance,omitempty"`
+	// Series restricts it to one series (or, for a series holding a single
+	// multi-frame file, that file's chapter). Empty matches any series, which
+	// is what a hand-authored profile.json scope means unchanged.
+	Series string `json:"series,omitempty"`
 	// Modality, Cols and Rows restrict it to one group of like images.
 	Modality string `json:"modality,omitempty"`
 	Cols     int    `json:"cols,omitempty"`
@@ -82,18 +86,20 @@ const (
 // nothing simply masks nothing. The shipped base-deident profile remaps UIDs,
 // so this was every run made with it.
 type maskSource struct {
-	sopInstanceUID string
-	modality       string
-	usBounds       pixelRect
-	usDeclared     bool
+	sopInstanceUID    string
+	seriesInstanceUID string
+	modality          string
+	usBounds          pixelRect
+	usDeclared        bool
 }
 
 // newMaskSource snapshots a dataset's masking identity. Call it on the file as
 // parsed, before anything modifies it.
 func newMaskSource(ds *sdicom.Dataset) maskSource {
 	src := maskSource{
-		sopInstanceUID: strings.TrimSpace(datasetFirstString(ds, tag.SOPInstanceUID)),
-		modality:       strings.TrimSpace(datasetFirstString(ds, tag.Modality)),
+		sopInstanceUID:    strings.TrimSpace(datasetFirstString(ds, tag.SOPInstanceUID)),
+		seriesInstanceUID: strings.TrimSpace(datasetFirstString(ds, tag.SeriesInstanceUID)),
+		modality:          strings.TrimSpace(datasetFirstString(ds, tag.Modality)),
 	}
 	src.usBounds, src.usDeclared = ultrasoundRegionBounds(ds)
 	return src
@@ -108,6 +114,9 @@ func (s *MaskScope) matches(src maskSource, cols, rows int) bool {
 		return true
 	}
 	if s.SOPInstanceUID != "" && !strings.EqualFold(src.sopInstanceUID, s.SOPInstanceUID) {
+		return false
+	}
+	if s.Series != "" && !strings.EqualFold(src.seriesInstanceUID, s.Series) {
 		return false
 	}
 	if s.Modality != "" && !strings.EqualFold(src.modality, s.Modality) {
@@ -144,6 +153,9 @@ func (s *MaskScope) describe() string {
 	}
 	if s.USRegion == usRegionAbsent {
 		parts = append(parts, "no calibrated region")
+	}
+	if s.Series != "" {
+		parts = append(parts, "this series")
 	}
 	if len(parts) == 0 {
 		return "all images"

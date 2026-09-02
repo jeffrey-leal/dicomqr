@@ -4,21 +4,29 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
 
 // queryRow is the canvas object used for each row in the results tree.
 // Mirrors treeRow from dicomhdr: tap to select, right-click context menu.
+// Also implements desktop.Mouseable, solely to read the shift modifier for
+// range selection — fyne.PointEvent (what Tapped receives) carries none.
+// Fyne's driver calls MouseUp immediately before Tapped for the same click
+// (and Tapped only ever fires after a primary-button release), so capturing
+// the modifier in MouseUp and consuming it in Tapped needs no state that
+// survives across separate clicks.
 type queryRow struct {
 	widget.BaseWidget
-	ct       *canvas.Text
-	nodeID   string
-	onTapped func(id string)
-	onMenu   func(id string, pos fyne.Position)
+	ct        *canvas.Text
+	nodeID    string
+	onTapped  func(id string, extend bool)
+	onMenu    func(id string, pos fyne.Position)
+	shiftHeld bool
 }
 
-func newQueryRow(onTapped func(id string), onMenu func(id string, pos fyne.Position)) *queryRow {
+func newQueryRow(onTapped func(id string, extend bool), onMenu func(id string, pos fyne.Position)) *queryRow {
 	qr := &queryRow{
 		ct:       canvas.NewText("", theme.Color(theme.ColorNameForeground)),
 		onTapped: onTapped,
@@ -30,8 +38,14 @@ func newQueryRow(onTapped func(id string), onMenu func(id string, pos fyne.Posit
 
 func (qr *queryRow) Tapped(*fyne.PointEvent) {
 	if qr.onTapped != nil && qr.nodeID != "" {
-		qr.onTapped(qr.nodeID)
+		qr.onTapped(qr.nodeID, qr.shiftHeld)
 	}
+}
+
+func (qr *queryRow) MouseDown(*desktop.MouseEvent) {}
+
+func (qr *queryRow) MouseUp(e *desktop.MouseEvent) {
+	qr.shiftHeld = e.Modifier&fyne.KeyModifierShift != 0
 }
 
 func (qr *queryRow) CreateRenderer() fyne.WidgetRenderer {

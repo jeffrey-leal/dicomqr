@@ -666,8 +666,12 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		Blocking: true,
 	}, func(owned fyne.Window) fyne.CanvasObject {
 		win = owned
+		// Right inset is the scroll gutter when that is wider: the Tags removed
+		// list scrolls on its own, and its scrollbar must stay out of the body
+		// scrollbar's grab zone (scrollgutter.go).
 		body := container.NewVScroll(container.New(
-			layout.NewCustomPaddedLayout(modEditorMargin, modEditorMargin, modEditorMargin, modEditorMargin),
+			layout.NewCustomPaddedLayout(modEditorMargin, modEditorMargin, modEditorMargin,
+				max(modEditorMargin, scrollGutterWidth())),
 			container.NewVBox(sections...)))
 		// A modest floor, as in the profile editor: it stops the window being
 		// shrunk to nothing without forbidding the vertical resizing that makes

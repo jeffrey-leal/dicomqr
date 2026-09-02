@@ -69,36 +69,19 @@ func importOneFile(srcPath, downloadDir string) (dest string, copied bool, err e
 // reloadLocal is invoked so the Local Browse tree picks them up.
 func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, reloadLocal func()) (fyne.CanvasObject, func()) {
 	model := newResultsModel()
-	selectedNodes := make(map[string]bool)
 	seriesFiles := make(map[string][]string)
 
 	var tree *widget.Tree
+	sel := newNodeSelection(model,
+		func(id string) { tree.RefreshItem(id) },
+		func() { tree.Refresh() },
+	)
 
-	var clearSubtree func(string)
-	clearSubtree = func(id string) {
-		if selectedNodes[id] {
-			delete(selectedNodes, id)
-			tree.RefreshItem(id)
-		}
-		for _, child := range model.childUIDs(id) {
-			clearSubtree(child)
-		}
-	}
-
-	var selectSubtree func(string)
-	selectSubtree = func(id string) {
-		selectedNodes[id] = true
-		tree.RefreshItem(id)
-		for _, child := range model.childUIDs(id) {
-			selectSubtree(child)
-		}
-	}
-
-	onTapped := func(id string) {
-		if selectedNodes[id] {
-			clearSubtree(id)
+	onTapped := func(id string, extend bool) {
+		if extend {
+			sel.ExtendTo(id)
 		} else {
-			selectSubtree(id)
+			sel.Toggle(id)
 		}
 	}
 
@@ -135,7 +118,7 @@ func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, 
 			row.nodeID = id
 			row.ct.Text = model.labelFor(id)
 			row.ct.TextSize = theme.TextSize()
-			if selectedNodes[id] {
+			if sel.Selected(id) {
 				if cfg.SelectionColor != "" {
 					row.ct.Color = hexToColor(cfg.SelectionColor)
 				} else {
@@ -168,7 +151,7 @@ func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, 
 			return
 		}
 		model.clear()
-		selectedNodes = make(map[string]bool)
+		sel.Clear()
 		seriesFiles = make(map[string][]string)
 		importStatusLbl.SetText("")
 		tree.Refresh()
@@ -272,19 +255,7 @@ func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, 
 	)
 
 	importBtn := widget.NewButton("Import Selected", func() {
-		// Collect unique file paths across all selected nodes. Because
-		// selectSubtree marks both parents and children, iterate the map and
-		// deduplicate so each file is only copied once.
-		seen := make(map[string]bool)
-		var paths []string
-		for id := range selectedNodes {
-			for _, p := range filesForNode(id, model, seriesFiles) {
-				if !seen[p] {
-					seen[p] = true
-					paths = append(paths, p)
-				}
-			}
-		}
+		paths := sel.Paths(seriesFiles)
 
 		if len(paths) == 0 {
 			importStatusLbl.SetText("Nothing selected — click tree items to select them first.")
@@ -366,15 +337,8 @@ func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, 
 		container.NewHBox(
 			importBtn,
 			layout.NewSpacer(),
-			widget.NewButton("Select All", func() {
-				for _, id := range model.activeRoots() {
-					selectSubtree(id)
-				}
-			}),
-			widget.NewButton("Clear Selection", func() {
-				selectedNodes = make(map[string]bool)
-				tree.Refresh()
-			}),
+			widget.NewButton("Select All", func() { sel.SelectAll(model.activeRoots()) }),
+			widget.NewButton("Clear Selection", func() { sel.Clear() }),
 		),
 		progressBar,
 		importStatusLbl,

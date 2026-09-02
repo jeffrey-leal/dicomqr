@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.20.0] — 2026-09-02
+
+### Added
+
+- **Series within a study can be range-selected with shift-click**, in Local Browse, Import and the Query Results tree alike: click one series, then shift-click another, and everything between them is selected — the fast way to pick several series out of a large study without clicking each one individually. The range is added to whatever else is already selected; nothing outside it is touched, and a shift-click that doesn't land on a sibling of the last plain click (a different study, or nothing clicked yet) just selects that one item instead of guessing at a range.
+
+- **The Review masking window now finds the problems instead of making you scrub for them.** A "Next failure" button jumps straight to the next image that cannot be masked and would fail the export — in whatever series it sits, wrapping past the end of the run — with a live count that reaching zero means the run exports clean; on a plain slice stack, which gets no filmstrip, this is the only flag a failing image gets. A counts line beside the image position tallies the whole run by outcome (masked / fallback / exempt / fail / untouched) in the same colours the filmstrip stripes use, updated as regions are drawn and undone, so it doubles as the colour legend. Navigation is labelled for what it does — "< Series / Series >" step series, new "<" and ">" beside the slider step single images — and the paragraph of instructions at the top is cut to two sentences, since the window now explains itself where each thing happens. Cancel and the title-bar X ask before discarding a session's drawn regions, and dragging on the image with Draw rectangles unticked says why nothing is happening instead of doing nothing silently.
+
+### Changed
+
+- **A rectangle drawn in the Review masking window and set to reach beyond the one image now stops at the series it was drawn in, and — for a series with separate chapters to review, such as an ultrasound series mixing clips and stills — at the one chapter**, instead of reaching into every other series (and study) the run happened to include, or every other clip of the same series. The "Images of this size" option becomes "Current chapter" or "Current series", showing whichever applies to the series being reviewed: for a series with no separate chapters (a plain slice stack, most CT and MR series) it reaches every like image across that whole series, since there a repeating layout is a statement about the acquisition as a whole; for a series that does have them, it stays confined to the one chapter drawn on, since a rectangle drawn on one clip is not a statement about a different view that happens to share its geometry. The match against modality, pixel dimensions and (for ultrasound) calibrated-region state is unchanged, so a differently laid-out worksheet mixed into a chapterless series is still left alone.
+
+### Fixed
+
+- **Deselecting one series of an already-selected study no longer leaves the whole study selected.** Selecting a study (or a patient) fans the selection out to every series beneath it, but in Local Browse and the Import tab, clicking a series back off only cleared that one series — the study itself stayed flagged selected, so Push Selected, Delete Selected and Import Selected kept operating on every series underneath it, including the one just excluded. Deselecting a series now clears the stale flag on the study (and patient) above it too, the way the Query Results tree's own selection already worked.
+
+- **Scrollbars inside scrolling dialogs no longer sit in each other's grab zones.** A list or multi-line field that scrolls on its own — the profile lists in Preferences' tabs, the Tags removed list in the Modification dialog, the Remove/Keep tag fields in the profile editor and its per-modality override — used to end flush against (or within a few pixels of) the dialog's own scrollbar, so dragging one bar routinely caught the other. Such content now keeps a clear gutter, the width of a scrollbar plus a little air, between its right edge and the dialog's, so each bar is visually distinct and drags only its own scroll.
+
 ## [1.18.0] — 2026-08-21
 
 ### Added

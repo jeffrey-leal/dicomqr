@@ -547,13 +547,15 @@ func TestMaskRegionScopeLimitsWhichImagesAreMasked(t *testing.T) {
 	}
 }
 
-// "This group" reaches the images of one modality and size, and stops there.
-func TestMaskRegionGroupScope(t *testing.T) {
-	group := &MaskScope{Modality: "US", Cols: 10, Rows: 10, USRegion: usRegionAbsent}
+// "Current Series/Chapter" reaches the images of one modality and size within
+// one series, and stops at both boundaries.
+func TestMaskRegionSeriesSizeScope(t *testing.T) {
+	group := &MaskScope{Series: "1.2.3.1", Modality: "US", Cols: 10, Rows: 10, USRegion: usRegionAbsent}
 	region := MaskRegion{Mode: maskModeRect, W: 1, H: 0.2, AppliesTo: group}
 
 	inGroup, inFrame := maskTestDataset(t, 10, 10, 1, "MONOCHROME2",
-		mustTestElement(t, tag.Modality, []string{"US"}))
+		mustTestElement(t, tag.Modality, []string{"US"}),
+		mustTestElement(t, tag.SeriesInstanceUID, []string{"1.2.3.1"}))
 	if _, err := applyPixelMask(inGroup, []MaskRegion{region}, newMaskSource(inGroup)); err != nil {
 		t.Fatalf("applyPixelMask: %v", err)
 	}
@@ -561,10 +563,24 @@ func TestMaskRegionGroupScope(t *testing.T) {
 		t.Errorf("an image of the group was not masked: pixel (0,0) = %d", got)
 	}
 
-	// Same size, but it states its own region: a different group in the review
-	// window, and a different group here.
+	// Same modality, size and calibration, but a different series — the
+	// cross-series bleed this scope exists to stop.
+	otherSeries, otherFrame := maskTestDataset(t, 10, 10, 1, "MONOCHROME2",
+		mustTestElement(t, tag.Modality, []string{"US"}),
+		mustTestElement(t, tag.SeriesInstanceUID, []string{"1.2.3.2"}))
+	otherBefore := slices.Clone(otherFrame.RawData)
+	if _, err := applyPixelMask(otherSeries, []MaskRegion{region}, newMaskSource(otherSeries)); err != nil {
+		t.Fatalf("applyPixelMask(otherSeries): %v", err)
+	}
+	if !slices.Equal(otherFrame.RawData, otherBefore) {
+		t.Error("a region scoped to one series masked an image of another series")
+	}
+
+	// Same series and size, but it states its own region: a different group
+	// in the review window, and a different group here.
 	calibrated, calFrame := maskTestDataset(t, 10, 10, 1, "MONOCHROME2",
 		mustTestElement(t, tag.Modality, []string{"US"}),
+		mustTestElement(t, tag.SeriesInstanceUID, []string{"1.2.3.1"}),
 		usRegionElement(t, 2, 2, 7, 7))
 	before := slices.Clone(calFrame.RawData)
 	if _, err := applyPixelMask(calibrated, []MaskRegion{region}, newMaskSource(calibrated)); err != nil {
@@ -574,15 +590,41 @@ func TestMaskRegionGroupScope(t *testing.T) {
 		t.Error("a region scoped to the uncalibrated group masked a calibrated image")
 	}
 
-	// A different size is a different group.
+	// A different size, same series, is a different group.
 	bigger, bigFrame := maskTestDataset(t, 20, 10, 1, "MONOCHROME2",
-		mustTestElement(t, tag.Modality, []string{"CT"}))
+		mustTestElement(t, tag.Modality, []string{"CT"}),
+		mustTestElement(t, tag.SeriesInstanceUID, []string{"1.2.3.1"}))
 	bigBefore := slices.Clone(bigFrame.RawData)
 	if _, err := applyPixelMask(bigger, []MaskRegion{region}, newMaskSource(bigger)); err != nil {
 		t.Fatalf("applyPixelMask(bigger): %v", err)
 	}
 	if !slices.Equal(bigFrame.RawData, bigBefore) {
 		t.Error("a group-scoped region reached an image of another group")
+	}
+}
+
+// MaskScope.matches directly, for the Series field: empty matches any series,
+// and a stated one narrows exactly like the neighbouring fields it composes
+// with.
+func TestMaskScopeMatchesSeries(t *testing.T) {
+	src := maskSource{seriesInstanceUID: "1.2.3.1", modality: "US"}
+	cases := []struct {
+		name string
+		s    *MaskScope
+		want bool
+	}{
+		{"no series stated matches anything", &MaskScope{Modality: "US"}, true},
+		{"matching series", &MaskScope{Series: "1.2.3.1"}, true},
+		{"different series", &MaskScope{Series: "1.2.3.2"}, false},
+		{"matching series and modality", &MaskScope{Series: "1.2.3.1", Modality: "US"}, true},
+		{"matching series, wrong modality", &MaskScope{Series: "1.2.3.1", Modality: "CT"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.s.matches(src, 800, 600); got != tc.want {
+				t.Errorf("matches = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

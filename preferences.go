@@ -744,14 +744,19 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 	)
 
 	// Three tabs, each scrolling independently; the button row stays pinned
-	// below the tab container so Cancel/Apply are always visible.
+	// below the tab container so Cancel/Apply are always visible. Each tab's
+	// content is padded clear of its scrollbar (padForScrollbar) because the
+	// profile lists inside these tabs scroll on their own — without the
+	// gutter, the list's scrollbar and the tab's sit in each other's grab
+	// zones. The whole tab is padded rather than just the lists, so the tab
+	// keeps one right edge and anything scrollable added later is covered.
 	tabs := container.NewAppTabs(
 		container.NewTabItem("SCP & Network",
-			container.NewVScroll(container.NewVBox(networkSection, serverSection))),
+			container.NewVScroll(padForScrollbar(container.NewVBox(networkSection, serverSection)))),
 		container.NewTabItem("User Interface",
-			container.NewVScroll(container.NewVBox(appearanceSection, viewerSection, hlSection, tpSection))),
+			container.NewVScroll(padForScrollbar(container.NewVBox(appearanceSection, viewerSection, hlSection, tpSection)))),
 		container.NewTabItem("Modification & Export",
-			container.NewVScroll(container.NewVBox(modProfileSection, defaultsSection))),
+			container.NewVScroll(padForScrollbar(container.NewVBox(modProfileSection, defaultsSection)))),
 	)
 
 	minSize := canvas.NewRectangle(color.Transparent)

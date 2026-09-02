@@ -27,7 +27,7 @@ import (
 	"github.com/grailbio/go-dicom/dicomlog"
 )
 
-const version = "1.18.0"
+const version = "1.20.0"
 
 // LED colours for connection and SCP state indicators.
 var (
@@ -355,105 +355,27 @@ func main() {
 
 	// ── Results tree ────────────────────────────────────────────────────────
 	model := newResultsModel()
-	selectedNodes := make(map[string]bool)
 
-	// tree is declared here so the selection helpers can reference it before
-	// widget.NewTree returns.
+	// tree is declared here so nodeSelection's refresh callbacks can
+	// reference it before widget.NewTree returns.
 	var tree *widget.Tree
+	sel := newNodeSelection(model,
+		func(id string) { tree.RefreshItem(id) },
+		func() { tree.Refresh() },
+	)
 
-	// clearSubtree removes id and every loaded descendant from selectedNodes.
-	var clearSubtree func(string)
-	clearSubtree = func(id string) {
-		if selectedNodes[id] {
-			delete(selectedNodes, id)
-			tree.RefreshItem(id)
+	onTapped := func(id string, extend bool) {
+		if extend {
+			sel.ExtendTo(id)
+		} else {
+			sel.Toggle(id)
 		}
-		for _, child := range model.childUIDs(id) {
-			clearSubtree(child)
-		}
-	}
-
-	// selectSubtree adds id and every loaded descendant to selectedNodes.
-	var selectSubtree func(string)
-	selectSubtree = func(id string) {
-		selectedNodes[id] = true
-		tree.RefreshItem(id)
-		for _, child := range model.childUIDs(id) {
-			selectSubtree(child)
-		}
-	}
-
-	// nodeOrAncestorSelected reports whether id or any of its ancestors is selected.
-	nodeOrAncestorSelected := func(id string) bool {
-		for cur := id; cur != ""; cur = model.parentOf(cur) {
-			if selectedNodes[cur] {
-				return true
-			}
-		}
-		return false
-	}
-
-	onTapped := func(id string) {
-		// Find the outermost selected ancestor (if any).
-		topAncestor := ""
-		for anc := model.parentOf(id); anc != ""; anc = model.parentOf(anc) {
-			if selectedNodes[anc] {
-				topAncestor = anc
-			}
-		}
-
-		if topAncestor != "" && selectedNodes[id] {
-			// Node is selected and an ancestor is also selected (node was
-			// auto-selected when the parent was chosen). The user wants to
-			// deselect just this node: clear it and its loaded descendants,
-			// then deselect every ancestor up to and including topAncestor.
-			clearSubtree(id)
-			for anc := model.parentOf(id); anc != ""; anc = model.parentOf(anc) {
-				if selectedNodes[anc] {
-					delete(selectedNodes, anc)
-					tree.RefreshItem(anc)
-				}
-				if anc == topAncestor {
-					break
-				}
-			}
-			return
-		}
-
-		if topAncestor != "" {
-			// Node is unselected but an ancestor is selected. Narrow the
-			// selection down to just this node's subtree.
-			clearSubtree(topAncestor)
-			selectSubtree(id)
-			return
-		}
-
-		if selectedNodes[id] {
-			// Node is selected with no selected ancestors: toggle it off
-			// together with all loaded descendants.
-			clearSubtree(id)
-			return
-		}
-
-		// Node is unselected with no selected ancestors: select it and all
-		// loaded descendants.
-		selectSubtree(id)
 	}
 
 	// selectAll selects every currently visible (filtered) root and its loaded
 	// descendants; clearSelection drops the whole selection (Phase 5-2C).
-	selectAll := func() {
-		for _, id := range model.activeRoots() {
-			selectSubtree(id)
-		}
-	}
-	clearSelection := func() {
-		if len(selectedNodes) == 0 {
-			return
-		}
-		selectedNodes = make(map[string]bool)
-		tree.Refresh()
-	}
+	selectAll := func() { sel.SelectAll(model.activeRoots()) }
+	clearSelection := func() { sel.Clear() }
 
 	// startRetrieve is assigned below after the retrieve variables are in scope.
 	var startRetrieve func(nodeIDs []string)
@@ -496,7 +418,7 @@ func main() {
 			row.nodeID = id
 			row.ct.Text = model.labelFor(id)
 			row.ct.TextSize = theme.TextSize()
-			if selectedNodes[id] {
+			if sel.Selected(id) {
 				// Selected rows use the user-configured appearance (Phase 5-2E);
 				// an empty SelectionColor follows the theme's primary colour.
 				if cfg.SelectionColor != "" {
@@ -548,10 +470,8 @@ func main() {
 						r.Modality, r.SeriesNumber, r.SeriesDescription, r.NumInstances)
 				}
 				// Auto-select newly loaded series if the study or any ancestor is selected.
-				if nodeOrAncestorSelected(id) {
-					for _, child := range model.childUIDs(id) {
-						selectedNodes[child] = true
-					}
+				if sel.nodeOrAncestorSelected(id) {
+					sel.MarkChildrenSelected(id)
 				}
 				model.applyFilter()
 				tree.RefreshItem(id)
@@ -560,9 +480,8 @@ func main() {
 	}
 
 	w.Canvas().AddShortcut(&fyne.ShortcutCopy{}, func(_ fyne.Shortcut) {
-		for id := range selectedNodes {
-			w.Clipboard().SetContent(model.labelFor(id))
-			break
+		if ids := sel.IDs(); len(ids) > 0 {
+			w.Clipboard().SetContent(model.labelFor(ids[0]))
 		}
 	})
 
@@ -771,7 +690,7 @@ func main() {
 		studyDateToEntry.SetDate(nil)
 		modalityCheck.SetSelected(nil)
 		model.clear()
-		selectedNodes = make(map[string]bool)
+		sel.Clear()
 		tree.Refresh()
 		setStatus("v" + version)
 	}
@@ -1463,11 +1382,7 @@ func main() {
 	}
 
 	retrieveBtn := widget.NewButton("Retrieve Selected", func() {
-		ids := make([]string, 0, len(selectedNodes))
-		for id := range selectedNodes {
-			ids = append(ids, id)
-		}
-		startRetrieve(ids)
+		startRetrieve(sel.IDs())
 	})
 
 	cancelRetrieveBtn := widget.NewButton("Cancel", func() {

@@ -61,6 +61,13 @@ type maskCanvas struct {
 	// (an ultrasound rule expands into bands that were never drawn), so it
 	// cannot let the canvas accumulate a second, divergent list.
 	onDraw func(MaskRegion)
+	// onBlockedDrag fires once per drag gesture that arrives while the canvas
+	// is not editable. A drag on this widget has no other meaning, so one made
+	// with editing off is an attempt to draw that is silently doing nothing —
+	// the preview uses this to say why. blockedDragHinted keeps it to one
+	// firing per gesture rather than one per pointer-motion event.
+	onBlockedDrag     func()
+	blockedDragHinted bool
 }
 
 // setMode switches between showing a mask and drawing one.
@@ -137,6 +144,10 @@ const maskDragMinimum = 0.005
 
 func (c *maskCanvas) Dragged(e *fyne.DragEvent) {
 	if c.mode != maskCanvasEdit {
+		if !c.blockedDragHinted && c.onBlockedDrag != nil {
+			c.blockedDragHinted = true
+			c.onBlockedDrag()
+		}
 		return
 	}
 	if !c.dragging {
@@ -148,6 +159,7 @@ func (c *maskCanvas) Dragged(e *fyne.DragEvent) {
 }
 
 func (c *maskCanvas) DragEnd() {
+	c.blockedDragHinted = false
 	if c.mode != maskCanvasEdit || !c.dragging {
 		return
 	}

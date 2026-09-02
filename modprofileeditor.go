@@ -650,8 +650,12 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 	// The margin goes inside the scroll rather than around it so the scrollbar
 	// still tracks the window edge; a window has none of the inset a dialog
 	// gets for free, which is what left these controls flush against the frame.
+	// The right inset is the scroll gutter when that is wider: the Remove/Keep
+	// entries scroll on their own, and their scrollbar must stay out of the
+	// body scrollbar's grab zone (scrollgutter.go).
 	bodyScroll := container.NewVScroll(container.New(
-		layout.NewCustomPaddedLayout(modEditorMargin, modEditorMargin, modEditorMargin, modEditorMargin),
+		layout.NewCustomPaddedLayout(modEditorMargin, modEditorMargin, modEditorMargin,
+			max(modEditorMargin, scrollGutterWidth())),
 		container.NewVBox(sections...)))
 	bodyScroll.SetMinSize(fyne.NewSize(0, 240))
 	minWidth := canvas.NewRectangle(color.Transparent)
@@ -852,7 +856,10 @@ func showPerModalityEditor(a fyne.App, w fyne.Window, code string, p ModProfile,
 		container.NewPadded(container.NewHBox(layout.NewSpacer(), cancelBtn, saveBtn)),
 	)
 
-	formScroll := container.NewVScroll(container.NewVBox(sections...))
+	// padForScrollbar: the Remove/Keep entries scroll on their own once their
+	// lists outgrow their visible rows, and without the gutter their scrollbar
+	// sits directly under this scroll's.
+	formScroll := container.NewVScroll(padForScrollbar(container.NewVBox(sections...)))
 	formScroll.SetMinSize(fyne.NewSize(0, 340))
 	minWidth := canvas.NewRectangle(color.Transparent)
 	minWidth.SetMinSize(fyne.NewSize(520, 0))

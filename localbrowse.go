@@ -847,7 +847,6 @@ func showPushDialog(w fyne.Window, cfg *Settings, paths []string, description st
 // from the catalog (call it after downloads or imports add files).
 func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, openInViewer func(string)) (fyne.CanvasObject, func(), func()) {
 	model := newResultsModel()
-	selectedNodes := make(map[string]bool)
 	seriesFiles := make(map[string][]string)
 
 	var doScan func()
@@ -855,33 +854,17 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 	var pruneMissing func(paths []string)
 	var verifyNode func(id string)
 	var tree *widget.Tree
+	sel := newNodeSelection(model,
+		func(id string) { tree.RefreshItem(id) },
+		func() { tree.Refresh() },
+	)
 
-	var clearSubtree func(string)
-	clearSubtree = func(id string) {
-		if selectedNodes[id] {
-			delete(selectedNodes, id)
-			tree.RefreshItem(id)
-		}
-		for _, child := range model.childUIDs(id) {
-			clearSubtree(child)
-		}
-	}
-
-	var selectSubtree func(string)
-	selectSubtree = func(id string) {
-		selectedNodes[id] = true
-		tree.RefreshItem(id)
-		for _, child := range model.childUIDs(id) {
-			selectSubtree(child)
-		}
-	}
-
-	onTapped := func(id string) {
+	onTapped := func(id string, extend bool) {
 		verifyNode(id)
-		if selectedNodes[id] {
-			clearSubtree(id)
+		if extend {
+			sel.ExtendTo(id)
 		} else {
-			selectSubtree(id)
+			sel.Toggle(id)
 		}
 	}
 
@@ -1017,7 +1000,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 			row.nodeID = id
 			row.ct.Text = model.labelFor(id)
 			row.ct.TextSize = theme.TextSize()
-			if selectedNodes[id] {
+			if sel.Selected(id) {
 				if cfg.SelectionColor != "" {
 					row.ct.Color = hexToColor(cfg.SelectionColor)
 				} else {
@@ -1052,11 +1035,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 				sr.seriesNumber, sr.seriesDesc, sr.numInstances)
 		}
 		model.applyFilter()
-		for id := range selectedNodes {
-			if _, ok := model.nodes[id]; !ok {
-				delete(selectedNodes, id)
-			}
-		}
+		sel.Prune()
 		tree.Refresh()
 	}
 
@@ -1168,7 +1147,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 		}
 		scanDir = dir
 		model.clear()
-		selectedNodes = make(map[string]bool)
+		sel.Clear()
 		seriesFiles = make(map[string][]string)
 		tree.Refresh()
 		scanStatusLbl.SetText("Scanning…")
@@ -1294,19 +1273,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 		filterEntry,
 	)
 
-	collectSelected := func() []string {
-		seen := make(map[string]bool)
-		var paths []string
-		for id := range selectedNodes {
-			for _, p := range filesForNode(id, model, seriesFiles) {
-				if !seen[p] {
-					seen[p] = true
-					paths = append(paths, p)
-				}
-			}
-		}
-		return paths
-	}
+	collectSelected := func() []string { return sel.Paths(seriesFiles) }
 
 	pushSelectedBtn := widget.NewButton("Push Selected…", func() {
 		paths := collectSelected()
@@ -1347,15 +1314,8 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 			pushSelectedBtn,
 			deleteSelectedBtn,
 			layout.NewSpacer(),
-			widget.NewButton("Select All", func() {
-				for _, id := range model.activeRoots() {
-					selectSubtree(id)
-				}
-			}),
-			widget.NewButton("Clear Selection", func() {
-				selectedNodes = make(map[string]bool)
-				tree.Refresh()
-			}),
+			widget.NewButton("Select All", func() { sel.SelectAll(model.activeRoots()) }),
+			widget.NewButton("Clear Selection", func() { sel.Clear() }),
 		),
 		scanStatusLbl,
 	)

@@ -1,8 +1,8 @@
 # dicomqr
 
-**User Manual  v1.18.0**
+**User Manual  v1.20.0**
 
-August 21, 2026
+September 2, 2026
 
 A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.
 
@@ -204,6 +204,8 @@ The filter acts on the already-loaded results and does not send a new query to t
 ### 6.3  Selecting Items for Retrieval
 
 Click any row in the results tree to select it. Selected rows are highlighted using the colour and font style configured in Preferences > User Interface (by default, bold in the theme's primary accent colour — see Section 11.1). Click the same row again to deselect it. Multiple rows at any level (patient, study, or series) may be selected simultaneously.
+
+Selecting a patient or study also selects every series beneath it. Clicking one of those series back off deselects just that series — the patient or study is no longer treated as fully selected, but its other series stay selected. Shift-click a second series within the same study to select every series between it and the one last clicked, in one step.
 
 The Select All button (in the retrieve panel) selects every currently visible row and its loaded descendants; Clear Selection clears the entire selection. Pressing Esc also clears the current selection.
 
@@ -491,6 +493,8 @@ Warning: Deletion is permanent. Files are not moved to the Recycle Bin.
 
 ### 8.7  Selection Controls
 
+Click any row in the tree to select it; click it again to deselect it. Selecting a patient or study selects every series beneath it — clicking one of those series back off deselects just that series, leaving the rest of the patient or study selected. Shift-click a second series within the same study to select every series between it and the one last clicked, in one step.
+
 | Control | Action |
 |---|---|
 | Select All | Selects every currently visible (filtered) root node and all its descendants. |
@@ -522,7 +526,7 @@ The folder imported from is remembered: it is filled in when the application nex
 
 ### 9.2  Selecting and Importing
 
-Click rows in the tree to select them. Click Import Selected to copy the selected files. Files already present in the destination (same SOP Instance UID at the same destination path) are skipped; the status label reports imported, already-present, and failed counts.
+Click rows in the tree to select them. Selecting a patient or study selects every series beneath it; clicking one of those series back off deselects just that series. Shift-click a second series within the same study to select every series between it and the one last clicked. Click Import Selected to copy the selected files. Files already present in the destination (same SOP Instance UID at the same destination path) are skipped; the status label reports imported, already-present, and failed counts.
 
 Select All and Clear Selection buttons are provided. The filter bar narrows the tree in the same way as the other tabs.
 
@@ -740,7 +744,7 @@ Some images carry patient identity in the pixels rather than in the tags: ultras
 
 A region is either a rectangle or the Outside ultrasound region rule.
 
-A region also carries how far it reaches. One defined in the profile editor applies to every image, which is what a profile-wide rule such as "blank the top 8%" should do. One drawn in the review window during a run (Section 8.9) can instead be limited to a single image or to one group of like images — necessary because the images that need a hand-drawn rectangle are usually the ones whose layout is unique, and a rectangle that suits one of them will cover something important on the next.
+A region also carries how far it reaches. One defined in the profile editor applies to every image, which is what a profile-wide rule such as "blank the top 8%" should do. One drawn in the review window during a run (Section 8.9) can instead be limited to a single image, to the series being reviewed, or to one chapter within it — necessary because the images that need a hand-drawn rectangle are usually the ones whose layout is unique, and a rectangle that suits one of them will cover something important on the next.
 
 A rectangle is given as percentages of each image's width and height — x and y locate its top-left corner, w and h its size — so 0, 0, 100, 8 blanks the top 8% of every image regardless of its resolution. Percentages rather than pixel coordinates matter because one study routinely mixes sizes: a rectangle measured on an 800×600 loop would miss the banner on a 1024×768 capture in the same export. Rectangles are rounded outward when they land between pixels, on the principle that half a row of leftover text is still identifiable.
 
@@ -750,19 +754,22 @@ Ultrasound images that declare no calibrated region are usually analysis or meas
 
 Drawing a rectangle instead of measuring one. Pick from image… beside Add region opens any DICOM file and shows it full size; drag across the image to mark an area, Undo last removes the most recent, and Apply replaces the profile's rectangles with what is on screen (Outside ultrasound region rows are left alone, having no geometry to draw). Rectangles snap to the image's own pixel grid, so what is stored is the area marked, to the nearest pixel, expressed as percentages that then apply to every image size in the study. The window also states what the file declares about itself — its size, its modality, and for ultrasound whether it carries a calibrated region, which tells you whether a rectangle is needed for that file at all.
 
-Reviewing and masking a run. The Modification dialog's Pixel masking section has a Review masking… button, and for a study with burned-in annotation this is where the work is done. It reads the header of every selected file and presents them series by series, in acquisition order — for an ultrasound study that is clip by clip, each clip shown at its middle frame. Every control sits beneath the image, in the order the work is done: the slider scrubs the images of the current series, Previous and Next step to another series (named beside them), and the row under those says which image is on screen. The arrow keys step a single image and Ctrl with an arrow key steps a series, for review that needs to be precise rather than quick. Each image is shown with the areas that will be blanked drawn in black, resolved by the same code the export uses, so what is shown is what will happen. Files that cannot be read, or that hold no image, are counted in the window's caption rather than silently left out.
+Reviewing and masking a run. The Modification dialog's Pixel masking section has a Review masking… button, and for a study with burned-in annotation this is where the work is done. It reads the header of every selected file and presents them series by series, in acquisition order — for an ultrasound study that is clip by clip, each clip shown at its middle frame. Every control sits beneath the image, in the order the work is done: the slider scrubs the images of the current series, with < and > beside it stepping a single image; < Series and Series > step to another series (named beside them), and the row under those says which image is on screen. The arrow keys also step a single image and Ctrl with an arrow key a series, for review that needs to be precise rather than quick. Each image is shown with the areas that will be blanked drawn in black, resolved by the same code the export uses, so what is shown is what will happen. Files that cannot be read, or that hold no image, are counted in the window's caption rather than silently left out.
+
+Two things keep a large run from having to be combed by hand. A counts line beside the image position tallies the whole run by outcome, in the same colours the filmstrip stripes use — how many images are masked, masked by fallback rectangles, marked as needing none, would fail the export, or are untouched — recomputed as regions are drawn and undone, so it always states what Use these regions would produce. And a Next failure button jumps straight to the next image that cannot be masked and would fail the export, in whatever series it sits, wrapping past the end of the run — the count on the button reaching zero is the sign the run exports clean. The button is the one flag failing images get in a series without a filmstrip, where there is no red stripe to spot.
 
 A series that contains clips also gets the viewer's filmstrip, between the image and the slider: one thumbnail per image of the series, decoded in the background, with the current image outlined — click any thumbnail to jump straight to it, exactly as in the viewer. A coloured stripe along the bottom edge of each thumbnail says what this run's masking will do to that image, resolved by the export's own rules and updated as regions are drawn or undone: green means the image is masked; amber means it is masked by the profile's rectangles standing in for a calibrated ultrasound region it does not declare, and is worth a look; blue means it has been marked as needing no masking; red means it cannot be masked and would fail the export; no stripe means nothing applies and the image exports untouched. For an echo study this is the quick pass the window exists for — the amber and red cells are the analysis screens needing a hand-drawn rectangle or an exemption, visible at a glance instead of found by scrubbing.
 
-Tick Draw rectangles to mark an area on the image in front of you: drag across it and the rectangle joins the regions this run will apply. How far it reaches is set by Applies to beside it:
+Tick Draw rectangles to mark an area on the image in front of you: drag across it and the rectangle joins the regions this run will apply (dragging with the box unticked does nothing, and the note beneath the image says so). How far the rectangle reaches is set by Applies to beside it — the middle option reads Current chapter or Current series, whichever applies to the series being reviewed:
 
 | Applies to | Effect |
 |---|---|
 | This image only | The image on screen and no other. The default, and the right choice for an analysis or measurement screen: the next screen is laid out differently, and blanking the same area there would destroy report content the export exists to keep. |
-| Images of this size | Every image in the run with this image's modality and pixel dimensions — in this series or any other, since a like-sized image elsewhere carries the same banner in the same place. For ultrasound it also matches on whether the file states its own image region, because calibrated loops and analysis screens are masked by different means. Use it where a layout genuinely repeats, such as a series of captures from one machine. |
+| Current chapter | Shown for a series with separate chapters to tell apart — the ones that get their own filmstrip, such as an ultrasound series mixing clips and stills. The rectangle reaches every image of this image's modality and pixel dimensions within the one chapter being reviewed, and nowhere else: a rectangle drawn on one clip is not a statement about a different view that happens to share its geometry. |
+| Current series | Shown for a series with no separate chapters (a plain single-frame slice stack, such as most CT or MR series). The rectangle reaches every image of this image's modality and pixel dimensions across the whole series — there a repeating layout is a statement about the acquisition as a whole — but never another series or the rest of the run. For ultrasound it also matches on whether the file states its own image region, because calibrated loops and analysis screens are masked by different means. |
 | All images | Every image in the run, whatever its modality or size. The same reach a rectangle defined in the profile editor has. |
 
-Undo takes back the most recent thing added in this session, wherever it went; it never removes a region the profile arrived with. Needs no masking records that the image on screen (or its group, following the same Applies to setting) was reviewed and requires no mask — which is what lets an ultrasound image with no stated region be exported instead of failed. Step to the next image to see whether it is covered too: that loop, draw and check, is the point of the window. Use these regions applies everything marked to this run; Cancel discards it.
+Undo takes back the most recent thing added in this session, wherever it went; it never removes a region the profile arrived with. Needs no masking records that the image on screen (or its group, following the same Applies to setting) was reviewed and requires no mask — which is what lets an ultrasound image with no stated region be exported instead of failed. Step to the next image to see whether it is covered too: that loop, draw and check, is the point of the window. Use these regions applies everything marked to this run; Cancel discards it — asking first when the session has drawn regions or exemptions to lose, so a stray click cannot take minutes of review with it.
 
 Regions marked here apply to this run only, like every other control in the Modification dialog — nothing is written back to the profile. Where the same layout recurs, for instance because a department's machines always print the same banner, define it once in the profile editor (Section 14.3) so every run starts with it in place.
 
@@ -822,7 +829,7 @@ The status bar at the bottom of the window provides real-time feedback. A colour
 
 | Situation | Status bar text |
 |---|---|
-| Application started, not connected | `v1.18.0` |
+| Application started, not connected | `v1.20.0` |
 | Connecting to server | `Connecting…` |
 | Connected | `Connected: <AE>@<host>:<port>` |
 | Connection cancelled | `Connection cancelled` |

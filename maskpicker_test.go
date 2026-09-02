@@ -272,6 +272,21 @@ func TestScanMaskSeries(t *testing.T) {
 	if !strings.Contains(series[0].label(), "3 file(s)") || !strings.Contains(series[0].label(), "Series 1") {
 		t.Errorf("label = %q, want the series number and file count", series[0].label())
 	}
+	// Neither series here has a clip to tell its files apart — three US stills
+	// and a CT pair are each one continuous stack, not separate chapters — so
+	// a size-scoped rectangle drawn on one of them still reaches the rest of
+	// its own series (newDrawnScope's other branch is covered where a series
+	// does have a clip: TestScanMaskSeriesBuildsChapters).
+	for _, f := range series[0].files {
+		if f.hasChapters {
+			t.Errorf("US still %q read as having distinguishable chapters", filepath.Base(f.path))
+		}
+	}
+	for _, f := range series[1].files {
+		if f.hasChapters {
+			t.Errorf("CT slice %q read as having distinguishable chapters", filepath.Base(f.path))
+		}
+	}
 }
 
 // Whether an ultrasound file declares a calibrated region is read per file:
@@ -493,6 +508,11 @@ func TestScanMaskSeriesBuildsChapters(t *testing.T) {
 	if files[0].chap.frames != 7 || files[1].chap.frames != 1 {
 		t.Errorf("chapter frames = %d, %d, want 7 and 1", files[0].chap.frames, files[1].chap.frames)
 	}
+	// The clip makes this series' chapters distinguishable, for both files in
+	// it — including the still, which on its own would not qualify.
+	if !files[0].hasChapters || !files[1].hasChapters {
+		t.Errorf("hasChapters = %v, %v, want both true once the series holds a clip", files[0].hasChapters, files[1].hasChapters)
+	}
 	for i, sf := range files {
 		if sf.chap.label == "" {
 			t.Errorf("file %d has no chapter label", i)
@@ -504,6 +524,9 @@ func TestScanMaskSeriesBuildsChapters(t *testing.T) {
 		if sf.src.sopInstanceUID != wantUID {
 			t.Errorf("file %d mask source SOP UID = %q, want %q", i, sf.src.sopInstanceUID, wantUID)
 		}
+		if sf.src.seriesInstanceUID != "1.2.3.1" {
+			t.Errorf("file %d mask source series UID = %q, want %q", i, sf.src.seriesInstanceUID, "1.2.3.1")
+		}
 	}
 	// The gate the filmstrip uses: this series holds a clip, so it qualifies.
 	chaps := []chapter{files[0].chap, files[1].chap}
@@ -514,5 +537,184 @@ func TestScanMaskSeriesBuildsChapters(t *testing.T) {
 	// would cost decode time and say nothing.
 	if anyMultiFrame([]chapter{files[1].chap}) {
 		t.Error("a stills-only series must not qualify for the filmstrip")
+	}
+}
+
+// seriesHasChapters is the shared gate behind both the filmstrip and
+// newDrawnScope's series-vs-chapter split: a lone file, or several files none
+// of which is multi-frame, is one continuous stack rather than separate
+// chapters.
+func TestSeriesHasChapters(t *testing.T) {
+	still := func(frames int) maskSeriesFile { return maskSeriesFile{chap: chapter{frames: frames}} }
+	cases := []struct {
+		name  string
+		files []maskSeriesFile
+		want  bool
+	}{
+		{"no files", nil, false},
+		{"one still", []maskSeriesFile{still(1)}, false},
+		{"one clip alone", []maskSeriesFile{still(200)}, false},
+		{"several stills, no clip", []maskSeriesFile{still(1), still(1), still(1)}, false},
+		{"stills plus one clip", []maskSeriesFile{still(1), still(200), still(1)}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := seriesHasChapters(tc.files); got != tc.want {
+				t.Errorf("seriesHasChapters(%d files) = %v, want %v", len(tc.files), got, tc.want)
+			}
+		})
+	}
+}
+
+// newDrawnScope is what a rectangle drawn in the review window actually gets:
+// the three Applies-to labels, plus the fallbacks for a file the scan could
+// not pin an identity to.
+func TestNewDrawnScope(t *testing.T) {
+	calibratedUS := maskSeriesFile{
+		modality: "US", cols: 800, rows: 600, calibrated: true,
+		src: maskSource{sopInstanceUID: "1.2.3.sop", seriesInstanceUID: "1.2.3.series"},
+	}
+	uncalibratedUS := calibratedUS
+	uncalibratedUS.calibrated = false
+	ct := maskSeriesFile{
+		modality: "CT", cols: 512, rows: 512,
+		src: maskSource{sopInstanceUID: "1.2.3.ct", seriesInstanceUID: "1.2.3.series"},
+	}
+	noSeries := maskSeriesFile{
+		modality: "CT", cols: 512, rows: 512,
+		src: maskSource{sopInstanceUID: "1.2.3.ct"},
+	}
+	noIdentity := maskSeriesFile{modality: "CT", cols: 512, rows: 512}
+	chapteredUS := calibratedUS
+	chapteredUS.hasChapters = true
+	chapteredNoSOP := maskSeriesFile{
+		modality: "CT", cols: 512, rows: 512, hasChapters: true,
+		src: maskSource{seriesInstanceUID: "1.2.3.series"},
+	}
+
+	cases := []struct {
+		name  string
+		label string
+		f     maskSeriesFile
+		want  *MaskScope
+	}{
+		{"all images", maskScopeAllLabel, calibratedUS, nil},
+		{"this image only", maskScopeImageLabel, ct, &MaskScope{SOPInstanceUID: "1.2.3.ct"}},
+		{"series, calibrated US", maskScopeSeriesLabel, calibratedUS,
+			&MaskScope{Series: "1.2.3.series", Modality: "US", Cols: 800, Rows: 600, USRegion: usRegionDeclared}},
+		{"series, uncalibrated US", maskScopeSeriesLabel, uncalibratedUS,
+			&MaskScope{Series: "1.2.3.series", Modality: "US", Cols: 800, Rows: 600, USRegion: usRegionAbsent}},
+		{"series, CT has no US split", maskScopeSeriesLabel, ct,
+			&MaskScope{Series: "1.2.3.series", Modality: "CT", Cols: 512, Rows: 512}},
+		{"series unknown falls back to this image", maskScopeSeriesLabel, noSeries,
+			&MaskScope{SOPInstanceUID: "1.2.3.ct"}},
+		{"no identity at all falls back to the size group", maskScopeSeriesLabel, noIdentity,
+			&MaskScope{Modality: "CT", Cols: 512, Rows: 512}},
+		{"this image, no SOP UID falls back to the size group", maskScopeImageLabel, noIdentity,
+			&MaskScope{Modality: "CT", Cols: 512, Rows: 512}},
+		{"series with chapters confines to the one drawn on", maskScopeChapterLabel, chapteredUS,
+			&MaskScope{SOPInstanceUID: "1.2.3.sop"}},
+		{"series with chapters, no SOP UID falls back to the size group", maskScopeChapterLabel, chapteredNoSOP,
+			&MaskScope{Modality: "CT", Cols: 512, Rows: 512}},
+		// Behavior comes from the file, never the label's face: a stale label
+		// mid-decode cannot change what a rectangle reaches.
+		{"series label on a chaptered file still confines", maskScopeSeriesLabel, chapteredUS,
+			&MaskScope{SOPInstanceUID: "1.2.3.sop"}},
+		{"chapter label on a plain-stack file still spans its series", maskScopeChapterLabel, ct,
+			&MaskScope{Series: "1.2.3.series", Modality: "CT", Cols: 512, Rows: 512}},
+		// The pre-1.19 static label is still honoured as the group case.
+		{"legacy label", "Current Series/Chapter", ct,
+			&MaskScope{Series: "1.2.3.series", Modality: "CT", Cols: 512, Rows: 512}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := newDrawnScope(tc.label, tc.f)
+			if (got == nil) != (tc.want == nil) || (got != nil && *got != *tc.want) {
+				t.Errorf("newDrawnScope(%q) = %+v, want %+v", tc.label, got, tc.want)
+			}
+		})
+	}
+
+	// The middle option's face tracks the displayed file.
+	if got := groupScopeLabelFor(chapteredUS); got != maskScopeChapterLabel {
+		t.Errorf("groupScopeLabelFor(chaptered) = %q, want %q", got, maskScopeChapterLabel)
+	}
+	if got := groupScopeLabelFor(ct); got != maskScopeSeriesLabel {
+		t.Errorf("groupScopeLabelFor(plain stack) = %q, want %q", got, maskScopeSeriesLabel)
+	}
+}
+
+// The status helpers behind the review window's counts line and Next failure
+// button — pure resolutions over the scan headers, so they are asserted
+// directly, with the same fixture style TestMaskFileStatusColor uses.
+func TestRunStatusCountsAndNextFailingFile(t *testing.T) {
+	usRegions := []MaskRegion{
+		{Mode: maskModeOutsideUS},
+		{Mode: maskModeRect, W: 1, H: 0.1, AppliesTo: &MaskScope{SOPInstanceUID: "fallback.1"}},
+		{Mode: maskModeNone, AppliesTo: &MaskScope{SOPInstanceUID: "exempt.1"}},
+	}
+	govern := func(modality string) []MaskRegion {
+		if strings.EqualFold(modality, "US") {
+			return usRegions
+		}
+		return nil
+	}
+	us := func(sop string, calibrated bool) maskSeriesFile {
+		src := maskSource{modality: "US", sopInstanceUID: sop}
+		if calibrated {
+			src.usDeclared = true
+			src.usBounds = pixelRect{10, 40, 790, 560}
+		}
+		return maskSeriesFile{cols: 800, rows: 600, modality: "US", src: src}
+	}
+	ct := maskSeriesFile{cols: 512, rows: 512, modality: "CT", src: maskSource{modality: "CT"}}
+
+	series := []maskSeries{
+		{files: []maskSeriesFile{us("ok.1", true), us("fail.1", false)}},
+		{files: []maskSeriesFile{ct, us("fallback.1", false), us("exempt.1", false), us("fail.2", false)}},
+	}
+
+	counts := runStatusCounts(series, govern)
+	want := map[maskFileStatus]int{
+		maskFileMasked: 1, maskFileFail: 2, maskFileFallback: 1,
+		maskFileExempt: 1, maskFileUntouched: 1,
+	}
+	for st, n := range want {
+		if counts[st] != n {
+			t.Errorf("counts[%v] = %d, want %d", st, counts[st], n)
+		}
+	}
+
+	// Failures sit at (0,1) and (1,3). The jump advances past the current
+	// position, crosses series, and wraps past the end.
+	cases := []struct{ fromS, fromF, wantS, wantF int }{
+		{0, 0, 0, 1}, // next failure ahead in the same series
+		{0, 1, 1, 3}, // from one failure to the next, across a series
+		{1, 3, 0, 1}, // wraps past the end
+		{1, 0, 1, 3}, // from a non-failure mid-run
+	}
+	for _, tc := range cases {
+		s, f, ok := nextFailingFile(series, govern, tc.fromS, tc.fromF)
+		if !ok || s != tc.wantS || f != tc.wantF {
+			t.Errorf("nextFailingFile(from %d,%d) = %d,%d,%v; want %d,%d,true",
+				tc.fromS, tc.fromF, s, f, ok, tc.wantS, tc.wantF)
+		}
+	}
+
+	// The starting file is checked last, so the run's only failure being the
+	// current file still finds it — repeated presses cycle rather than losing
+	// the one file that matters.
+	one := []maskSeries{{files: []maskSeriesFile{us("fail.only", false)}}}
+	if s, f, ok := nextFailingFile(one, govern, 0, 0); !ok || s != 0 || f != 0 {
+		t.Errorf("single failure not refound: %d,%d,%v", s, f, ok)
+	}
+
+	// No failures: ok is false — the state in which the run exports clean.
+	clean := []maskSeries{{files: []maskSeriesFile{us("ok.2", true), ct}}}
+	if _, _, ok := nextFailingFile(clean, govern, 0, 0); ok {
+		t.Error("a clean run reported a failure to jump to")
+	}
+	if _, _, ok := nextFailingFile(nil, govern, 0, 0); ok {
+		t.Error("an empty run reported a failure to jump to")
 	}
 }
