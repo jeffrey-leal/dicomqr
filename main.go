@@ -27,7 +27,7 @@ import (
 	"github.com/grailbio/go-dicom/dicomlog"
 )
 
-const version = "1.20.0"
+const version = "1.20.1"
 
 // LED colours for connection and SCP state indicators.
 var (
@@ -1540,14 +1540,12 @@ func main() {
 				"dicomqr  v%s  (built %s)\n"+
 					"DICOM Query/Retrieve client — query and retrieve studies from a PACS server.\n"+
 					"Implements DICOM PS3.4/PS3.7: C-ECHO, C-FIND, C-MOVE, C-STORE SCP.\n\n"+
-					"Architecture & Direction\n"+
-					"  Jeffrey Leal  <jeffrey.leal@gmail.com>\n"+
-					"  https://github.com/jeffrey-leal\n"+
-					"  Program architecture, feature design, field testing, release decisions.\n\n"+
+					"Architecture & Design\n"+
+					"  Jeffrey Leal <jeffrey.leal@gmail.com>\n"+
+					"  https://github.com/jeffrey-leal\n\n"+
 					"Implementation\n"+
-					"  Claude by Anthropic  (https://anthropic.com)\n"+
-					"  All application code and documentation, written via Claude Code\n"+
-					"  to Jeffrey Leal's architecture and direction.\n\n"+
+					"  Claude by Anthropic (https://anthropic.com)\n"+
+					"  Application code and documentation\n\n"+
 					"DICOM Standard Reference\n"+
 					"  DICOM PS3 (2024b) — https://dicom.nema.org/medical/dicom/current",
 				version, bd))

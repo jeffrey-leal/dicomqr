@@ -109,7 +109,7 @@ CGO_ENABLED=1 CC=/c/msys64/mingw64/bin/gcc.exe \
 
 | File | Purpose |
 |---|---|
-| `CREDITS.md` | Full attribution by role — Jeffrey Leal (architecture & direction), Claude by Anthropic (implementation), DICOM standard reference, open-source libraries |
+| `CREDITS.md` | Full attribution by role — Jeffrey Leal (architecture & design), Claude by Anthropic (implementation), DICOM standard reference, open-source libraries |
 | `CHANGELOG.md` | Version history |
 | `dicomqr-user-manual.md` | End-user guide |
 

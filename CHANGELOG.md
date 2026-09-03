@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.20.1] — 2026-09-03
+
+### Changed
+
+- **Credits reworded** — the About dialog, CREDITS.md and the manual's credits appendix now name Jeffrey Leal under *Architecture & Design* (name, email, GitHub) and Claude by Anthropic under *Implementation* (application code and documentation), replacing the longer descriptions of each role.
+
 ## [1.20.0] — 2026-09-02
 
 ### Added

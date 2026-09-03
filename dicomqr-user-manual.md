@@ -1,8 +1,8 @@
 # dicomqr
 
-**User Manual  v1.20.0**
+**User Manual  v1.20.1**
 
-September 2, 2026
+September 3, 2026
 
 A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.
 
@@ -829,7 +829,7 @@ The status bar at the bottom of the window provides real-time feedback. A colour
 
 | Situation | Status bar text |
 |---|---|
-| Application started, not connected | `v1.20.0` |
+| Application started, not connected | `v1.20.1` |
 | Connecting to server | `Connecting…` |
 | Connected | `Connected: <AE>@<host>:<port>` |
 | Connection cancelled | `Connection cancelled` |
@@ -937,18 +937,18 @@ Retrieve stalls on non-image series — some PACS servers' C-MOVE agents fail wh
 dicomqr is a human–AI collaboration. Credit is given by role, reflecting how the work was actually divided.
 
 
-### Architecture and Direction — Jeffrey Leal
+### Architecture & Design
 
-Email: jeffrey.leal@gmail.com
+Jeffrey Leal <jeffrey.leal@gmail.com>
 
-GitHub: https://github.com/jeffrey-leal
-
-Program concept and architecture, feature design and requirements, field testing against clinical PACS systems, and release decisions. The application is built, tested, and published by Jeffrey Leal, who remains responsible for the software.
+https://github.com/jeffrey-leal
 
 
-### Implementation — Claude by Anthropic
+### Implementation
 
-All application code, tests, and documentation were written by Claude (https://www.anthropic.com) through Claude Code (https://claude.ai/code), working to Jeffrey Leal's architecture and direction — code generation, DICOM standard research, debugging against field evidence, and this manual.
+Claude by Anthropic (https://anthropic.com)
+
+Application code and documentation
 
 
 ### DICOM Standard Reference

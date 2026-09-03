@@ -499,7 +499,7 @@ const stylesXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 
 func buildContent(d Formatter) {
 
-	d.Cover("dicomqr", "User Manual  v1.20.0",
+	d.Cover("dicomqr", "User Manual  v1.20.1",
 		time.Now().Format("January 2, 2006"),
 		"A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.")
 
@@ -1076,7 +1076,7 @@ func buildContent(d Formatter) {
 	d.P("The status bar at the bottom of the window provides real-time feedback. A coloured LED indicator (gray / amber / green) precedes the status text.")
 	d.Table([]Row{
 		{"Situation", "Status bar text"},
-		{"Application started, not connected", "`v1.20.0`"},
+		{"Application started, not connected", "`v1.20.1`"},
 		{"Connecting to server", "`Connecting…`"},
 		{"Connected", "`Connected: <AE>@<host>:<port>`"},
 		{"Connection cancelled", "`Connection cancelled`"},
@@ -1166,13 +1166,13 @@ func buildContent(d Formatter) {
 
 	d.P("dicomqr is a human–AI collaboration. Credit is given by role, reflecting how the work was actually divided.")
 
-	d.H2("Architecture and Direction — Jeffrey Leal")
-	d.P("Email: jeffrey.leal@gmail.com")
-	d.P("GitHub: https://github.com/jeffrey-leal")
-	d.P("Program concept and architecture, feature design and requirements, field testing against clinical PACS systems, and release decisions. The application is built, tested, and published by Jeffrey Leal, who remains responsible for the software.")
+	d.H2("Architecture & Design")
+	d.P("Jeffrey Leal <jeffrey.leal@gmail.com>")
+	d.P("https://github.com/jeffrey-leal")
 
-	d.H2("Implementation — Claude by Anthropic")
-	d.P("All application code, tests, and documentation were written by Claude (https://www.anthropic.com) through Claude Code (https://claude.ai/code), working to Jeffrey Leal's architecture and direction — code generation, DICOM standard research, debugging against field evidence, and this manual.")
+	d.H2("Implementation")
+	d.P("Claude by Anthropic (https://anthropic.com)")
+	d.P("Application code and documentation")
 
 	d.H2("DICOM Standard Reference")
 	d.P("Protocol implementation follows the DICOM Standard published by NEMA:")
