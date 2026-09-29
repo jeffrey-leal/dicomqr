@@ -509,7 +509,7 @@ const stylesXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 
 func buildContent(d Formatter) {
 
-	d.Cover("dicomqr", "User Manual  v1.20.1",
+	d.Cover("dicomqr", "User Manual  v1.21.0",
 		time.Now().Format("January 2, 2006"),
 		"A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.")
 
@@ -714,7 +714,7 @@ func buildContent(d Formatter) {
 	d.Code("Retrieved N files successfully")
 	d.P("If one or more targets encountered a recoverable DICOM error (for example, a warning status from the PACS indicating that some sub-operations failed), the status bar shows the number of files received alongside the number of targets that had problems:")
 	d.Code("Retrieved N files (X/Y targets had errors — see log)")
-	d.P("In this case a dialog also appears offering to retry only the failed targets. Accepting re-runs the retrieve loop for just those items, leaving already-retrieved files in place. Details of the errors are written to `dicom.log` in `%USERPROFILE%\\.dicomqr\\`. The log records the full DICOM protocol exchange — association negotiation (each presentation context with the offered and chosen transfer syntaxes, and any rejections), every PDU, and per-file receipt — and the two previous sessions are kept as `dicom.log.1` and `dicom.log.2`, so evidence of a failed or stalled transfer survives an application restart.")
+	d.P("In this case a dialog also appears offering to retry only the failed targets. Accepting re-runs the retrieve loop for just those items, leaving already-retrieved files in place. Details of the errors are written to `dicom.log` in `%USERPROFILE%\\.dicomqr\\`. The log records the DICOM protocol exchange — association negotiation (each presentation context with the offered and chosen transfer syntaxes, and any rejections), every DICOM message, and per-file receipt — and the two previous sessions are kept as `dicom.log.1` and `dicom.log.2`, so evidence of a failed or stalled transfer survives an application restart. For a deeper protocol investigation, starting dicomqr with the environment variable `DICOMQR_DICOMLOG_LEVEL=3` also records every network packet (PDU) and each step of the connection's state — too much to leave on routinely, since it slows large transfers.")
 	d.P("When the profile requires a specific transfer syntax, the completion status also accounts for objects that could not be obtained in it — the retrieve continues past them rather than aborting. Files that arrived in a different syntax and were converted locally are counted as '(N converted locally to …)'. An object that arrives but cannot be converted (for example a screenshot or vendor graphic whose pixel data has no built-in decoder) is skipped — it never reaches the download folder — and the status appends '— N unconvertible object(s) skipped, see Activity Log'. An object the server could not deliver in any negotiable syntax appends '— N not delivered by the server, see Activity Log'. Each skipped or undelivered object is logged with its SOP Instance UID and series so it can be identified afterwards, and every file that does reach the download folder is guaranteed to be in the required syntax. Only when the server delivers nothing at all in a negotiable syntax (zero files received) does an error dialog appear, naming the required syntax and recommending the 'As stored' setting for that server.")
 
 	d.H2("7.5  Cancelling a Retrieve")
@@ -1093,7 +1093,7 @@ func buildContent(d Formatter) {
 	d.P("The status bar at the bottom of the window provides real-time feedback. A coloured LED indicator (gray / amber / green) precedes the status text.")
 	d.Table([]Row{
 		{"Situation", "Status bar text"},
-		{"Application started, not connected", "`v1.20.1`"},
+		{"Application started, not connected", "`v1.21.0`"},
 		{"Connecting to server", "`Connecting…`"},
 		{"Connected", "`Connected: <AE>@<host>:<port>`"},
 		{"Connection cancelled", "`Connection cancelled`"},

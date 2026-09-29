@@ -1,6 +1,6 @@
 # dicomqr
 
-**User Manual  v1.20.1**
+**User Manual  v1.21.0**
 
 September 29, 2026
 
@@ -297,7 +297,7 @@ If one or more targets encountered a recoverable DICOM error (for example, a war
 Retrieved N files (X/Y targets had errors — see log)
 ```
 
-In this case a dialog also appears offering to retry only the failed targets. Accepting re-runs the retrieve loop for just those items, leaving already-retrieved files in place. Details of the errors are written to `dicom.log` in `%USERPROFILE%\.dicomqr\`. The log records the full DICOM protocol exchange — association negotiation (each presentation context with the offered and chosen transfer syntaxes, and any rejections), every PDU, and per-file receipt — and the two previous sessions are kept as `dicom.log.1` and `dicom.log.2`, so evidence of a failed or stalled transfer survives an application restart.
+In this case a dialog also appears offering to retry only the failed targets. Accepting re-runs the retrieve loop for just those items, leaving already-retrieved files in place. Details of the errors are written to `dicom.log` in `%USERPROFILE%\.dicomqr\`. The log records the DICOM protocol exchange — association negotiation (each presentation context with the offered and chosen transfer syntaxes, and any rejections), every DICOM message, and per-file receipt — and the two previous sessions are kept as `dicom.log.1` and `dicom.log.2`, so evidence of a failed or stalled transfer survives an application restart. For a deeper protocol investigation, starting dicomqr with the environment variable `DICOMQR_DICOMLOG_LEVEL=3` also records every network packet (PDU) and each step of the connection's state — too much to leave on routinely, since it slows large transfers.
 
 When the profile requires a specific transfer syntax, the completion status also accounts for objects that could not be obtained in it — the retrieve continues past them rather than aborting. Files that arrived in a different syntax and were converted locally are counted as '(N converted locally to …)'. An object that arrives but cannot be converted (for example a screenshot or vendor graphic whose pixel data has no built-in decoder) is skipped — it never reaches the download folder — and the status appends '— N unconvertible object(s) skipped, see Activity Log'. An object the server could not deliver in any negotiable syntax appends '— N not delivered by the server, see Activity Log'. Each skipped or undelivered object is logged with its SOP Instance UID and series so it can be identified afterwards, and every file that does reach the download folder is guaranteed to be in the required syntax. Only when the server delivers nothing at all in a negotiable syntax (zero files received) does an error dialog appear, naming the required syntax and recommending the 'As stored' setting for that server.
 
@@ -851,7 +851,7 @@ The status bar at the bottom of the window provides real-time feedback. A colour
 
 | Situation | Status bar text |
 |---|---|
-| Application started, not connected | `v1.20.1` |
+| Application started, not connected | `v1.21.0` |
 | Connecting to server | `Connecting…` |
 | Connected | `Connected: <AE>@<host>:<port>` |
 | Connection cancelled | `Connection cancelled` |
