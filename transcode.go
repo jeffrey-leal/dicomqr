@@ -8,6 +8,7 @@ import (
 	"image/color"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -122,10 +123,14 @@ func datasetTransferSyntaxUID(ds *sdicom.Dataset) string {
 // no built-in decoder or a frame fails to decode. ds is left partially modified
 // on an error path, so callers must discard it rather than write it out.
 //
+// tokens is the modification run's CPU-token set (see forEachFrame), letting a
+// multi-frame file decode on the run's idle cores; nil decodes frame by frame
+// on the caller, which is what the receive path does.
+//
 // This is the whole conversion: transcodeDICOMFileToTemp wraps it in file I/O
 // for the receive path, and processFile calls it directly on the dataset it has
 // already transformed.
-func convertDatasetSyntax(ds *sdicom.Dataset, sourceTS, targetTS string) (bool, error) {
+func convertDatasetSyntax(ds *sdicom.Dataset, sourceTS, targetTS string, tokens cpuTokens) (bool, error) {
 	if sourceTS == "" {
 		return false, errors.New("cannot determine transfer syntax")
 	}
@@ -147,7 +152,7 @@ func convertDatasetSyntax(ds *sdicom.Dataset, sourceTS, targetTS string) (bool, 
 			return false, errors.New("unexpected PixelData value type")
 		}
 		if info.IsEncapsulated {
-			newInfo, colorOut, decErr := decompressPixelData(ds, info, sourceTS)
+			newInfo, colorOut, decErr := decompressPixelData(ds, info, sourceTS, tokens)
 			if decErr != nil {
 				return false, decErr
 			}
@@ -225,7 +230,7 @@ func transcodeDICOMFileToTemp(path, targetTS, tmpDir string) (string, bool, erro
 	if err != nil {
 		return "", false, fmt.Errorf("parse: %w", err)
 	}
-	if _, err := convertDatasetSyntax(&ds, tsUID, targetTS); err != nil {
+	if _, err := convertDatasetSyntax(&ds, tsUID, targetTS, nil); err != nil {
 		return "", false, err
 	}
 
@@ -273,7 +278,7 @@ func mergeEncapsulatedFragments(frames []*frame.Frame) (*frame.Frame, error) {
 // decompressPixelData converts encapsulated frames to native frames. colorOut
 // reports whether any frame decoded to colour (the caller then rewrites the
 // Photometric Interpretation as RGB).
-func decompressPixelData(ds *sdicom.Dataset, info sdicom.PixelDataInfo, tsUID string) (sdicom.PixelDataInfo, bool, error) {
+func decompressPixelData(ds *sdicom.Dataset, info sdicom.PixelDataInfo, tsUID string, tokens cpuTokens) (sdicom.PixelDataInfo, bool, error) {
 	bitsAlloc := datasetInt(ds, tag.BitsAllocated, 16)
 	numberOfFrames := datasetInt(ds, tag.NumberOfFrames, 1)
 
@@ -292,29 +297,38 @@ func decompressPixelData(ds *sdicom.Dataset, info sdicom.PixelDataInfo, tsUID st
 		return info, false, fmt.Errorf("%d fragments for %d frames — cannot map fragments to frames", len(encFrames), numberOfFrames)
 	}
 
-	colorOut := false
-	newFrames := make([]*frame.Frame, 0, len(encFrames))
-	for i, fr := range encFrames {
+	for _, fr := range encFrames {
 		if fr == nil || !fr.IsEncapsulated() {
 			return info, false, errors.New("mixed native and encapsulated frames")
 		}
+	}
+	// Frames decode independently, so a multi-frame file spreads across
+	// whichever of the run's cores are idle (see forEachFrame); each frame
+	// writes only its own slot, so the order is the file's own.
+	newFrames := make([]*frame.Frame, len(encFrames))
+	isColor := make([]bool, len(encFrames))
+	err := forEachFrame(tokens, len(encFrames), func(i int) error {
+		fr := encFrames[i]
 		var nf frame.INativeFrame
-		var isColor bool
 		var err error
 		switch {
 		case isJPEG2000TransferSyntax(tsUID):
-			nf, isColor, err = j2kFrameToNative(fr.EncapsulatedData.Data, bitsAlloc)
+			nf, isColor[i], err = j2kFrameToNative(fr.EncapsulatedData.Data, bitsAlloc)
 		case isJPEGLosslessTransferSyntax(tsUID):
-			nf, isColor, err = jpegLosslessFrameToNative(fr.EncapsulatedData.Data, bitsAlloc)
+			nf, isColor[i], err = jpegLosslessFrameToNative(fr.EncapsulatedData.Data, bitsAlloc)
 		default:
-			nf, isColor, err = jpegFrameToNative(fr, bitsAlloc)
+			nf, isColor[i], err = jpegFrameToNative(fr, bitsAlloc)
 		}
 		if err != nil {
-			return info, false, fmt.Errorf("frame %d: %w", i+1, err)
+			return fmt.Errorf("frame %d: %w", i+1, err)
 		}
-		colorOut = colorOut || isColor
-		newFrames = append(newFrames, &frame.Frame{Encapsulated: false, NativeData: nf})
+		newFrames[i] = &frame.Frame{Encapsulated: false, NativeData: nf}
+		return nil
+	})
+	if err != nil {
+		return info, false, err
 	}
+	colorOut := slices.Contains(isColor, true)
 	return sdicom.PixelDataInfo{Frames: newFrames, IsEncapsulated: false}, colorOut, nil
 }
 

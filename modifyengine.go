@@ -81,6 +81,12 @@ type modifyParams struct {
 	// masking may force a decompression the profile did not ask for.
 	maskRegions []MaskRegion
 	mayMask     bool
+	// frameTokens is run state, not profile: the CPU-token set
+	// runModificationImpl creates for each run and sets on its own copy of the
+	// params, through which a multi-frame file's decode and re-encode borrow the
+	// run's idle cores (frameparallel.go). Nil — compileModifyParams' output,
+	// and every caller outside a run — processes frames one at a time.
+	frameTokens cpuTokens
 	// dicomdir requests a DICOMDIR (PS3.10 File-set) index alongside the
 	// export — one per run, referencing every file actually written, built
 	// from dicomdirSource records the run collects as files succeed. Unlike
@@ -698,7 +704,16 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 	}
 
 	cpuHeavy := zsink != nil || params.mayMask || params.targetTS != ""
-	numWorkers := modifyWorkerCount(cpuHeavy, len(files))
+	// allowance is how much of the machine the run may use; there are never
+	// more workers than files, but the CPU tokens (frameparallel.go) number
+	// the full allowance — a worker holds one while it processes a file, and
+	// frame-by-frame work borrows any left free. So a run of one large file,
+	// or the large file left alone at the end of a run, spreads its frames
+	// across the cores no other file is using, and nothing ever exceeds the
+	// allowance at once.
+	allowance := modifyWorkerCount(cpuHeavy, math.MaxInt32)
+	numWorkers := min(allowance, max(1, len(files)))
+	params.frameTokens = newCPUTokens(allowance)
 
 	// Every run is admitted by weight as well as by count, so a wider pool can
 	// never mean more memory than the budget (sysmem.go) allows. A file's weight
@@ -821,6 +836,9 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 					// a moment later, and inventing a weight for a file we
 					// cannot read would be worse than not gating it.
 					defer budget.acquire(fileWeight(path, srcFile))()
+					// The token is taken after the budget admits the file, so a
+					// worker waiting on memory lends its core to frame work.
+					defer params.frameTokens.hold()()
 					skipped, ds, notes, perr := processFileFn(srcFile, params, uidRemap)
 					if perr != nil {
 						recordFailure(path, fmt.Errorf("process: %w", perr))
@@ -1546,7 +1564,7 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 	// no built-in decoder fails the file rather than exporting it in a syntax
 	// the profile did not ask for.
 	if p.targetTS != "" {
-		if _, err := convertDatasetSyntax(&ds, datasetTransferSyntaxUID(&ds), p.targetTS); err != nil {
+		if _, err := convertDatasetSyntax(&ds, datasetTransferSyntaxUID(&ds), p.targetTS, p.frameTokens); err != nil {
 			return false, ds, notes, fmt.Errorf("convert to %s: %w", transferSyntaxLabel(p.targetTS), err)
 		}
 	}
@@ -1579,7 +1597,7 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 		var snap *pixelStateSnapshot
 		if encapsulatedPixelData(&ds) {
 			s := snapshotPixelState(&ds)
-			if _, err := convertDatasetSyntax(&ds, s.sourceTS, tsExplicitVRLE); err != nil {
+			if _, err := convertDatasetSyntax(&ds, s.sourceTS, tsExplicitVRLE, p.frameTokens); err != nil {
 				return false, ds, notes, fmt.Errorf("decompress for pixel masking: %w", err)
 			}
 			snap = &s
@@ -1601,7 +1619,7 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 				}
 				notes.maskDecompressed = false
 			} else if target, ok := recompressTargetFor(snap.sourceTS); ok {
-				if rerr := recompressPixelData(&ds, *snap, target); rerr != nil {
+				if rerr := recompressPixelData(&ds, *snap, target, p.frameTokens); rerr != nil {
 					// Fall back to the uncompressed export; the worker logs
 					// this and maskDecompressed keeps it in the summary.
 					notes.maskRecompressErr = fmt.Sprintf("recompress to %s: %v",

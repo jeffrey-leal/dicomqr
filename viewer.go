@@ -312,17 +312,13 @@ func buildAnnObjects(ann imageAnnotations, idx, total int) []fyne.CanvasObject {
 func extractAnnotationsFromDataset(ds sdicom.Dataset) imageAnnotations {
 	var ann imageAnnotations
 
-	str := func(t tag.Tag) string {
-		e, err := ds.FindElementByTag(t)
-		if err != nil {
-			return ""
-		}
-		strs := sdicom.MustGetStrings(e.Value)
-		if len(strs) == 0 {
-			return ""
-		}
-		return strings.TrimSpace(strs[0])
-	}
+	// Every value below is read with a checked type assertion (datasetString,
+	// datasetStrings, datasetInt), never sdicom.MustGet*: those panic when a tag
+	// arrives under an unexpected VR, and this runs after the parse has
+	// returned — outside safeParseFile's recover, and usually on a worker
+	// goroutine (clip buffer, filmstrip, slice loader), where a panic ends the
+	// process. A malformed value reads as absent instead.
+	str := func(t tag.Tag) string { return datasetString(&ds, t) }
 
 	// Patient identity
 	ann.patientName = formatDicomPersonName(str(tag.PatientName))
@@ -372,39 +368,33 @@ func extractAnnotationsFromDataset(ds sdicom.Dataset) imageAnnotations {
 			ann.sliceLoc = fmt.Sprintf("Loc: %.1f mm", f)
 		}
 	}
-	if e, err := ds.FindElementByTag(tag.PixelSpacing); err == nil {
-		strs := sdicom.MustGetStrings(e.Value)
-		if len(strs) >= 2 {
-			r, e1 := strconv.ParseFloat(strings.TrimSpace(strs[0]), 64)
-			c, e2 := strconv.ParseFloat(strings.TrimSpace(strs[1]), 64)
-			if e1 == nil && e2 == nil {
-				ann.pixelSpacing = fmt.Sprintf("%.4f × %.4f mm", r, c)
-			}
+	if strs := datasetStrings(&ds, tag.PixelSpacing); len(strs) >= 2 {
+		r, e1 := strconv.ParseFloat(strings.TrimSpace(strs[0]), 64)
+		c, e2 := strconv.ParseFloat(strings.TrimSpace(strs[1]), 64)
+		if e1 == nil && e2 == nil {
+			ann.pixelSpacing = fmt.Sprintf("%.4f × %.4f mm", r, c)
 		}
 	}
 
 	// Orientation markers from ImageOrientationPatient (6 direction cosines)
-	if e, err := ds.FindElementByTag(tag.ImageOrientationPatient); err == nil {
-		strs := sdicom.MustGetStrings(e.Value)
-		if len(strs) == 6 {
-			cos := make([]float64, 6)
-			ok := true
-			for i, s := range strs {
-				v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-				if err != nil {
-					ok = false
-					break
-				}
-				cos[i] = v
+	if strs := datasetStrings(&ds, tag.ImageOrientationPatient); len(strs) == 6 {
+		cos := make([]float64, 6)
+		ok := true
+		for i, s := range strs {
+			v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+			if err != nil {
+				ok = false
+				break
 			}
-			if ok {
-				// Row cosines (cos[0..2]): direction from left→right edge of image.
-				// Col cosines (cos[3..5]): direction from top→bottom edge of image.
-				ann.orientRight = dominantOrientLabel(cos[0], cos[1], cos[2])
-				ann.orientLeft = flipOrientLabel(ann.orientRight)
-				ann.orientBottom = dominantOrientLabel(cos[3], cos[4], cos[5])
-				ann.orientTop = flipOrientLabel(ann.orientBottom)
-			}
+			cos[i] = v
+		}
+		if ok {
+			// Row cosines (cos[0..2]): direction from left→right edge of image.
+			// Col cosines (cos[3..5]): direction from top→bottom edge of image.
+			ann.orientRight = dominantOrientLabel(cos[0], cos[1], cos[2])
+			ann.orientLeft = flipOrientLabel(ann.orientRight)
+			ann.orientBottom = dominantOrientLabel(cos[3], cos[4], cos[5])
+			ann.orientTop = flipOrientLabel(ann.orientBottom)
 		}
 	}
 
@@ -868,17 +858,11 @@ func presetsForModality(mod string) []wlPreset {
 	}
 }
 
-// dicomIntParam reads an integer attribute from a suyashkumar Dataset, returning 0 if absent.
+// dicomIntParam reads an integer attribute from a suyashkumar Dataset, returning
+// 0 if absent or unreadable (datasetInt: checked, and tolerant of an integer
+// stored as text — see extractAnnotationsFromDataset on why never MustGetInts).
 func dicomIntParam(ds sdicom.Dataset, t tag.Tag) int {
-	e, err := ds.FindElementByTag(t)
-	if err != nil {
-		return 0
-	}
-	vals := sdicom.MustGetInts(e.Value)
-	if len(vals) == 0 {
-		return 0
-	}
-	return vals[0]
+	return datasetInt(&ds, t, 0)
 }
 
 // decodeRawPixelFallback decodes raw uncompressed pixel bytes into a decodedFrame
@@ -1197,12 +1181,7 @@ func parseDicomFile(path string) (*parsedDicom, error) {
 		return nil, errors.New("no pixel data in file")
 	}
 
-	transferSyntax := ""
-	if e, err2 := ds.FindElementByTag(tag.TransferSyntaxUID); err2 == nil {
-		if strs := sdicom.MustGetStrings(e.Value); len(strs) > 0 {
-			transferSyntax = strings.TrimSpace(strs[0])
-		}
-	}
+	transferSyntax := datasetString(&ds, tag.TransferSyntaxUID)
 	// Reject encapsulated transfer syntaxes the built-in viewer cannot decode
 	// (JPEG-LS, RLE, lossless JPEG) up front with a clear message instead of a
 	// raw decode error. JPEG 2000 is handled by decodeFrame and is not listed;
@@ -1268,14 +1247,12 @@ func parseDicomFile(path string) (*parsedDicom, error) {
 	}, nil
 }
 
+// The readers below all use checked assertions, never sdicom.MustGet* — see
+// extractAnnotationsFromDataset. A value under an unexpected VR reads as
+// absent, and the image falls back to its default window, rescale and so on.
 func dicomWindowParams(ds sdicom.Dataset) (center, width float64, ok bool) {
-	wcElem, e1 := ds.FindElementByTag(tag.WindowCenter)
-	wwElem, e2 := ds.FindElementByTag(tag.WindowWidth)
-	if e1 != nil || e2 != nil {
-		return 0, 0, false
-	}
-	wcs := sdicom.MustGetStrings(wcElem.Value)
-	wws := sdicom.MustGetStrings(wwElem.Value)
+	wcs := datasetStrings(&ds, tag.WindowCenter)
+	wws := datasetStrings(&ds, tag.WindowWidth)
 	if len(wcs) == 0 || len(wws) == 0 {
 		return 0, 0, false
 	}
@@ -1289,57 +1266,25 @@ func dicomWindowParams(ds sdicom.Dataset) (center, width float64, ok bool) {
 
 func dicomRescaleParams(ds sdicom.Dataset) (slope, intercept float64) {
 	slope = 1.0
-	if e, err := ds.FindElementByTag(tag.RescaleSlope); err == nil {
-		if strs := sdicom.MustGetStrings(e.Value); len(strs) > 0 {
-			if v, err := strconv.ParseFloat(strings.TrimSpace(strs[0]), 64); err == nil {
-				slope = v
-			}
-		}
+	if v, err := strconv.ParseFloat(datasetString(&ds, tag.RescaleSlope), 64); err == nil {
+		slope = v
 	}
-	if e, err := ds.FindElementByTag(tag.RescaleIntercept); err == nil {
-		if strs := sdicom.MustGetStrings(e.Value); len(strs) > 0 {
-			if v, err := strconv.ParseFloat(strings.TrimSpace(strs[0]), 64); err == nil {
-				intercept = v
-			}
-		}
+	if v, err := strconv.ParseFloat(datasetString(&ds, tag.RescaleIntercept), 64); err == nil {
+		intercept = v
 	}
 	return
 }
 
 func dicomPixelRepresentation(ds sdicom.Dataset) int {
-	e, err := ds.FindElementByTag(tag.PixelRepresentation)
-	if err != nil {
-		return 0
-	}
-	vals := sdicom.MustGetInts(e.Value)
-	if len(vals) == 0 {
-		return 0
-	}
-	return vals[0]
+	return datasetInt(&ds, tag.PixelRepresentation, 0)
 }
 
 func dicomBitsAllocated(ds sdicom.Dataset) int {
-	e, err := ds.FindElementByTag(tag.BitsAllocated)
-	if err != nil {
-		return 16
-	}
-	vals := sdicom.MustGetInts(e.Value)
-	if len(vals) == 0 {
-		return 16
-	}
-	return vals[0]
+	return datasetInt(&ds, tag.BitsAllocated, 16)
 }
 
 func dicomPhotometricInterp(ds sdicom.Dataset) string {
-	e, err := ds.FindElementByTag(tag.PhotometricInterpretation)
-	if err != nil {
-		return ""
-	}
-	strs := sdicom.MustGetStrings(e.Value)
-	if len(strs) == 0 {
-		return ""
-	}
-	return strings.TrimSpace(strs[0])
+	return datasetString(&ds, tag.PhotometricInterpretation)
 }
 
 // jpeg2000TransferSyntaxes are the DICOM JPEG 2000 transfer syntax UIDs

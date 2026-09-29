@@ -283,7 +283,7 @@ func TestConvertDatasetSyntax(t *testing.T) {
 
 	t.Run("already in target is a no-op", func(t *testing.T) {
 		ds := load(t)
-		changed, err := convertDatasetSyntax(&ds, tsExplicitVRLE, tsExplicitVRLE)
+		changed, err := convertDatasetSyntax(&ds, tsExplicitVRLE, tsExplicitVRLE, nil)
 		if err != nil {
 			t.Fatalf("convertDatasetSyntax: %v", err)
 		}
@@ -294,7 +294,7 @@ func TestConvertDatasetSyntax(t *testing.T) {
 
 	t.Run("rewrites the meta transfer syntax", func(t *testing.T) {
 		ds := load(t)
-		changed, err := convertDatasetSyntax(&ds, tsExplicitVRLE, tsImplicitVRLE)
+		changed, err := convertDatasetSyntax(&ds, tsExplicitVRLE, tsImplicitVRLE, nil)
 		if err != nil {
 			t.Fatalf("convertDatasetSyntax: %v", err)
 		}
@@ -310,14 +310,14 @@ func TestConvertDatasetSyntax(t *testing.T) {
 		ds := load(t)
 		// The gate is on the source syntax and fires before any decode, so the
 		// fixture's actual pixel encoding is irrelevant here.
-		if _, err := convertDatasetSyntax(&ds, "1.2.840.10008.1.2.4.80", tsExplicitVRLE); err == nil {
+		if _, err := convertDatasetSyntax(&ds, "1.2.840.10008.1.2.4.80", tsExplicitVRLE, nil); err == nil {
 			t.Fatal("JPEG-LS source must be rejected (no built-in decoder)")
 		}
 	})
 
 	t.Run("unknown source syntax is rejected", func(t *testing.T) {
 		ds := load(t)
-		if _, err := convertDatasetSyntax(&ds, "", tsExplicitVRLE); err == nil {
+		if _, err := convertDatasetSyntax(&ds, "", tsExplicitVRLE, nil); err == nil {
 			t.Fatal("an empty source syntax must be an error, not a silent pass-through")
 		}
 	})

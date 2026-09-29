@@ -150,7 +150,7 @@ var encodeMaskedFrame = encodeAndVerifyFrame
 // construction — happens before the first mutation, so on any error the
 // dataset is exactly the decompressed one the caller already knows how to
 // export.
-func recompressPixelData(ds *sdicom.Dataset, snap pixelStateSnapshot, targetTS string) error {
+func recompressPixelData(ds *sdicom.Dataset, snap pixelStateSnapshot, targetTS string, tokens cpuTokens) error {
 	pdElem, err := ds.FindElementByTag(tag.PixelData)
 	if err != nil {
 		return fmt.Errorf("pixel data element: %w", err)
@@ -193,8 +193,14 @@ func recompressPixelData(ds *sdicom.Dataset, snap pixelStateSnapshot, targetTS s
 		signBits = prec
 	}
 
-	encFrames := make([]*frame.Frame, 0, len(info.Frames))
-	for i, fr := range info.Frames {
+	// Each frame encodes and verifies independently — the expensive half of a
+	// masked export — so a multi-frame file spreads across the run's idle
+	// cores (forEachFrame). Every frame still goes through the decode-back
+	// verification in encodeMaskedFrame, and any frame failing fails the file
+	// exactly as the serial loop did, reporting the lowest-numbered one.
+	encFrames := make([]*frame.Frame, len(info.Frames))
+	err = forEachFrame(tokens, len(info.Frames), func(i int) error {
+		fr := info.Frames[i]
 		if fr == nil || fr.IsEncapsulated() {
 			return fmt.Errorf("frame %d is not native", i+1)
 		}
@@ -215,10 +221,14 @@ func recompressPixelData(ds *sdicom.Dataset, snap pixelStateSnapshot, targetTS s
 		if len(data)%2 != 0 {
 			data = append(data, 0)
 		}
-		encFrames = append(encFrames, &frame.Frame{
+		encFrames[i] = &frame.Frame{
 			Encapsulated:     true,
 			EncapsulatedData: frame.EncapsulatedFrame{Data: data},
-		})
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	newPD, err := sdicom.NewElement(tag.PixelData, sdicom.PixelDataInfo{

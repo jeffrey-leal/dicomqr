@@ -199,9 +199,12 @@ func TestPlayerStartStopIdempotent(t *testing.T) {
 func TestPlayerDeliversBufferedFramesInOrder(t *testing.T) {
 	test.NewApp() // fyne.Do runs the frame callback inline under the test driver
 
+	// 20 fps rather than faster, so the most one late tick may advance
+	// (cineMaxCatchup's worth, 5 frames) is well short of the 12-frame loop: a
+	// forward skip then stays distinguishable from playing out of order.
 	const frames = 12
 	path := writeMultiframeTestFile(t, t.TempDir(), frames, 1)
-	c := chapter{path: path, frames: frames, fps: 60, loopTo: frames - 1}
+	c := chapter{path: path, frames: frames, fps: 20, loopTo: frames - 1}
 	buf := startClipBuffer(c, nil)
 	waitForBuffer(t, buf)
 
@@ -225,8 +228,9 @@ func TestPlayerDeliversBufferedFramesInOrder(t *testing.T) {
 	mu.Unlock()
 
 	if len(got) < 3 {
-		t.Fatalf("only %d frames delivered in 300ms at 60 fps: %v", len(got), got)
+		t.Fatalf("only %d frames delivered in 300ms at 20 fps: %v", len(got), got)
 	}
+	maxStep := int((cineMaxCatchup + frameInterval(c.fps) - 1) / frameInterval(c.fps))
 	for i, frame := range got {
 		if frame < 0 || frame >= frames {
 			t.Fatalf("delivered frame %d is outside the clip", frame)
@@ -235,10 +239,14 @@ func TestPlayerDeliversBufferedFramesInOrder(t *testing.T) {
 			t.Errorf("delivered frame %d was never buffered", frame)
 		}
 		if i > 0 {
-			// Forward playback advances by one, or wraps to the start.
+			// Forward playback advances, wrapping at the end. Usually by one
+			// frame, but the player turns elapsed time into frames, so a tick
+			// that arrives late (a loaded test machine) legitimately advances
+			// by several — up to maxStep. What must never happen is a step
+			// backwards, which modulo the loop reads as more than maxStep.
 			prev := got[i-1]
-			if frame != (prev+1)%frames {
-				t.Errorf("frame %d followed %d: playback must advance in order", frame, prev)
+			if step := (frame - prev + frames) % frames; step < 1 || step > maxStep {
+				t.Errorf("frame %d followed %d: a step of %d, want forward by 1..%d", frame, prev, step, maxStep)
 			}
 		}
 	}
