@@ -1754,3 +1754,50 @@ func TestValidateExportFolderName(t *testing.T) {
 		}
 	}
 }
+
+// The ignoresopclass filter skips by SOP Class UID: the test file is a
+// Secondary Capture object labelled with an imaging modality, which is exactly
+// the shape of a scanned document the ImageType and Modality filters miss.
+func TestRunModificationIgnoreSOPClass(t *testing.T) {
+	const sc = "1.2.840.10008.5.1.4.1.1.7"
+	run := func(t *testing.T, p ModProfile, modality string) modifyResult {
+		t.Helper()
+		params, err := compileModifyParams(p)
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		rootDir := t.TempDir()
+		srcPath := filepath.Join(rootDir, "sc.dcm")
+		writeModifyTestDICOMModality(t, srcPath, modality)
+		return runModification(context.Background(), []string{srcPath}, rootDir, t.TempDir(), params, nil, nil)
+	}
+
+	// Profile-wide: the listed class is skipped, an unlisted one is processed.
+	if res := run(t, ModProfile{IgnoreSOPClasses: []string{sc}}, "CT"); res.Skipped != 1 || res.Processed != 0 || res.Failed != 0 {
+		t.Errorf("profile-wide filter: %+v, want the file skipped", res)
+	}
+	if res := run(t, ModProfile{Sets: []string{"0010,0010=ANON"}, IgnoreSOPClasses: []string{"1.2.840.10008.5.1.4.1.1.2"}}, "CT"); res.Processed != 1 || res.Skipped != 0 {
+		t.Errorf("unlisted class: %+v, want the file processed", res)
+	}
+
+	// Per-modality: the CT override's list reaches a CT file and not an MR one.
+	perMod := ModProfile{
+		Sets:        []string{"0010,0010=ANON"},
+		PerModality: map[string]ModProfile{"CT": {IgnoreSOPClasses: []string{sc}}},
+	}
+	if res := run(t, perMod, "CT"); res.Skipped != 1 || res.Processed != 0 {
+		t.Errorf("CT override on a CT file: %+v, want skipped", res)
+	}
+	if res := run(t, perMod, "MR"); res.Processed != 1 || res.Skipped != 0 {
+		t.Errorf("CT override on an MR file: %+v, want processed", res)
+	}
+
+	// A malformed entry is refused at compile time rather than matching nothing.
+	if _, err := compileModifyParams(ModProfile{IgnoreSOPClasses: []string{"SC"}}); err == nil || !strings.Contains(err.Error(), "not a UID") {
+		t.Errorf("compile accepted a non-UID entry: %v", err)
+	}
+	if _, err := compileModifyParams(ModProfile{Sets: []string{"0010,0010=ANON"},
+		PerModality: map[string]ModProfile{"CT": {IgnoreSOPClasses: []string{"SC"}}}}); err == nil || !strings.Contains(err.Error(), "modality CT") {
+		t.Errorf("compile accepted a non-UID override entry: %v", err)
+	}
+}

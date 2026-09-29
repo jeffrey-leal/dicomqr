@@ -47,12 +47,12 @@ func TestClipBufferHoldsEveryFrame(t *testing.T) {
 			continue
 		}
 		df := b.frame(i)
-		if df == nil || len(df.gray) != 4 {
+		if df == nil || len(df.displayValues()) != 4 {
 			t.Errorf("frame %d did not decode to a 2×2 frame: %+v", i, df)
 			continue
 		}
 		// writeMultiframeTestFile marks each frame with 40+index.
-		if got, want := int(df.gray[3]), 40+i; got != want {
+		if got, want := int(df.displayValues()[3]), 40+i; got != want {
 			t.Errorf("frame %d holds marker %d, want %d", i, got, want)
 		}
 	}

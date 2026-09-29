@@ -465,6 +465,7 @@ func TestModProfileEditPreservesUneditedFields(t *testing.T) {
 			Verbose:          true,
 			IgnoreTypes:      []string{"SECONDARY"},
 			IgnoreModalities: []string{"SR", "PR"},
+			IgnoreSOPClasses: []string{"1.2.840.10008.5.1.4.1.1.7"},
 			PerModality: map[string]ModProfile{
 				"CT": {Removes: []string{"0018,1030"}},
 			},
@@ -492,6 +493,9 @@ func TestModProfileEditPreservesUneditedFields(t *testing.T) {
 		!reflect.DeepEqual(got.IgnoreModalities, []string{"SR", "PR"}) {
 		t.Errorf("ignore filters lost: types %v modalities %v", got.IgnoreTypes, got.IgnoreModalities)
 	}
+	if !reflect.DeepEqual(got.IgnoreSOPClasses, []string{"1.2.840.10008.5.1.4.1.1.7"}) {
+		t.Errorf("ignoresopclass lost: %v", got.IgnoreSOPClasses)
+	}
 	if !reflect.DeepEqual(got.PerModality, cfg["full"].PerModality) {
 		t.Errorf("per-modality overrides lost: %+v", got.PerModality)
 	}
@@ -512,5 +516,25 @@ func TestDefaultSettingsExportFormat(t *testing.T) {
 	}
 	if s.ModifyOutputDir != "" {
 		t.Errorf("default modifyOutputDir = %q, want empty", s.ModifyOutputDir)
+	}
+}
+
+// ignoresopclass merges like its sibling filters — union with the base,
+// deduplicated — and survives inside a per-modality override.
+func TestMergeUnionsIgnoreSOPClasses(t *testing.T) {
+	base := ModProfile{IgnoreSOPClasses: []string{"1.2.840.10008.5.1.4.1.1.7"}}
+	override := ModProfile{
+		IgnoreSOPClasses: []string{" 1.2.840.10008.5.1.4.1.1.7", "1.2.840.10008.5.1.4.1.1.104.1"},
+		PerModality:      map[string]ModProfile{"ct": {IgnoreSOPClasses: []string{"1.2.840.10008.5.1.4.1.1.7.4"}}},
+	}
+	got := mergeModProfiles(base, override)
+	if want := []string{"1.2.840.10008.5.1.4.1.1.7", "1.2.840.10008.5.1.4.1.1.104.1"}; !reflect.DeepEqual(got.IgnoreSOPClasses, want) {
+		t.Errorf("IgnoreSOPClasses = %v, want %v", got.IgnoreSOPClasses, want)
+	}
+	if want := []string{"1.2.840.10008.5.1.4.1.1.7.4"}; !reflect.DeepEqual(got.PerModality["CT"].IgnoreSOPClasses, want) {
+		t.Errorf("CT override IgnoreSOPClasses = %v, want %v", got.PerModality["CT"].IgnoreSOPClasses, want)
+	}
+	if merged := mergeModProfiles(ModProfile{}, ModProfile{}); merged.IgnoreSOPClasses != nil {
+		t.Errorf("empty merge produced %#v, want nil", merged.IgnoreSOPClasses)
 	}
 }

@@ -151,13 +151,18 @@ func TestCatalogUpsertMeta(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := upsertMeta(tx, m); err != nil {
-		t.Fatalf("upsertMeta: %v", err)
+	u, err := newMetaUpserter(tx)
+	if err != nil {
+		t.Fatalf("newMetaUpserter: %v", err)
+	}
+	if err := u.upsert(m); err != nil {
+		t.Fatalf("upsert: %v", err)
 	}
 	// Upserting the same file again must not duplicate anything.
-	if err := upsertMeta(tx, m); err != nil {
-		t.Fatalf("upsertMeta(again): %v", err)
+	if err := u.upsert(m); err != nil {
+		t.Fatalf("upsert(again): %v", err)
 	}
+	u.close()
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
@@ -172,6 +177,45 @@ func TestCatalogUpsertMeta(t *testing.T) {
 	}
 	if series[0].numInstances != 1 {
 		t.Fatalf("numInstances = %d, want 1", series[0].numInstances)
+	}
+}
+
+// The upserter skips parent rows it has already written in the batch. That
+// must be invisible: the first file's patient, study and series metadata still
+// wins — within one batch, and against a later batch — and every file of the
+// series is still indexed.
+func TestCatalogUpsertMetasFirstWriteWins(t *testing.T) {
+	c, dir := openTestCatalog(t)
+	file := func(name, studyDesc, seriesDesc string) fileMeta {
+		return fileMeta{
+			path: filepath.Join(dir, name), patientName: "DOE^JANE", patientID: "MRN1",
+			studyUID: "1.2.3", studyDesc: studyDesc,
+			seriesUID: "1.2.3.1", modality: "CT", seriesNumber: "1", seriesDesc: seriesDesc,
+		}
+	}
+	if n := c.upsertMetas([]fileMeta{
+		file("a.dcm", "FIRST STUDY", "FIRST SERIES"),
+		file("b.dcm", "SECOND STUDY", "SECOND SERIES"),
+		file("c.dcm", "THIRD STUDY", "THIRD SERIES"),
+	}); n != 3 {
+		t.Fatalf("first batch wrote %d rows, want 3", n)
+	}
+	if n := c.upsertMetas([]fileMeta{file("d.dcm", "LATER STUDY", "LATER SERIES")}); n != 1 {
+		t.Fatalf("second batch wrote %d rows, want 1", n)
+	}
+
+	studies, series, files, err := c.load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(studies) != 1 || studies[0].studyDesc != "FIRST STUDY" {
+		t.Errorf("studies = %+v, want one, described by the first file", studies)
+	}
+	if len(series) != 1 || series[0].seriesDesc != "FIRST SERIES" {
+		t.Errorf("series = %+v, want one, described by the first file", series)
+	}
+	if got := len(files["1.2.3.1"]); got != 4 {
+		t.Errorf("series holds %d files, want all 4", got)
 	}
 }
 

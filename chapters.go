@@ -18,6 +18,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"unicode"
 
 	sdicom "github.com/suyashkumar/dicom"
@@ -101,34 +103,102 @@ func totalChapterFrames(chapters []chapter) int {
 	return total
 }
 
-// scanChapters reads each file's header — pixel data skipped — and builds one
-// chapter per file, ordered by InstanceNumber, reporting progress after each.
+// scanChapters reads each file's header — pixel data never read, see
+// readDicomHeader — and builds one chapter per file, ordered by InstanceNumber.
 // This is the same single header pass the viewer already needed to order a
 // series, so chapter information costs nothing extra.
+//
+// Files are read on the scan worker pool (scanWorkers): a header read is a seek
+// and a few KB, so like the folder scan this is bound by disk latency, which
+// overlapping reads hide. Each worker writes its own index and the sort below is
+// stable with a path tie-break, so the result never depends on which worker
+// finished first. progress, when non-nil, is called from one goroutine at
+// scanProgressInterval (see startPacedProgress) and once more with the total at
+// the end — never per file, so a caller may hand it straight to the UI.
 //
 // A file whose header cannot be read becomes a single-frame chapter: one
 // unreadable instance must not cost the user the whole series, and the frame it
 // occupies reports its own load error when selected.
 func scanChapters(paths []string, progress func(done int)) []chapter {
-	chapters := make([]chapter, len(paths))
-	for i, p := range paths {
-		ds, err := safeParseFile(p, nil, sdicom.SkipPixelData())
-		if err != nil {
-			chapters[i] = chapterFromHeader(i, p, nil)
-		} else {
-			chapters[i] = chapterFromHeader(i, p, &ds)
-		}
-		if progress != nil {
-			progress(i + 1)
+	var groupProgress func(done, total int)
+	if progress != nil {
+		groupProgress = func(done, _ int) { progress(done) }
+	}
+	return scanChapterGroups([][]string{paths}, groupProgress)[0]
+}
+
+// scanChapterGroups is scanChapters over several series at once — one result
+// per group, each ordered exactly as scanChapters would order it alone — read on
+// a single worker pool shared by every group rather than a pool per group.
+//
+// That sharing is the point. A pool per series is right for one series, but the
+// study overview scans every series of a study together, and it used to start
+// one goroutine per series, each running its own scanWorkers pool: a 40-series
+// study put 320 header reads in flight at once. On a spinning disk — where
+// scanWorkers is tuned to the queue depth the drive can keep busy — that many
+// competing seeks slows the scan down rather than speeding it up. One pool keeps
+// the whole study at that tuned width however many series it has.
+//
+// progress follows scanChapters' contract (paced, from one goroutine, then once
+// with the total), counting files across every group.
+func scanChapterGroups(groups [][]string, progress func(done, total int)) [][]chapter {
+	type fileRef struct{ group, index int }
+	var files []fileRef
+	out := make([][]chapter, len(groups))
+	for g, paths := range groups {
+		out[g] = make([]chapter, len(paths))
+		for i := range paths {
+			files = append(files, fileRef{g, i})
 		}
 	}
-	sort.SliceStable(chapters, func(i, j int) bool {
-		if chapters[i].instanceNum != chapters[j].instanceNum {
-			return chapters[i].instanceNum < chapters[j].instanceNum
-		}
-		return chapters[i].path < chapters[j].path
-	})
-	return chapters
+	total := len(files)
+
+	var done atomic.Int64
+	var publish func()
+	if progress != nil {
+		publish = func() { progress(int(done.Load()), total) }
+	}
+	stopReporting := startPacedProgress(scanProgressInterval, publish)
+
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range scanWorkers(total) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				n := int(next.Add(1)) - 1
+				if n >= total {
+					return
+				}
+				// Each file has its own slot, so no lock: the index within its
+				// group is also chapterFromHeader's fallback instance number.
+				f := files[n]
+				p := groups[f.group][f.index]
+				if ds, err := readDicomHeader(p); err != nil {
+					out[f.group][f.index] = chapterFromHeader(f.index, p, nil)
+				} else {
+					out[f.group][f.index] = chapterFromHeader(f.index, p, &ds)
+				}
+				done.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	stopReporting()
+	if progress != nil {
+		progress(total, total)
+	}
+
+	for _, chapters := range out {
+		sort.SliceStable(chapters, func(i, j int) bool {
+			if chapters[i].instanceNum != chapters[j].instanceNum {
+				return chapters[i].instanceNum < chapters[j].instanceNum
+			}
+			return chapters[i].path < chapters[j].path
+		})
+	}
+	return out
 }
 
 // chapterFromHeader builds one chapter from an already-parsed header. Split out

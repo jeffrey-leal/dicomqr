@@ -101,10 +101,10 @@ func writeMultiframeTestFile(t *testing.T, dir string, nFrames, instanceNumber i
 // writeMultiframeTestFile, i.e. 40 + the frame index it holds.
 func frameMarker(t *testing.T, vs viewerState) int {
 	t.Helper()
-	if vs.frame == nil || len(vs.frame.gray) != 4 {
+	if vs.frame == nil || len(vs.frame.displayValues()) != 4 {
 		t.Fatalf("frame not decoded as a 2×2 grayscale frame: %+v", vs.frame)
 	}
-	return int(vs.frame.gray[3])
+	return int(vs.frame.displayValues()[3])
 }
 
 func TestLoadDicomImageManyFrames(t *testing.T) {
@@ -339,7 +339,7 @@ func TestSampleMultiframeFile(t *testing.T) {
 		if vs.img == nil {
 			t.Fatalf("frameState(%d) returned no image", i)
 		}
-		gray := vs.frame.gray
+		gray := vs.frame.displayValues()
 		if prev != nil && len(gray) == len(prev) && !uniform(gray) {
 			same := true
 			for j := range gray {

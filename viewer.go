@@ -6,15 +6,17 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -514,9 +516,19 @@ type viewerState struct {
 // render returns it unchanged.
 type decodedFrame struct {
 	rows, cols int
-	gray       []float32   // rescaled grayscale values, len rows*cols; nil for colour
 	colorImg   image.Image // non-nil for RGB / JPEG-decoded frames (not windowable)
 	invert     bool        // MONOCHROME1 — invert the display ramp
+
+	// Greyscale samples, in one of two forms (see grayframe.go). Usually
+	// indexed: pixel i's stored value is rawBase+rawIdx[i], displayed as
+	// rescaled(rawIdx[i]), and rawSpan is the stored range's size. When the
+	// stored values span more than 65,536, gray holds the rescaled values
+	// directly instead. Both nil for colour.
+	rawIdx           []uint16
+	rawBase          int64
+	rawSpan          int
+	slope, intercept float64
+	gray             []float32
 
 	wc, ww         float64 // default window centre/width (from tags or auto)
 	lo, hi         float64 // full rescaled data range, for the "Full range" preset
@@ -572,7 +584,7 @@ func (d *decodedFrame) render(cm *colorMap, wc, ww float64) image.Image {
 // stable, which is important for flicker-free interactive window/level dragging.
 // *image.RGBA also uploads to the GPU without conversion.
 func (d *decodedFrame) renderInto(dst *image.RGBA, cm *colorMap, wc, ww float64) {
-	if d.gray == nil {
+	if !d.hasSamples() {
 		return
 	}
 	if cm == nil {
@@ -580,6 +592,10 @@ func (d *decodedFrame) renderInto(dst *image.RGBA, cm *colorMap, wc, ww float64)
 	}
 	if ww < 1 {
 		ww = 1
+	}
+	if d.rawIdx != nil {
+		d.renderIndexed(dst, cm, wc, ww)
+		return
 	}
 	lower := wc - ww/2
 	inv := d.invert
@@ -712,17 +728,8 @@ func extractOverlays(ds sdicom.Dataset) []dicomOverlay {
 // for PET/NM and other modalities lacking window tags); failing that, the full
 // data range is used.
 func (d *decodedFrame) computeDefaultWindow(hasWindow bool, wc, ww float64) {
-	lo, hi := math.Inf(1), math.Inf(-1)
-	for _, v := range d.gray {
-		f := float64(v)
-		if f < lo {
-			lo = f
-		}
-		if f > hi {
-			hi = f
-		}
-	}
-	if math.IsInf(lo, 1) {
+	lo, hi, ok := d.grayRange()
+	if !ok {
 		lo, hi = 0, 0
 	}
 	d.lo, d.hi = lo, hi
@@ -731,14 +738,8 @@ func (d *decodedFrame) computeDefaultWindow(hasWindow bool, wc, ww float64) {
 		d.wc, d.ww, d.windowFromTags = wc, ww, true
 		return
 	}
-	if len(d.gray) > 0 && hi > lo {
-		cp := make([]float64, len(d.gray))
-		for i, v := range d.gray {
-			cp[i] = float64(v)
-		}
-		sort.Float64s(cp)
-		n := len(cp)
-		plo, phi := cp[n/100], cp[(n*99)/100]
+	if ok && hi > lo {
+		plo, phi := d.percentiles()
 		if phi > plo {
 			d.wc, d.ww = (plo+phi)/2, phi-plo
 			return
@@ -939,22 +940,24 @@ func decodeRawPixelFallback(data []byte, rows, cols, samplesPerPixel, bitsAlloc 
 		return nil, fmt.Errorf("raw pixel fallback: data too short for grayscale (%d < %d)", len(data), bytesNeeded)
 	}
 
-	gray := make([]float32, pixelsPerFrame)
-	if bitsAlloc <= 8 {
-		for i := 0; i < pixelsPerFrame; i++ {
-			gray[i] = float32(float64(data[i])*slope + intercept)
+	invert := photometric == "MONOCHROME1"
+	var df *decodedFrame
+	switch {
+	case bitsAlloc <= 8:
+		df = newGrayFrame(rows, cols, data[:pixelsPerFrame], slope, intercept, invert)
+	case isSigned:
+		s := make([]int16, pixelsPerFrame)
+		for i := range s {
+			s[i] = int16(binary.LittleEndian.Uint16(data[i*2:]))
 		}
-	} else {
-		for i := 0; i < pixelsPerFrame; i++ {
-			raw := float64(binary.LittleEndian.Uint16(data[i*2:]))
-			if isSigned {
-				raw = float64(int16(binary.LittleEndian.Uint16(data[i*2:])))
-			}
-			gray[i] = float32(raw*slope + intercept)
+		df = newGrayFrame(rows, cols, s, slope, intercept, invert)
+	default:
+		s := make([]uint16, pixelsPerFrame)
+		for i := range s {
+			s[i] = binary.LittleEndian.Uint16(data[i*2:])
 		}
+		df = newGrayFrame(rows, cols, s, slope, intercept, invert)
 	}
-
-	df := &decodedFrame{rows: rows, cols: cols, gray: gray, invert: photometric == "MONOCHROME1"}
 	df.computeDefaultWindow(hasWindow, wc, ww)
 	return df, nil
 }
@@ -991,12 +994,54 @@ func (p *parsedDicom) frameCount() int { return len(p.frames) }
 // display. idx is clamped, so a file whose declared NumberOfFrames overstates
 // what the parser could deliver still shows an image instead of failing.
 func (p *parsedDicom) frameState(idx int) (viewerState, error) {
+	return p.frameStateOpts(idx, frameDecodeOpts{})
+}
+
+// frameDecodeOpts tunes one frame's decode for where the image is going. The
+// zero value — one thread, full resolution — is right for every pool that
+// decodes many frames at once (clip buffer, filmstrip, overview, conversions),
+// which already keep every core busy.
+type frameDecodeOpts struct {
+	// threads lets a codec that can split one image across threads do so —
+	// JPEG 2000, whose code-blocks decode independently. Only for a decode the
+	// user is waiting on, one at a time; see interactiveDecodeOpts.
+	threads int
+	// maxSide > 0 says only an image about this large is needed (a thumbnail),
+	// so a codec that stores several resolutions (JPEG 2000) may decode a
+	// smaller one — never smaller than maxSide on the longer side. The frame
+	// then has the reduced dimensions, and frameStateOpts drops its overlays,
+	// which are in full-resolution coordinates.
+	maxSide int
+	// skipRender leaves viewerState.img nil, for the viewer, whose viewport
+	// windows the frame itself: the still image is never looked at there, and
+	// would cost a render plus 4 bytes a pixel in every cached slice.
+	skipRender bool
+}
+
+// interactiveDecodeOpts is for the frame on screen that the user is waiting on:
+// every core on that one image.
+func interactiveDecodeOpts() frameDecodeOpts {
+	return frameDecodeOpts{threads: runtime.NumCPU()}
+}
+
+// viewerDecodeOpts is interactiveDecodeOpts for the viewer window, which renders
+// through its viewport and never uses the still image.
+func viewerDecodeOpts(interactive bool) frameDecodeOpts {
+	opts := frameDecodeOpts{skipRender: true}
+	if interactive {
+		opts.threads = runtime.NumCPU()
+	}
+	return opts
+}
+
+// frameStateOpts is frameState with decode options (see frameDecodeOpts).
+func (p *parsedDicom) frameStateOpts(idx int, opts frameDecodeOpts) (viewerState, error) {
 	if len(p.frames) == 0 {
 		return viewerState{}, errors.New("no pixel data in file")
 	}
 	f := p.frames[clampInt(idx, 0, len(p.frames)-1)]
 
-	df, err := decodeFrame(f, p.transferSyntax, p.hasWindow, p.wc, p.ww,
+	df, err := decodeFrame(f, opts, p.transferSyntax, p.hasWindow, p.wc, p.ww,
 		p.slope, p.intercept, p.isSigned, p.bitsAlloc, p.photometric)
 
 	// Fallback: some DICOM implementations store uncompressed pixel data with
@@ -1017,13 +1062,19 @@ func (p *parsedDicom) frameState(idx int) (viewerState, error) {
 	}
 
 	df.modality = p.ann.modality
-	df.overlays = p.overlays
+	// Overlay planes are positioned in the file's own pixel grid; a frame
+	// decoded at reduced resolution (a thumbnail) would place them wrongly.
+	if p.rows <= 0 || df.rows == p.rows {
+		df.overlays = p.overlays
+	}
 
 	// Render the still image (thumbnails, initial view) through the modality's
 	// default colour map so NM/PET overviews appear in colour like the viewer.
-	img := df.render(colorMapByName(defaultColorMapForModality(df.modality)), df.wc, df.ww)
-	b := img.Bounds()
-	label := fmt.Sprintf("%d × %d", b.Dx(), b.Dy())
+	var img image.Image
+	if !opts.skipRender {
+		img = df.render(colorMapByName(defaultColorMapForModality(df.modality)), df.wc, df.ww)
+	}
+	label := fmt.Sprintf("%d × %d", df.cols, df.rows)
 	ann := p.ann // copy: windowStr is per-frame
 	if df.windowable() {
 		label += fmt.Sprintf("   W:%.0f  L:%.0f", df.ww, df.wc)
@@ -1058,7 +1109,18 @@ func (c *dicomFileCache) load(path string, frameIdx int) (viewerState, error) {
 		}
 		c.path, c.parsed = path, p
 	}
-	return c.parsed.frameState(frameIdx)
+	// The viewer's on-demand path: one frame, and the user is waiting on it.
+	return c.parsed.frameStateOpts(frameIdx, viewerDecodeOpts(true))
+}
+
+// decodeViewerSlice decodes one slice-mode slice for the viewer: a single-frame
+// file, so parsed afresh — there is nothing to reuse between slices.
+func decodeViewerSlice(key viewerSlice, interactive bool) (viewerState, error) {
+	p, err := parseDicomFile(key.path)
+	if err != nil {
+		return viewerState{}, err
+	}
+	return p.frameStateOpts(key.frame, viewerDecodeOpts(interactive))
 }
 
 // loadDicomImage parses a DICOM file and returns its first frame, windowed and
@@ -1079,6 +1141,18 @@ func loadDicomFrame(path string, frameIdx int) (viewerState, error) {
 		return viewerState{}, err
 	}
 	return p.frameState(frameIdx)
+}
+
+// loadDicomThumbnail is loadDicomFrame for an image that will only be shown
+// about maxSide pixels across: a JPEG 2000 frame decodes at the smallest stored
+// resolution still that large, rather than in full to be scaled down. A large
+// CR or mammogram thumbnail decodes a small fraction of the codestream.
+func loadDicomThumbnail(path string, frameIdx, maxSide int) (viewerState, error) {
+	p, err := parseDicomFile(path)
+	if err != nil {
+		return viewerState{}, err
+	}
+	return p.frameStateOpts(frameIdx, frameDecodeOpts{maxSide: maxSide})
 }
 
 // parseDicomFile reads a DICOM file's frames and the parameters needed to
@@ -1300,10 +1374,10 @@ func isJPEGLosslessTransferSyntax(ts string) bool {
 // handled by the OpenJPEG-backed decoder (decodeJPEG2000Frame), JPEG Lossless
 // by the libjpeg-turbo-backed decoder (decodeJPEGLosslessFrame); other
 // encapsulated syntaxes fall through to the library's JPEG Baseline decoder.
-func decodeFrame(f *frame.Frame, transferSyntax string, hasWindow bool, wc, ww, slope, intercept float64, isSigned bool, bitsAlloc int, photometric string) (*decodedFrame, error) {
+func decodeFrame(f *frame.Frame, opts frameDecodeOpts, transferSyntax string, hasWindow bool, wc, ww, slope, intercept float64, isSigned bool, bitsAlloc int, photometric string) (*decodedFrame, error) {
 	if f.IsEncapsulated() {
 		if isJPEG2000TransferSyntax(transferSyntax) {
-			return decodeJPEG2000Frame(f.EncapsulatedData.Data, slope, intercept, hasWindow, wc, ww, photometric)
+			return decodeJPEG2000Frame(f.EncapsulatedData.Data, opts, slope, intercept, hasWindow, wc, ww, photometric)
 		}
 		if isJPEGLosslessTransferSyntax(transferSyntax) {
 			return decodeJPEGLosslessFrame(f.EncapsulatedData.Data, slope, intercept, hasWindow, wc, ww, photometric, isSigned)
@@ -1355,20 +1429,20 @@ func decodeFrame(f *frame.Frame, transferSyntax string, hasWindow bool, wc, ww, 
 		return &decodedFrame{rows: rows, cols: cols, colorImg: img}, nil
 	}
 
-	// --- Grayscale (1 sample per pixel): rescale into a float buffer ---
-	gray := make([]float32, rows*cols)
+	// --- Grayscale (1 sample per pixel): the stored values, see grayframe.go ---
+	invert := photometric == "MONOCHROME1"
+	var df *decodedFrame
 	switch data := rawData.(type) {
 	case []uint8:
-		for i, v := range data {
-			gray[i] = float32(float64(v)*slope + intercept)
-		}
+		df = newGrayFrame(rows, cols, data, slope, intercept, invert)
 	case []uint16:
-		for i, v := range data {
-			raw := float64(v)
-			if isSigned {
-				raw = float64(int16(v))
-			}
-			gray[i] = float32(raw*slope + intercept)
+		if isSigned {
+			// Same bits read as two's complement — a reinterpretation of the
+			// slice rather than a copy of it.
+			df = newGrayFrame(rows, cols, unsafe.Slice((*int16)(unsafe.Pointer(unsafe.SliceData(data))), len(data)),
+				slope, intercept, invert)
+		} else {
+			df = newGrayFrame(rows, cols, data, slope, intercept, invert)
 		}
 	default:
 		img2, err := nf.GetImage()
@@ -1377,8 +1451,6 @@ func decodeFrame(f *frame.Frame, transferSyntax string, hasWindow bool, wc, ww, 
 		}
 		return &decodedFrame{rows: rows, cols: cols, colorImg: img2}, nil
 	}
-
-	df := &decodedFrame{rows: rows, cols: cols, gray: gray, invert: photometric == "MONOCHROME1"}
 	df.computeDefaultWindow(hasWindow, wc, ww)
 	return df, nil
 }
@@ -1502,11 +1574,20 @@ func (b *busyDialog) hide() {
 	fyne.Do(func() { b.dlg.Hide() })
 }
 
+// overviewThumbWorkers is how many series thumbnails the study overview decodes
+// at once. Four, matching the modification engine's tag-only cap: each is a full
+// parse and decode of one file, so the limit that matters is cores and memory —
+// a multi-frame SPECT or echo file parses every frame to show one — not disk
+// queue depth, which is what the eight header-scan workers are sized for.
+func overviewThumbWorkers(n int) int {
+	return max(1, min(4, runtime.NumCPU(), n))
+}
+
 // showStudyOverviewWindow opens a grid window showing the middle slice of each
 // series for a study. Each series' paths are sorted by InstanceNumber here —
-// sorting parses every file in the study, so the caller must NOT pre-sort on
-// the UI goroutine — and thumbnails are loaded in parallel while a modal busy
-// dialog over parent reports progress. Double-clicking any thumbnail opens the
+// sorting reads every file's header in the study, so the caller must NOT
+// pre-sort on the UI goroutine — and thumbnails are loaded on bounded pools
+// while a modal busy dialog over parent reports progress. Double-clicking any thumbnail opens the
 // full series viewer for that series.
 // Must be called from a non-UI goroutine.
 func showStudyOverviewWindow(a fyne.App, parent fyne.Window, title string, series []seriesThumb) {
@@ -1522,37 +1603,56 @@ func showStudyOverviewWindow(a fyne.App, parent fyne.Window, title string, serie
 
 	// Busy dialog: large studies take seconds to sort and thumbnail, and
 	// without feedback the app looks hung.
-	busy := showBusyDialog(parent, "Generating study preview",
-		fmt.Sprintf("Loading series previews (0/%d)…", len(series)))
+	busy := showBusyDialog(parent, "Generating study preview", "Reading image headers…")
 
-	// Sort and load the middle slice of every series in parallel. "Middle" is
-	// the middle of the frame list, not of the file list, so a single-file
-	// multi-frame acquisition (NM/SPECT) shows its central slice rather than
-	// its first frame.
-	thumbs := make([]viewerState, len(series))
-	sorted := make([][]chapter, len(series))
-	var loaded atomic.Int32
-	var wg sync.WaitGroup
+	// Two phases, each on a bounded pool — they used to run as one goroutine
+	// per series, each with its own header-scan pool and its own thumbnail
+	// decode, so a study's whole series count set the number of disk reads and
+	// full decodes in flight at once.
+	//
+	// First every series' headers, on the one pool scanChapterGroups shares
+	// across all of them (see there for why a pool per series was wrong).
+	groups := make([][]string, len(series))
 	for i, s := range series {
+		groups[i] = s.paths
+	}
+	sorted := scanChapterGroups(groups, func(done, total int) {
+		busy.setStatus(fmt.Sprintf("Reading image headers (%d/%d)…", done, total))
+	})
+
+	// Then the middle slice of each series. "Middle" is the middle of the
+	// frame list, not of the file list, so a single-file multi-frame
+	// acquisition (NM/SPECT) shows its central slice rather than its first
+	// frame. Each is a full parse and decode of one file — a multi-frame
+	// SPECT file holds its whole acquisition — so these are bounded by CPU and
+	// memory rather than seek latency, and get their own, smaller pool.
+	thumbs := make([]viewerState, len(series))
+	var loaded, next atomic.Int64
+	stopReporting := startPacedProgress(scanProgressInterval, func() {
+		busy.setStatus(fmt.Sprintf("Loading series previews (%d/%d)…", loaded.Load(), len(series)))
+	})
+	var wg sync.WaitGroup
+	for range overviewThumbWorkers(len(series)) {
 		wg.Add(1)
-		i, s := i, s
 		go func() {
 			defer wg.Done()
-			if len(s.paths) > 0 {
-				chapters := scanChapters(s.paths, nil)
-				sorted[i] = chapters
-				if slices := expandFrames(chapters); len(slices) > 0 {
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= len(series) {
+					return
+				}
+				if slices := expandFrames(sorted[i]); len(slices) > 0 {
 					mid := slices[len(slices)/2]
-					vs, err := loadDicomFrame(mid.path, mid.frame)
-					if err == nil {
+					if vs, err := loadDicomThumbnail(mid.path, mid.frame, 2*thumbSide); err == nil {
 						thumbs[i] = vs
 					}
 				}
+				loaded.Add(1)
 			}
-			busy.setStatus(fmt.Sprintf("Loading series previews (%d/%d)…", loaded.Add(1), len(series)))
 		}()
 	}
 	wg.Wait()
+	stopReporting()
 	busy.hide()
 
 	fyne.Do(func() {
@@ -1617,12 +1717,10 @@ func showDicomViewerPaths(a fyne.App, parent fyne.Window, title string, rawPaths
 	total := len(rawPaths)
 	busy := showBusyDialog(parent, "Generating series preview",
 		fmt.Sprintf("Sorting images (0/%d)…", total))
+	// scanChapters paces its own progress (see startPacedProgress), so every
+	// report can go straight to the dialog.
 	chapters := scanChapters(rawPaths, func(done int) {
-		// Throttle updates: one per 50 files is smooth enough and avoids
-		// flooding the UI event queue on multi-thousand-image series.
-		if done%50 == 0 || done == total {
-			busy.setStatus(fmt.Sprintf("Sorting images (%d/%d)…", done, total))
-		}
+		busy.setStatus(fmt.Sprintf("Sorting images (%d/%d)…", done, total))
 	})
 	busy.hide()
 	openViewerWindow(a, title, chapters, nil)
@@ -1680,19 +1778,23 @@ func clampFloat(v, lo, hi float64) float64 {
 //
 // Window/level changes re-render from the cached decodedFrame, so they are cheap
 // and never touch disk. Zoom/pan are implemented by cropping the rendered image
-// (SubImage) so the displayed image always fills the viewport without overflow.
+// (a packed copy of the crop — see cropPacked) so the displayed image always
+// fills the viewport without overflow.
 type imageViewport struct {
 	widget.BaseWidget
 
 	img     *canvas.Image
 	overlay *fyne.Container
 
-	frame  *decodedFrame
-	base   image.Image // frame rendered at current wc/ww/map (full frame, pre-crop)
-	buf    *image.RGBA // reused windowing buffer for grayscale frames (flicker-free drag)
-	curMap *colorMap   // active colour map applied to grayscale frames
-	wc     float64
-	ww     float64
+	frame *decodedFrame
+	base  image.Image // frame rendered at current wc/ww/map (full frame, pre-crop)
+	buf   *image.RGBA // reused windowing buffer for grayscale frames (flicker-free drag)
+	// zoomBuf holds the displayed crop while zoomed in — a packed copy, never a
+	// SubImage of base (see cropPacked). Reused across refreshes of one size.
+	zoomBuf *image.RGBA
+	curMap  *colorMap // active colour map applied to grayscale frames
+	wc      float64
+	ww      float64
 
 	zoom         float64 // 1 = fit; >1 = magnified
 	panCX, panCY float64 // crop centre in source-pixel coordinates
@@ -1888,14 +1990,45 @@ func (v *imageViewport) applyDisplay() {
 	cx := clampInt(int(v.panCX+0.5)-cw/2, b.Min.X, b.Max.X-cw)
 	cy := clampInt(int(v.panCY+0.5)-ch/2, b.Min.Y, b.Max.Y-ch)
 	crop := image.Rect(cx, cy, cx+cw, cy+ch)
-	if sub, ok := v.base.(interface {
-		SubImage(image.Rectangle) image.Image
-	}); ok {
-		v.img.Image = sub.SubImage(crop)
-	} else {
-		v.img.Image = v.base
-	}
+	v.zoomBuf = cropPacked(v.zoomBuf, v.base, crop)
+	v.img.Image = v.zoomBuf
 	v.img.Refresh()
+}
+
+// cropPacked copies the crop rectangle of src into dst — reused when it is
+// already the crop's size, reallocated otherwise — as a tightly packed RGBA
+// whose bounds start at (0,0), and returns it.
+//
+// The crop must be a copy, never src.SubImage(crop). A SubImage shares its
+// parent's pixel buffer: its Pix starts at the crop's first pixel but its rows
+// are still Stride (the full frame's width) apart. Fyne 2.7.3's texture upload
+// (painter/gl imgToTexture) passes an *image.RGBA's Pix straight to
+// glTexImage2D at Rect.Size() with no row-length setting, so it read each row
+// as if it followed the last one directly and the zoomed image sheared; any
+// other image type goes through draw.Draw from image.Point{}, which ignores a
+// SubImage's non-zero origin. Both are satisfied only by an image that starts
+// at (0,0) with Stride == 4 × width.
+//
+// Copying costs one crop's worth of memcpy, at most the displayed pixel count,
+// and saves Fyne converting non-RGBA frames on every refresh. dst is reused for
+// the same reason v.buf is: pan and window/level drags refresh at pointer rate,
+// and a fresh allocation per tick is garbage the display gains nothing from.
+func cropPacked(dst *image.RGBA, src image.Image, crop image.Rectangle) *image.RGBA {
+	crop = crop.Intersect(src.Bounds())
+	w, h := crop.Dx(), crop.Dy()
+	if dst == nil || dst.Rect.Dx() != w || dst.Rect.Dy() != h {
+		dst = image.NewRGBA(image.Rect(0, 0, w, h))
+	}
+	if s, ok := src.(*image.RGBA); ok {
+		rowBytes := w * 4
+		for y := 0; y < h; y++ {
+			off := s.PixOffset(crop.Min.X, crop.Min.Y+y)
+			copy(dst.Pix[y*dst.Stride:y*dst.Stride+rowBytes], s.Pix[off:off+rowBytes])
+		}
+		return dst
+	}
+	draw.Draw(dst, dst.Rect, src, crop.Min, draw.Src)
+	return dst
 }
 
 func (v *imageViewport) refreshOverlay() {
@@ -2136,10 +2269,11 @@ func openViewerWindow(a fyne.App, title string, chapters []chapter, collectErr e
 			current = total / 2 // open at the middle slice
 		}
 
-		// One parsed file is cached for the lifetime of this window, so scrolling
-		// through a multi-frame acquisition decodes a single frame per step
-		// instead of re-parsing the whole file each time. In chapter mode this is
-		// the on-demand path for frames the clip buffer has not reached.
+		// Chapter mode's on-demand path, for frames the clip buffer has not
+		// reached: one parsed file is kept, so scrubbing a multi-frame
+		// acquisition decodes a single frame per step instead of re-parsing the
+		// whole file. Slice mode has its own loader (see loadAndShow), since each
+		// of its files holds one frame and a one-file cache never hits there.
 		cache := &dicomFileCache{}
 
 		viewport := newImageViewport()
@@ -2285,20 +2419,47 @@ func openViewerWindow(a fyne.App, title string, chapters []chapter, collectErr e
 
 		// ── Slice mode display ────────────────────────────────────────────────
 
-		loadAndShow := func(idx int, keepView bool) {
-			counterLbl.SetText(fmt.Sprintf("%d / %d  (loading…)", idx+1, total))
-			go func() {
-				st, err := cache.load(slices[idx].path, slices[idx].frame)
-				postUI(func() {
-					if err != nil {
-						infoLabel.SetText("Error: " + err.Error())
-						counterLbl.SetText(fmt.Sprintf("%d / %d", idx+1, total))
-						return
-					}
-					applyState(st, idx, total, keepView)
-					counterLbl.SetText(fmt.Sprintf("%d / %d", idx+1, total))
+		// Slices come from a loader (sliceloader.go): a cached slice shows at
+		// once, anything else is decoded ahead of the read-ahead and delivered
+		// only if it is still the one on the slider — so a fast scroll neither
+		// queues a decode per step nor comes to rest on a stale slice.
+		// scrollDir is the direction of the last move, which aims the read-ahead;
+		// pendingKeepView belongs to the request awaiting delivery.
+		scrollDir := 1
+		pendingKeepView := false
+		var loader *sliceLoader
+		if !chapterMode {
+			loader = newSliceLoader(sliceCacheBudget, decodeViewerSlice,
+				func(key viewerSlice, st viewerState, err error) {
+					postUI(func() {
+						if current >= len(slices) || slices[current] != key {
+							return // the user has moved on; it waits in the cache
+						}
+						counterLbl.SetText(fmt.Sprintf("%d / %d", current+1, total))
+						if err != nil {
+							infoLabel.SetText("Error: " + err.Error())
+							return
+						}
+						applyState(st, current, total, pendingKeepView)
+					})
 				})
-			}()
+		}
+		loadAndShow := func(idx int, keepView bool) {
+			key := slices[idx]
+			var others [][]viewerSlice
+			for p := range phases {
+				if p != curPhase {
+					others = append(others, phases[p].slices)
+				}
+			}
+			if st, ok := loader.get(key); ok {
+				applyState(st, idx, total, keepView)
+				counterLbl.SetText(fmt.Sprintf("%d / %d", idx+1, total))
+			} else {
+				pendingKeepView = keepView
+				counterLbl.SetText(fmt.Sprintf("%d / %d  (loading…)", idx+1, total))
+			}
+			loader.request(key, sliceReadAhead(slices, idx, scrollDir, others))
 		}
 
 		// ── Phase switching (phased slice mode only) ──────────────────────────
@@ -2578,6 +2739,11 @@ func openViewerWindow(a fyne.App, title string, chapters []chapter, collectErr e
 			if pos == current {
 				return
 			}
+			if pos < current {
+				scrollDir = -1
+			} else {
+				scrollDir = 1
+			}
 			current = pos
 			loadAndShow(pos, true)
 		}
@@ -2757,6 +2923,11 @@ func openViewerWindow(a fyne.App, title string, chapters []chapter, collectErr e
 		// viewer that keeps a ticker and a decode pool running would hold the
 		// process busy for the rest of the session.
 		win.SetOnClosed(func() {
+			if loader != nil {
+				// On its own goroutine: stop waits for a decode in flight, and
+				// this runs on the UI goroutine.
+				go loader.stop()
+			}
 			player.stopPlayback()
 			if clip := clipRef.Load(); clip != nil {
 				clip.cancel()

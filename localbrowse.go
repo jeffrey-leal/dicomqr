@@ -371,25 +371,11 @@ func parseFilesParallel(paths []string, progress func(phase scanPhase, done, tot
 	// split clipBuffer uses. Posting from every worker would put an update in
 	// flight per file, which is what previously buried the tree's own callback
 	// behind hundreds of queued repaints.
-	stopReporting := make(chan struct{})
-	reporterDone := make(chan struct{})
-	if progress != nil && scanProgressInterval > 0 {
-		go func() {
-			defer close(reporterDone)
-			ticker := time.NewTicker(scanProgressInterval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-stopReporting:
-					return
-				case <-ticker.C:
-					progress(scanPhaseRead, int(done.Load()), total)
-				}
-			}
-		}()
-	} else {
-		close(reporterDone)
+	var publish func()
+	if progress != nil {
+		publish = func() { progress(scanPhaseRead, int(done.Load()), total) }
 	}
+	stopReporting := startPacedProgress(scanProgressInterval, publish)
 
 	var next atomic.Int64
 	var wg sync.WaitGroup
@@ -410,8 +396,7 @@ func parseFilesParallel(paths []string, progress func(phase scanPhase, done, tot
 	}
 	wg.Wait()
 
-	close(stopReporting)
-	<-reporterDone
+	stopReporting()
 	// The ticker can miss the end, so close the contract explicitly: the last
 	// thing a caller sees is done == total.
 	if progress != nil {
@@ -620,6 +605,107 @@ func filesForNode(id string, m *resultsModel, seriesFiles map[string][]string) [
 		return paths
 	}
 	return nil
+}
+
+// modificationScope maps a Local Browse selection onto the only two shapes a
+// Modification run has: study-level (every selected node lies within one
+// study — typically a subset of its series) or patient-level (several studies
+// of one patient, or the patient node itself). There is deliberately no
+// series-level run: the export root the user names stands in for the patient
+// folder, or patient+study (see exportLayout), so a subset of series is just
+// a study-level run over fewer files. A selection spanning patients is
+// refused — one export root would merge their folders, and a profile's Set
+// values (a new Patient Name, a Patient ID following it) would give every
+// patient in it the same identity, a de-identification error rather than a
+// layout one. label names the scope for the dialog header, saying how much
+// of it the selection covers when that is not all of it.
+func modificationScope(m *resultsModel, ids []string) (label string, studyLevel bool, err error) {
+	patients := map[string]bool{}
+	studies := map[string]bool{}
+	selected := map[string]bool{}
+	wholePatient := false
+	for _, id := range ids {
+		n, ok := m.nodes[id]
+		if !ok {
+			continue
+		}
+		selected[id] = true
+		switch n.kind {
+		case kindPatient:
+			patients[id] = true
+			wholePatient = true
+		case kindStudy:
+			studies[id] = true
+			patients[n.parentID] = true
+		case kindSeries:
+			studies[n.parentID] = true
+			patients[m.parentOf(n.parentID)] = true
+		}
+	}
+	switch {
+	case len(patients) == 0:
+		return "", false, fmt.Errorf("nothing selected — click tree items to select them first")
+	case len(patients) > 1:
+		return "", false, fmt.Errorf("the selection spans %d patients. A Modification run exports one patient "+
+			"under one export folder name, and its Set values (such as a new Patient Name) would give every "+
+			"patient in it the same identity. Select series or studies of a single patient", len(patients))
+	}
+	var patientID string
+	for id := range patients {
+		patientID = id
+	}
+
+	if !wholePatient && len(studies) == 1 {
+		var studyID string
+		for id := range studies {
+			studyID = id
+		}
+		label = m.labelFor(studyID)
+		if !selected[studyID] {
+			total, chosen := 0, 0
+			for _, child := range m.childUIDs(studyID) {
+				total++
+				if selected[child] {
+					chosen++
+				}
+			}
+			label += fmt.Sprintf(" (%d of %d series selected)", chosen, total)
+		}
+		return label, true, nil
+	}
+
+	label = m.labelFor(patientID)
+	if !selected[patientID] {
+		label += fmt.Sprintf(" (selection from %d studies)", len(studies))
+	}
+	return label, false, nil
+}
+
+// modificationProfileItems returns one menu item per modification profile,
+// sorted by name, each calling run with that name. profiles.json is re-read
+// on every call so hand-edits take effect immediately (dicomtool semantics);
+// a missing or unreadable file yields one disabled "(no profiles defined)"
+// entry rather than an empty menu.
+func modificationProfileItems(run func(name string)) []*fyne.MenuItem {
+	var items []*fyne.MenuItem
+	if profPath, err := modifyProfilesPath(); err == nil {
+		if profCfg, err := loadModProfileConfig(profPath); err == nil {
+			names := make([]string, 0, len(profCfg))
+			for name := range profCfg {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			for _, name := range names {
+				items = append(items, fyne.NewMenuItem(name, func() { run(name) }))
+			}
+		}
+	}
+	if len(items) == 0 {
+		none := fyne.NewMenuItem("(no profiles defined)", nil)
+		none.Disabled = true
+		items = []*fyne.MenuItem{none}
+	}
+	return items
 }
 
 // pruneEmptyDirs walks up from dir toward root, removing each directory that
@@ -859,16 +945,21 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 		func() { tree.Refresh() },
 	)
 
-	onTapped := func(id string, extend bool) {
+	onTapped := func(id string, mods fyne.KeyModifier) {
 		verifyNode(id)
-		if extend {
-			sel.ExtendTo(id)
-		} else {
-			sel.Toggle(id)
-		}
+		sel.Click(id, mods)
 	}
 
 	var scanDir string
+
+	// modificationRoot is the download-folder root a Modification run's
+	// source paths are made relative to (see exportLayout).
+	modificationRoot := func() string {
+		if scanDir != "" {
+			return scanDir
+		}
+		return cfg.DownloadDir
+	}
 
 	onMenu := func(id string, pos fyne.Position) {
 		verifyNode(id)
@@ -948,32 +1039,11 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 		modItem := fyne.NewMenuItem("Modification", nil)
 		modItem.Disabled = seriesUID != "" // patient and study levels only
 		if !modItem.Disabled {
-			var children []*fyne.MenuItem
-			if profPath, err := modifyProfilesPath(); err == nil {
-				if profCfg, err := loadModProfileConfig(profPath); err == nil {
-					names := make([]string, 0, len(profCfg))
-					for name := range profCfg {
-						names = append(names, name)
-					}
-					sort.Strings(names)
-					capturedRoot := scanDir
-					if capturedRoot == "" {
-						capturedRoot = cfg.DownloadDir
-					}
-					capturedStudyLevel := studyUID != ""
-					for _, name := range names {
-						children = append(children, fyne.NewMenuItem(name, func() {
-							showModificationDialog(w, cfg, name, capturedLabel, capturedPaths, capturedRoot, capturedStudyLevel)
-						}))
-					}
-				}
-			}
-			if len(children) == 0 {
-				none := fyne.NewMenuItem("(no profiles defined)", nil)
-				none.Disabled = true
-				children = []*fyne.MenuItem{none}
-			}
-			modItem.ChildMenu = fyne.NewMenu("", children...)
+			capturedRoot := modificationRoot()
+			capturedStudyLevel := studyUID != ""
+			modItem.ChildMenu = fyne.NewMenu("", modificationProfileItems(func(name string) {
+				showModificationDialog(w, cfg, name, capturedLabel, capturedPaths, capturedRoot, capturedStudyLevel)
+			})...)
 		}
 		copyUID := fyne.NewMenuItem("Copy UID", func() { w.Clipboard().SetContent(uid) })
 		copyLabel := fyne.NewMenuItem("Copy label", func() { w.Clipboard().SetContent(model.labelFor(id)) })
@@ -1296,6 +1366,32 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 			func() { pruneMissing(paths) })
 	})
 
+	// Modify Selected… runs a Modification over exactly the selected files —
+	// the way to de-identify a subset of a study's series, which the
+	// right-click submenu (whole patient or study) cannot. The profile is
+	// chosen from a menu opened above the button (it sits in the bottom bar,
+	// so below it there is no room), listing what the submenu lists.
+	var modifySelectedBtn *widget.Button
+	modifySelectedBtn = widget.NewButton("Modify Selected…", func() {
+		ids := sel.IDs()
+		if len(ids) == 0 {
+			scanStatusLbl.SetText("Nothing selected — click tree items to select them first.")
+			return
+		}
+		label, studyLevel, err := modificationScope(model, ids)
+		if err != nil {
+			dialog.ShowInformation("Modify Selected", err.Error()+".", w)
+			return
+		}
+		paths := collectSelected()
+		root := modificationRoot()
+		menu := widget.NewPopUpMenu(fyne.NewMenu("", modificationProfileItems(func(name string) {
+			showModificationDialog(w, cfg, name, label, paths, root, studyLevel)
+		})...), w.Canvas())
+		pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(modifySelectedBtn)
+		menu.ShowAtPosition(fyne.NewPos(pos.X, max(0, pos.Y-menu.MinSize().Height)))
+	})
+
 	localOpenInViewerBtn := widget.NewButton("Open in Viewer", func() { openInViewer(scanDir) })
 	if cfg.ViewerPath == "" {
 		localOpenInViewerBtn.Disable()
@@ -1312,6 +1408,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 			}),
 			localOpenInViewerBtn,
 			pushSelectedBtn,
+			modifySelectedBtn,
 			deleteSelectedBtn,
 			layout.NewSpacer(),
 			widget.NewButton("Select All", func() { sel.SelectAll(model.activeRoots()) }),

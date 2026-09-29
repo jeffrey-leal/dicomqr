@@ -1,15 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"image/color"
 	"io"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -105,15 +108,33 @@ func collapseAllTree(tree *widget.Tree) {
 // settings, catalog, and SCP cleanup have finished, so the forced exit loses
 // nothing; on a normal shutdown the process is gone before the timer fires.
 func armExitWatchdog() {
+	// Every termination path arms this after its cleanup, which makes it the
+	// one place that can see the batched log file sink emptied before exit.
+	flushLogFile()
 	time.AfterFunc(3*time.Second, func() {
 		logError("exit watchdog: shutdown wedged 3s after close — forcing process exit")
+		flushLogFile()
 		os.Exit(0)
 	})
 }
 
+// dicomLogLevel is the protocol log verbosity: 2 — associations and every DIMSE
+// message, the field evidence dicom.log exists to hold — unless
+// DICOMQR_DICOMLOG_LEVEL overrides it. 3 adds the per-PDU and per-state-
+// transition trace the vendored state machine keeps one level up
+// (pduTraceLevel), for a protocol investigation; it is too much to run with
+// routinely, since it costs several log lines per PDU.
+func dicomLogLevel() int {
+	if v, err := strconv.Atoi(os.Getenv("DICOMQR_DICOMLOG_LEVEL")); err == nil && v >= 0 {
+		return v
+	}
+	return 2
+}
+
 func main() {
-	dicomlog.SetLevel(2)
+	dicomlog.SetLevel(dicomLogLevel())
 	setupLogFile()
+	defer flushLogFile() // a normal return from ShowAndRun; exits and panics flush on their own paths
 	// Before any GL context exists: make sure this executable's NVIDIA driver
 	// profile has Threaded Optimization off (see nvthreadctl.go — it corrupts
 	// multi-window rendering during cine playback). No-op on other GPUs.
@@ -364,13 +385,7 @@ func main() {
 		func() { tree.Refresh() },
 	)
 
-	onTapped := func(id string, extend bool) {
-		if extend {
-			sel.ExtendTo(id)
-		} else {
-			sel.Toggle(id)
-		}
-	}
+	onTapped := func(id string, mods fyne.KeyModifier) { sel.Click(id, mods) }
 
 	// selectAll selects every currently visible (filtered) root and its loaded
 	// descendants; clearSelection drops the whole selection (Phase 5-2C).
@@ -1020,6 +1035,32 @@ func main() {
 				recvMu.Unlock()
 			}
 
+			// Per-file and per-sub-operation UI updates are published at a
+			// fixed rate rather than one fyne.Do each (see startPacedProgress):
+			// the receive callbacks only store the latest path and bar
+			// position, and one reporter shows whichever is newest. The status
+			// label is not truncated, so every "Received: <path>" re-text
+			// changed its width and repainted the whole window frame — once per
+			// file, at whatever rate the PACS delivered.
+			var lastReceived atomic.Pointer[string]
+			var barFrac atomic.Uint64 // math.Float64bits of the bar position
+			var shownPath *string     // reporter-owned: the path last put on screen
+			shownFrac := -1.0         // reporter-owned
+			setBar := func(frac float64) { barFrac.Store(math.Float64bits(frac)) }
+			publishRetrieve := func() {
+				if p := lastReceived.Load(); p != nil && p != shownPath && ctx.Err() == nil {
+					shownPath = p
+					path := *p
+					fyne.Do(func() { statusLabel.SetText("Received: " + path) })
+				}
+				if f := math.Float64frombits(barFrac.Load()); f != shownFrac {
+					shownFrac = f
+					fyne.Do(func() { progressBar.SetValue(f) })
+				}
+			}
+			stopRetrieveProgress := startPacedProgress(scanProgressInterval, publishRetrieve)
+			defer stopRetrieveProgress() // idempotent; covers any early return
+
 			// Stall watchdog: some PACS servers' C-MOVE agents hang while
 			// sending non-image objects (SR, PR, encapsulated PDF) — the
 			// association stays open but no further data or progress response
@@ -1093,9 +1134,7 @@ func main() {
 					atomic.AddInt64(&fileCount, 1)
 					recordPath(path)
 					touch()
-					if ctx.Err() == nil {
-						fyne.Do(func() { statusLabel.SetText("Received: " + path) })
-					}
+					lastReceived.Store(&path)
 				})
 			}
 			restoreSCP := func() {
@@ -1135,9 +1174,7 @@ func main() {
 				atomic.AddInt64(&fileCount, 1)
 				recordPath(path)
 				touch()
-				if ctx.Err() == nil {
-					fyne.Do(func() { statusLabel.SetText("Received: " + path) })
-				}
+				lastReceived.Store(&path)
 				return nil
 			}
 
@@ -1167,8 +1204,7 @@ func main() {
 					trackSubOpFailures(p)
 					sub := p.Remaining + p.Completed + p.Failed + p.Warning
 					if sub > 0 {
-						frac := (float64(i) + float64(p.Completed)/float64(sub)) / float64(count)
-						fyne.Do(func() { progressBar.SetValue(frac) })
+						setBar((float64(i) + float64(p.Completed)/float64(sub)) / float64(count))
 					}
 				}
 
@@ -1212,11 +1248,14 @@ func main() {
 				// above also updates it finely for both C-MOVE and C-GET; this
 				// guarantees the bar reaches 100% on the final target even when
 				// a server sends no sub-operation counts (Phase 5-2A).
-				frac := float64(idx) / float64(count)
-				fyne.Do(func() { progressBar.SetValue(frac) })
+				setBar(float64(idx) / float64(count))
 			}
 
 			restoreSCP()
+			// The ticker can miss the last change (the bar reaching 100% on
+			// the final target), so publish once more after it has stopped.
+			stopRetrieveProgress()
+			publishRetrieve()
 
 			recvMu.Lock()
 			received := recvPaths
@@ -1664,24 +1703,77 @@ func (s failsafeWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// fileLogSink appends every write to the log file by path, opening and closing
-// the file per write. Field evidence (2026-07-23): sessions holding one long-
-// lived handle produced log files containing only the session-start header —
-// every later write vanished without an error surfacing. Reopening per write
-// makes the sink stateless, so nothing that happens to a previous handle
-// (rotation by a second app instance, antivirus interference, a recreated
-// directory) can silently kill logging for the rest of the session: each line
-// either lands or fails alone, and the first failure is reported to the
-// Activity Log ring.
+// fileLogSink appends to the log file by path, opening and closing the file per
+// flush. Field evidence (2026-07-23): sessions holding one long-lived handle
+// produced log files containing only the session-start header — every later
+// write vanished without an error surfacing. Reopening per flush keeps the sink
+// stateless, so nothing that happens to a previous handle (rotation by a second
+// app instance, antivirus interference, a recreated directory) can silently
+// kill logging for the rest of the session: each flush either lands or fails
+// alone, and the first failure is reported to the Activity Log ring.
+//
+// Lines are batched, flushed at most logFlushInterval after the first one
+// waiting. The sink used to reopen the file for every line, while the log
+// package held its global mutex — so every logging goroutine, the receive path
+// included, queued behind a CreateFile/CloseHandle pair (and an antivirus scan
+// on close) per line. Batching keeps the reopen, per batch rather than per line.
+//
+// What batching could cost is the tail of the log when the process dies, so
+// error lines ([E], which includes every recovered panic and the FATAL line of
+// an unrecovered one on the main goroutine) are written through synchronously,
+// taking everything queued ahead of them along; every termination path flushes
+// via armExitWatchdog; and main flushes on a normal return.
 type fileLogSink struct {
 	path     string
 	failures atomic.Int64
+
+	mu      sync.Mutex // guards pending and armed; held only to append or swap
+	pending []byte
+	armed   bool // a timed flush is scheduled
+
+	// ioMu serialises flushes, taken before mu and held through the file
+	// write, so two flushes can never land their batches out of order.
+	ioMu sync.Mutex
 }
 
+// logFlushInterval bounds how long a line may wait in the batch.
+const logFlushInterval = 200 * time.Millisecond
+
+// logFlushBytes flushes early once this much is waiting, so a burst cannot grow
+// the batch without bound between timed flushes.
+const logFlushBytes = 256 << 10
+
 func (s *fileLogSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	s.pending = append(s.pending, p...)
+	urgent := isErrorLogLine(p) || len(s.pending) >= logFlushBytes
+	if !urgent && !s.armed {
+		s.armed = true
+		time.AfterFunc(logFlushInterval, s.flush)
+	}
+	s.mu.Unlock()
+	if urgent {
+		s.flush()
+	}
+	return len(p), nil
+}
+
+// flush writes out everything waiting. Safe to call at any time, from any
+// goroutine; an empty batch costs nothing.
+func (s *fileLogSink) flush() {
+	s.ioMu.Lock()
+	defer s.ioMu.Unlock()
+	s.mu.Lock()
+	batch := s.pending
+	s.pending = nil
+	s.armed = false
+	s.mu.Unlock()
+	if len(batch) == 0 {
+		return
+	}
 	f, err := os.OpenFile(s.path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
 	if err == nil {
-		_, err = f.Write(p)
+		_, err = f.Write(batch)
 		if closeErr := f.Close(); err == nil {
 			err = closeErr
 		}
@@ -1692,7 +1784,28 @@ func (s *fileLogSink) Write(p []byte) (int, error) {
 		// errors-only view level.
 		appLog.Write([]byte("[E] dicom.log unwritable: " + err.Error()))
 	}
-	return len(p), nil
+}
+
+// isErrorLogLine reports whether a formatted log line carries logError's [E]
+// tag where logError puts it: straight after the timestamp setupLogFile's flags
+// add (Ltime|Lmicroseconds, "15:04:05.000000 ", always logTimestampLen bytes),
+// or at the very start for a line written without one.
+func isErrorLogLine(p []byte) bool {
+	tag := []byte("[E] ")
+	return bytes.HasPrefix(p, tag) || (len(p) > logTimestampLen && bytes.HasPrefix(p[logTimestampLen:], tag))
+}
+
+// logTimestampLen is the length of the prefix log.Ltime|log.Lmicroseconds adds.
+const logTimestampLen = len("15:04:05.000000 ")
+
+// logFileSink is the session's dicom.log sink, nil when the file could not be
+// set up. flushLogFile empties it; nil-safe.
+var logFileSink *fileLogSink
+
+func flushLogFile() {
+	if logFileSink != nil {
+		logFileSink.flush()
+	}
 }
 
 func setupLogFile() {
@@ -1715,7 +1828,8 @@ func setupLogFile() {
 			os.Rename(logPath, filepath.Join(dir, "dicom.log.1"))
 			// The file sink comes first so protocol evidence lands on disk
 			// before anything else can interfere.
-			sinks = append([]io.Writer{&fileLogSink{path: logPath}}, sinks...)
+			logFileSink = &fileLogSink{path: logPath}
+			sinks = append([]io.Writer{logFileSink}, sinks...)
 		}
 	}
 	log.SetOutput(io.MultiWriter(sinks...))

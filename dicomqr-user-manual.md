@@ -2,7 +2,7 @@
 
 **User Manual  v1.20.1**
 
-September 3, 2026
+September 29, 2026
 
 A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.
 
@@ -203,9 +203,18 @@ The filter acts on the already-loaded results and does not send a new query to t
 
 ### 6.3  Selecting Items for Retrieval
 
-Click any row in the results tree to select it. Selected rows are highlighted using the colour and font style configured in Preferences > User Interface (by default, bold in the theme's primary accent colour — see Section 11.1). Click the same row again to deselect it. Multiple rows at any level (patient, study, or series) may be selected simultaneously.
+Click any row in the results tree to select it. Selected rows are highlighted using the colour and font style configured in Preferences > User Interface (by default, bold in the theme's primary accent colour — see Section 11.1). A plain click always replaces the selection: whatever was selected before is deselected. Clicking the row that is the only selection deselects it (a selected patient or study counts as one row together with the series beneath it); when several rows are selected, clicking one of them keeps just that one. Clicking the arrow beside a patient or study opens or closes it without changing the selection. Selecting more than one row takes a modifier key, as in Windows Explorer:
 
-Selecting a patient or study also selects every series beneath it. Clicking one of those series back off deselects just that series — the patient or study is no longer treated as fully selected, but its other series stay selected. Shift-click a second series within the same study to select every series between it and the one last clicked, in one step.
+| Mouse | Action |
+|---|---|
+| Click | Select that row (and everything beneath it), deselecting everything else. Clicking the row that is the only selection deselects it. |
+| Ctrl+click | Add the row to the selection, or remove it if it is already selected; the rest of the selection is untouched. |
+| Shift+click | Select every row from the last click to this one, replacing the selection. |
+| Ctrl+Shift+click | Add every row from the last click to this one to the existing selection. |
+
+Rows at any level (patient, study, or series) may be selected together. Selecting a patient or study also selects every series beneath it; Ctrl+click one of those series to deselect just that series — the patient or study is no longer treated as fully selected, but its other series stay selected.
+
+A Shift range runs between series of the same study (or studies of the same patient). A Shift+click on a row that is not a sibling of the last click — a series in a different study, for example — selects just that row instead of guessing at a range across branches.
 
 The Select All button (in the retrieve panel) selects every currently visible row and its loaded descendants; Clear Selection clears the entire selection. Pressing Esc also clears the current selection.
 
@@ -493,14 +502,17 @@ Warning: Deletion is permanent. Files are not moved to the Recycle Bin.
 
 ### 8.7  Selection Controls
 
-Click any row in the tree to select it; click it again to deselect it. Selecting a patient or study selects every series beneath it — clicking one of those series back off deselects just that series, leaving the rest of the patient or study selected. Shift-click a second series within the same study to select every series between it and the one last clicked, in one step.
+Selection works as in the Query Results tree (Section 6.3): a plain click selects one row and deselects everything else, Ctrl+click adds or removes a single row, Shift+click selects the range from the last click, and Ctrl+Shift+click adds that range to the selection. Selecting a patient or study selects every series beneath it — Ctrl+click one of those series to deselect just that series, leaving the rest of the patient or study selected.
 
 | Control | Action |
 |---|---|
 | Select All | Selects every currently visible (filtered) root node and all its descendants. |
 | Clear Selection | Deselects everything. |
 | Push Selected… | Pushes all selected files to a chosen server. |
+| Modify Selected… | Runs a modification (de-identification) profile over exactly the selected files — choose the profile from the menu that opens above the button. See below. |
 | Delete Selected… | Deletes all selected files after confirmation. |
+
+Modify Selected… is how to de-identify and export only some of a study's series: select them, click Modify Selected…, and choose a profile. The right-click Modification submenu always takes the whole patient or study it was opened on; Modify Selected… takes the selection instead, and opens the same Modification window (Section 14.3), whose header says how much of the study or patient is included — for example "3 of 7 series selected". Series chosen from one study make a study-level run, exported exactly as a right-click on that study would be, just with fewer series in it; a selection covering several studies of one patient makes a patient-level run. A selection spanning more than one patient is refused: an export stands in for a single patient under one export folder name, and the profile's set values — a new Patient Name, and the Patient ID that follows it — would give every patient in it the same identity. Run each patient separately instead.
 
 
 ### 8.8  Tag Review and Export (View Tags)
@@ -526,7 +538,7 @@ The folder imported from is remembered: it is filled in when the application nex
 
 ### 9.2  Selecting and Importing
 
-Click rows in the tree to select them. Selecting a patient or study selects every series beneath it; clicking one of those series back off deselects just that series. Shift-click a second series within the same study to select every series between it and the one last clicked. Click Import Selected to copy the selected files. Files already present in the destination (same SOP Instance UID at the same destination path) are skipped; the status label reports imported, already-present, and failed counts.
+Click rows in the tree to select them, the same way as in the Query Results tree (Section 6.3): a plain click selects one row and deselects everything else, Ctrl+click adds or removes a row, Shift+click selects the range from the last click, and Ctrl+Shift+click adds that range. Selecting a patient or study selects every series beneath it; Ctrl+click one of those series to deselect just that series. Click Import Selected to copy the selected files. Files already present in the destination (same SOP Instance UID at the same destination path) are skipped; the status label reports imported, already-present, and failed counts.
 
 Select All and Clear Selection buttons are provided. The filter bar narrows the tree in the same way as the other tabs.
 
@@ -638,6 +650,15 @@ Each SOP Instance UID is unique, so files from different studies that share the 
 | Ctrl+C | Copy the full label of the currently selected result row to the clipboard. |
 | Esc | Clear the current selection in the results tree. |
 
+In the Query Results, Local Browse and Import trees, clicks select as follows:
+
+| Mouse | Action |
+|---|---|
+| Click | Select that row (and everything beneath it), deselecting everything else. Clicking the row that is the only selection deselects it. |
+| Ctrl+click | Add the row to the selection, or remove it if it is already selected; the rest of the selection is untouched. |
+| Shift+click | Select every row from the last click to this one, replacing the selection. |
+| Ctrl+Shift+click | Add every row from the last click to this one to the existing selection. |
+
 
 ## 14  Preferences
 
@@ -705,7 +726,7 @@ Tag Profiles — named tag sets coloured in the View Tags window. Each profile h
 
 ### 14.3  Modification & Export Tab
 
-Modification Profiles — the de-identification recipes applied from the Local Browse right-click Modification submenu. Profiles are stored in `%USERPROFILE%\.dicomqr\profiles.json` in the same format as the dicomtool CLI, so profile files can be copied between the two tools (with deliberate divergences: the dicomqr-only settings — Zip export, Flat export, Output transfer syntax, the export folder name, pixel masking, and Remove overlay planes — are ignored by dicomtool, and dicomtool's maskrows parameter is not supported by dicomqr). The list shows each profile with its set/remove counts, base profile, and per-modality override count; Edit and Add profile… open the profile editor. Changes are committed to profiles.json only when Apply is clicked, and only when something actually changed — a hand-edited file is never rewritten gratuitously. If profiles.json cannot be parsed, the list is replaced by an explanatory message and Apply leaves the file untouched.
+Modification Profiles — the de-identification recipes applied from the Local Browse right-click Modification submenu or its Modify Selected… button. Profiles are stored in `%USERPROFILE%\.dicomqr\profiles.json` in the same format as the dicomtool CLI, so profile files can be copied between the two tools (with deliberate divergences: the dicomqr-only settings — Zip export, Flat export, Output transfer syntax, the export folder name, pixel masking, Remove overlay planes, and Ignore SOP classes — are ignored by dicomtool, and dicomtool's maskrows parameter is not supported by dicomqr). The list shows each profile with its set/remove counts, base profile, and per-modality override count; Edit and Add profile… open the profile editor. Changes are committed to profiles.json only when Apply is clicked, and only when something actually changed — a hand-edited file is never rewritten gratuitously. If profiles.json cannot be parsed, the list is replaced by an explanatory message and Apply leaves the file untouched.
 
 Deleting a profile that other profiles use as their base prompts for confirmation; renaming a profile automatically updates the base reference in profiles that inherit from it.
 
@@ -731,6 +752,7 @@ Profile editor fields:
 | Flat export | Pre-check the Modification dialog's Flat export option for runs with this profile — every file is written directly into the export root (or the archive root, with Zip export also set), with no patient/study/series folders, and named after its SOP Instance UID rather than kept under its source name. The dialog checkbox still decides per run. |
 | Ignore image types | Comma-separated values; a file whose ImageType (0008,0008) contains any of them is skipped entirely. |
 | Ignore modalities | Comma-separated values; a file whose Modality (0008,0060) matches one is skipped entirely. |
+| Ignore SOP classes | Comma-separated SOP Class UIDs; a file whose SOP Class UID (0008,0016) matches one is skipped entirely. This is the filter for scanned documents, dose and protocol pages and saved screens: they arrive as Secondary Capture objects (`1.2.840.10008.5.1.4.1.1.7`, or its multi-frame variants `.7.1` to `.7.4`) yet carry the study's imaging modality, so neither filter above sees them — one scanned form in the field carried no Image Type at all. The line beneath the field names each class typed, or says that an entry is not a UID. Also available inside a per-modality override, where it adds to the profile's list for that modality alone. Note what else is Secondary Capture: fused PET/CT renders, MIP cines, MR Care Bolus monitoring frames and an ultrasound study's measurement screens are all dropped by the same entry, and nothing in the header tells them from a document. |
 | Pixel masking | Areas of the image itself blanked in the export — see below. Add region adds a row; each row is a rectangle in percentages of the image, or the Outside ultrasound region rule, which takes its geometry from the file. |
 
 The birth date mask and Original Attributes Sequence. The mask replaces the Patient Birth Date recorded at the top of the file. That is all an ordinary image carries — patient details are not repeated inside the nested structures that make up the rest of a DICOM file. There is one exception. A study that has already been de-identified somewhere else may carry an Original Attributes Sequence (0400,0561), which is a record of what that earlier process changed, and it holds the values as they were before. A real birth date can sit in that record while the visible Patient Birth Date reads as masked.
@@ -779,7 +801,7 @@ Two consequences worth knowing before enabling masking. Because writing pixels r
 
 Masked areas are filled with black as the image's own photometric interpretation defines it, so a redaction reads as a redaction: the maximum stored value on an inverted greyscale image, neutral chroma on a colour-difference image, and the darkest entry of the palette on a palette-colour image. The one format that cannot be masked directly is uncompressed chroma-subsampled ultrasound, whose samples are not stored one set per pixel; setting Output transfer syntax to either uncompressed option rewrites it in a form that masks normally, and the error says so.
 
-Per-modality overrides — the editor lists each override with Edit/Delete buttons and an Add modality override… button. An override varies only what is genuinely modality-specific, so its dialog offers the modality code, the set/remove/keep tag lists, and Keep private tags; on a file whose Modality matches, these layer on top of the profile. Keep private tags cancels the profile's private-tag removal for that modality — it is meaningful only here, which is why the main editor has no such control. Everything else (birth date mask, date shift, remove private tags, remove overlay planes, fix VR, output transfer syntax) is a profile-wide decision and is set once in the main editor.
+Per-modality overrides — the editor lists each override with Edit/Delete buttons and an Add modality override… button. An override varies only what is genuinely modality-specific, so its dialog offers the modality code, the set/remove/keep tag lists, Keep private tags, and Ignore SOP classes; on a file whose Modality matches, these layer on top of the profile. Ignore SOP classes here adds to the profile's SOP class filter for that modality alone — the way to skip Secondary Capture for CT, MR, NM and PT while an ultrasound study's measurement screens, Secondary Capture too, stay for the mask review. Keep private tags cancels the profile's private-tag removal for that modality — it is meaningful only here, which is why the main editor has no such control. Everything else (birth date mask, date shift, remove private tags, remove overlay planes, fix VR, output transfer syntax) is a profile-wide decision and is set once in the main editor.
 
 Tag picker — the Choose… button beside Remove tags and Keep tags opens the whole DICOM dictionary in its own window, as a tree of groups, each group opening to its tags with a checkbox. The window can be moved and resized, which is worth doing when working through a long list; the profile editor behind it is dimmed while it is open, because the picker takes a copy of the field's contents as it opens and anything typed into that field behind it would be overwritten on Apply. The search box matches on tag name, keyword or number ("patient", "0010", "InstitutionName" all work) and automatically opens the groups holding matches; Hide retired omits tags the standard has withdrawn. Apply writes the result back.
 
@@ -806,7 +828,7 @@ Defaults:
 | Default output folder | Where modification exports are written. When set, the Modification dialog uses it directly — no folder picker appears; the dialog's Change… button overrides it for a single run. When empty, the dialog asks on the first run and saves that choice here. Must be outside the download folder — modified files are never mixed into the local index. |
 | Default export format | The file type listed first in the View Tags Export Tags… save dialog, and the format used when the typed filename has no extension (Section 8.8). |
 
-Running a modification (Local Browse right-click > Modification > profile) opens a confirmation window showing what the profile will do, with everything on it editable for that run alone. The window can be moved and resized, and its contents scroll, so a profile with a long list of set values or removed tags still shows its Modify… and Cancel buttons. The export is written to <output folder>\<export folder name>, and the export folder name is entered here. Its default comes from the profile: base-deident names the export after the new patient name, so typing a name into the Patient Name set field fills the Patient ID and the export folder name with it as you type. A profile that names no export default falls back to a profile-name-plus-timestamp suggestion. Any of these fields stops following the moment it is edited directly, so a suggested value can simply be overtyped. The export folder name replaces the original patient folder — and, for a Study-level run, the study folder too — because a patient folder always identifies someone. Folders below it (the study folder on a Patient-level run, and every series folder) keep their original names, unless the profile deletes or replaces the value a name is built from — a removed Study Description, a replaced Series Description, a shifted Study Date — in which case just that folder is rebuilt from the new value, following the same naming the download folder itself uses. A file whose SOP Instance UID is remapped is renamed to match, so no original UID survives the export either.
+Running a modification (Local Browse right-click > Modification > profile, or Modify Selected… > profile for just the selected series — Section 8.7) opens a confirmation window showing what the profile will do, with everything on it editable for that run alone. The window can be moved and resized, and its contents scroll, so a profile with a long list of set values or removed tags still shows its Modify… and Cancel buttons. The export is written to <output folder>\<export folder name>, and the export folder name is entered here. Its default comes from the profile: base-deident names the export after the new patient name, so typing a name into the Patient Name set field fills the Patient ID and the export folder name with it as you type. A profile that names no export default falls back to a profile-name-plus-timestamp suggestion. Any of these fields stops following the moment it is edited directly, so a suggested value can simply be overtyped. The export folder name replaces the original patient folder — and, for a Study-level run, the study folder too — because a patient folder always identifies someone. Folders below it (the study folder on a Patient-level run, and every series folder) keep their original names, unless the profile deletes or replaces the value a name is built from — a removed Study Description, a replaced Series Description, a shifted Study Date — in which case just that folder is rebuilt from the new value, following the same naming the download folder itself uses. A file whose SOP Instance UID is remapped is renamed to match, so no original UID survives the export either.
 
 The dialog's Options section shows the effective settings and lets any of them be changed for this run only — nothing typed there is written back to the profile. It presents the same controls in the same order as the profile editor's Options section, Output transfer syntax included, so an export can be converted (or left as stored) without editing the profile it came from. The three controls positioned differently are Zip export, Flat export and Include DICOMDIR, which sit in this dialog's Export section beside the output folder and export folder name they change.
 

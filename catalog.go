@@ -159,21 +159,42 @@ func (c *catalog) replaceAll(studies []localStudy, series []localSeries, filesBy
 		}
 	}
 
+	// Each statement prepared once for the whole rebuild rather than compiled
+	// per row (see metaUpserter).
+	prep := func(query string) (*sql.Stmt, error) { return tx.Prepare(query) }
+	patientStmt, err := prep(`INSERT OR IGNORE INTO patients(patient_id, patient_name) VALUES(?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer patientStmt.Close()
+	studyStmt, err := prep(`INSERT OR REPLACE INTO studies(study_uid, patient_id, study_date, study_desc, accession, modalities)
+		VALUES(?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer studyStmt.Close()
+	seriesStmt, err := prep(`INSERT OR REPLACE INTO series(series_uid, study_uid, modality, series_number, series_desc)
+		VALUES(?, ?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer seriesStmt.Close()
+	instanceStmt, err := prep(`INSERT OR REPLACE INTO instances(path, series_uid, size, mtime) VALUES(?, ?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer instanceStmt.Close()
+
 	for _, s := range studies {
-		if _, err := tx.Exec(`INSERT OR IGNORE INTO patients(patient_id, patient_name) VALUES(?, ?)`,
-			s.patientID, s.patientName); err != nil {
+		if _, err := patientStmt.Exec(s.patientID, s.patientName); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`INSERT OR REPLACE INTO studies(study_uid, patient_id, study_date, study_desc, accession, modalities)
-			VALUES(?, ?, ?, ?, ?, ?)`,
-			s.studyUID, s.patientID, s.studyDate, s.studyDesc, s.accession, s.modalities); err != nil {
+		if _, err := studyStmt.Exec(s.studyUID, s.patientID, s.studyDate, s.studyDesc, s.accession, s.modalities); err != nil {
 			return err
 		}
 	}
 	for _, sr := range series {
-		if _, err := tx.Exec(`INSERT OR REPLACE INTO series(series_uid, study_uid, modality, series_number, series_desc)
-			VALUES(?, ?, ?, ?, ?)`,
-			sr.seriesUID, sr.studyUID, sr.modality, sr.seriesNumber, sr.seriesDesc); err != nil {
+		if _, err := seriesStmt.Exec(sr.seriesUID, sr.studyUID, sr.modality, sr.seriesNumber, sr.seriesDesc); err != nil {
 			return err
 		}
 	}
@@ -183,8 +204,7 @@ func (c *catalog) replaceAll(studies []localStudy, series []localSeries, filesBy
 			if info, statErr := os.Stat(p); statErr == nil {
 				size, mtime = info.Size(), info.ModTime().Unix()
 			}
-			if _, err := tx.Exec(`INSERT OR REPLACE INTO instances(path, series_uid, size, mtime) VALUES(?, ?, ?, ?)`,
-				p, seriesUID, size, mtime); err != nil {
+			if _, err := instanceStmt.Exec(p, seriesUID, size, mtime); err != nil {
 				return err
 			}
 		}
@@ -192,27 +212,97 @@ func (c *catalog) replaceAll(studies []localStudy, series []localSeries, filesBy
 	return tx.Commit()
 }
 
-// upsertMeta inserts one parsed file into the hierarchy. Patient, study, and
-// series rows are first-write-wins (INSERT OR IGNORE), matching how the tree
-// model keeps the metadata of the first file seen.
-func upsertMeta(tx *sql.Tx, m fileMeta) error {
-	if _, err := tx.Exec(`INSERT OR IGNORE INTO patients(patient_id, patient_name) VALUES(?, ?)`,
-		m.patientID, m.patientName); err != nil {
-		return err
+// metaUpserter inserts parsed files into the hierarchy within one transaction.
+// Patient, study and series rows are first-write-wins (INSERT OR IGNORE),
+// matching how the tree model keeps the metadata of the first file seen.
+//
+// Two things make it cheaper than a statement per row, and neither changes what
+// is written:
+//
+//   - The four statements are prepared once per transaction. tx.Exec with a SQL
+//     string prepares and finalizes it on every call in modernc's driver, so a
+//     10,000-file ingest compiled the same four statements 40,000 times.
+//   - A patient, study or series already inserted earlier in this batch is not
+//     inserted again. Every file of a series carries the same three parents, so
+//     three of the four statements per file were INSERT OR IGNOREs of a row the
+//     batch had just written — no-ops by definition, since the first insert is
+//     the one that wins. A key is only recorded after its insert succeeded, so
+//     a failed insert is retried by the next file just as before.
+type metaUpserter struct {
+	patient, study, series, instance *sql.Stmt
+
+	seenPatient, seenStudy, seenSeries map[string]bool
+}
+
+func newMetaUpserter(tx *sql.Tx) (*metaUpserter, error) {
+	u := &metaUpserter{
+		seenPatient: map[string]bool{},
+		seenStudy:   map[string]bool{},
+		seenSeries:  map[string]bool{},
 	}
-	if _, err := tx.Exec(`INSERT OR IGNORE INTO studies(study_uid, patient_id, study_date, study_desc, accession, modalities)
-		VALUES(?, ?, ?, ?, ?, ?)`,
-		m.studyUID, m.patientID, m.studyDate, m.studyDesc, m.accession, m.modalities); err != nil {
-		return err
+	for _, s := range []struct {
+		dst   **sql.Stmt
+		query string
+	}{
+		{&u.patient, `INSERT OR IGNORE INTO patients(patient_id, patient_name) VALUES(?, ?)`},
+		{&u.study, `INSERT OR IGNORE INTO studies(study_uid, patient_id, study_date, study_desc, accession, modalities)
+			VALUES(?, ?, ?, ?, ?, ?)`},
+		{&u.series, `INSERT OR IGNORE INTO series(series_uid, study_uid, modality, series_number, series_desc)
+			VALUES(?, ?, ?, ?, ?)`},
+		{&u.instance, `INSERT OR REPLACE INTO instances(path, series_uid, size, mtime) VALUES(?, ?, ?, ?)`},
+	} {
+		stmt, err := tx.Prepare(s.query)
+		if err != nil {
+			u.close()
+			return nil, err
+		}
+		*s.dst = stmt
 	}
-	if _, err := tx.Exec(`INSERT OR IGNORE INTO series(series_uid, study_uid, modality, series_number, series_desc)
-		VALUES(?, ?, ?, ?, ?)`,
-		m.seriesUID, m.studyUID, m.modality, m.seriesNumber, m.seriesDesc); err != nil {
-		return err
+	return u, nil
+}
+
+// upsert inserts one parsed file, and whichever of its parents this batch has
+// not yet written.
+func (u *metaUpserter) upsert(m fileMeta) error {
+	if !u.seenPatient[m.patientID] {
+		if _, err := u.patient.Exec(m.patientID, m.patientName); err != nil {
+			return err
+		}
+		u.seenPatient[m.patientID] = true
 	}
-	_, err := tx.Exec(`INSERT OR REPLACE INTO instances(path, series_uid, size, mtime) VALUES(?, ?, ?, ?)`,
-		m.path, m.seriesUID, m.size, m.mtime)
+	if !u.seenStudy[m.studyUID] {
+		if _, err := u.study.Exec(m.studyUID, m.patientID, m.studyDate, m.studyDesc, m.accession, m.modalities); err != nil {
+			return err
+		}
+		u.seenStudy[m.studyUID] = true
+	}
+	if !u.seenSeries[m.seriesUID] {
+		if _, err := u.series.Exec(m.seriesUID, m.studyUID, m.modality, m.seriesNumber, m.seriesDesc); err != nil {
+			return err
+		}
+		u.seenSeries[m.seriesUID] = true
+	}
+	_, err := u.instance.Exec(m.path, m.seriesUID, m.size, m.mtime)
 	return err
+}
+
+// upsertAll upserts every meta, returning how many rows were written.
+func (u *metaUpserter) upsertAll(metas []fileMeta) int {
+	n := 0
+	for _, m := range metas {
+		if u.upsert(m) == nil {
+			n++
+		}
+	}
+	return n
+}
+
+func (u *metaUpserter) close() {
+	for _, s := range []*sql.Stmt{u.patient, u.study, u.series, u.instance} {
+		if s != nil {
+			s.Close()
+		}
+	}
 }
 
 // fileStamp is what the index remembers about a file's contents without
@@ -263,7 +353,7 @@ func (c *catalog) fileStamps() (map[string]fileStamp, error) {
 // upsertMetas indexes files that have already been parsed, returning how many
 // rows were written.
 //
-// The counterpart to ingestPaths, which parses the files itself and serially.
+// The counterpart to ingestPaths, which parses the files itself.
 // A scan has already parsed its changed files, on a worker pool; handing it
 // paths instead of results would throw that work away and do it again. Both
 // exist because the callers genuinely differ: the retrieve and import hooks
@@ -282,12 +372,12 @@ func (c *catalog) upsertMetas(metas []fileMeta) int {
 		return 0
 	}
 	defer tx.Rollback()
-	n := 0
-	for _, m := range metas {
-		if upsertMeta(tx, m) == nil {
-			n++
-		}
+	u, err := newMetaUpserter(tx)
+	if err != nil {
+		return 0
 	}
+	n := u.upsertAll(metas)
+	u.close()
 	if tx.Commit() != nil {
 		return 0
 	}
@@ -302,36 +392,17 @@ func (c *catalog) ingestPaths(paths []string) int {
 	if c == nil || len(paths) == 0 {
 		return 0
 	}
+	// On the scan worker pool, in the order given — parseFilesParallel keeps
+	// the first-write-wins study/series metadata independent of which worker
+	// finished first. This runs after every retrieve and import, and one file
+	// at a time it waited out a disk seek per file.
 	var metas []fileMeta
-	for _, p := range paths {
-		if m, ok := parseLocalFileMeta(p); ok {
-			metas = append(metas, m)
+	for _, r := range parseFilesParallel(paths, nil) {
+		if r.ok {
+			metas = append(metas, r.m)
 		}
 	}
-	if len(metas) == 0 {
-		return 0
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.db == nil {
-		return 0
-	}
-	tx, err := c.db.Begin()
-	if err != nil {
-		return 0
-	}
-	defer tx.Rollback()
-	n := 0
-	for _, m := range metas {
-		if upsertMeta(tx, m) == nil {
-			n++
-		}
-	}
-	if tx.Commit() != nil {
-		return 0
-	}
-	return n
+	return c.upsertMetas(metas)
 }
 
 // removePaths deletes the given file paths from the index, then prunes any
@@ -351,9 +422,15 @@ func (c *catalog) removePaths(paths []string) int {
 		return 0
 	}
 	defer tx.Rollback()
+	// Prepared once rather than compiled per path (see metaUpserter).
+	del, err := tx.Prepare(`DELETE FROM instances WHERE path = ?`)
+	if err != nil {
+		return 0
+	}
+	defer del.Close()
 	n := 0
 	for _, p := range paths {
-		res, execErr := tx.Exec(`DELETE FROM instances WHERE path = ?`, p)
+		res, execErr := del.Exec(p)
 		if execErr == nil {
 			if k, _ := res.RowsAffected(); k > 0 {
 				n += int(k)

@@ -168,6 +168,8 @@ type modProfileEditor struct {
 	dicomdirCheck    *widget.Check
 	ignoreTypesEntry *widget.Entry
 	ignoreModsEntry  *widget.Entry
+	ignoreSOPEntry   *widget.Entry
+	ignoreSOPNames   *widget.Label
 	// perMod is the working copy edited through the per-modality sub-editor.
 	// The shallow clone is safe because sub-editor saves always build fresh
 	// slices (updated := orig, whole-field overwrites) rather than mutating
@@ -244,6 +246,11 @@ func newModProfileEditor(name string, p ModProfile, cfg ModProfileConfig) *modPr
 	e.ignoreModsEntry.SetText(strings.Join(p.IgnoreModalities, ", "))
 	e.ignoreModsEntry.SetPlaceHolder("e.g. SR, PR")
 
+	e.ignoreSOPEntry = widget.NewEntry()
+	e.ignoreSOPEntry.SetText(strings.Join(p.IgnoreSOPClasses, ", "))
+	e.ignoreSOPEntry.SetPlaceHolder("e.g. 1.2.840.10008.5.1.4.1.1.7")
+	e.ignoreSOPNames = sopClassHintLabel(e.ignoreSOPEntry)
+
 	e.perMod = maps.Clone(p.PerModality)
 	return e
 }
@@ -298,6 +305,11 @@ func (e *modProfileEditor) validate() (string, ModProfile, error) {
 	// commas, so the comma-joined display round-trips exactly.
 	updated.IgnoreTypes = splitCommaList(e.ignoreTypesEntry.Text)
 	updated.IgnoreModalities = splitCommaList(e.ignoreModsEntry.Text)
+	sopClasses, err := validateSOPClassUIDs(splitCommaList(e.ignoreSOPEntry.Text))
+	if err != nil {
+		return "", ModProfile{}, err
+	}
+	updated.IgnoreSOPClasses = sopClasses
 	updated.PerModality = e.perMod
 	if len(updated.PerModality) == 0 {
 		updated.PerModality = nil // keep omitempty round-trips byte-identical
@@ -528,12 +540,15 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 	ed.dob.OnChanged = func(string) { refreshDOBAdvisory() }
 	ed.fields.removes.OnChanged = func(string) { refreshDOBAdvisory() }
 
-	filterCaption := widget.NewLabel("Files matching either comma-separated filter are skipped entirely.")
+	filterCaption := widget.NewLabel("Files matching any of the comma-separated filters are skipped entirely. " +
+		"SOP classes are UIDs: Secondary Capture (1.2.840.10008.5.1.4.1.1.7) is how scanned documents, " +
+		"dose and protocol pages and saved screens usually arrive, whatever Modality they carry.")
 	filterCaption.TextStyle = fyne.TextStyle{Italic: true}
 	filterCaption.Wrapping = fyne.TextWrapWord
 	filtersForm := widget.NewForm(
 		widget.NewFormItem("Ignore image types", ed.ignoreTypesEntry),
-		widget.NewFormItem("Ignore modalities", ed.ignoreModsEntry))
+		widget.NewFormItem("Ignore modalities", ed.ignoreModsEntry),
+		widget.NewFormItem("Ignore SOP classes", container.NewVBox(ed.ignoreSOPEntry, ed.ignoreSOPNames)))
 
 	optionsSection := prefSection("Options", optionsForm, dobAdvisoryLabel)
 	filtersSection := prefSection("File filters", filterCaption, filtersForm)
@@ -688,9 +703,11 @@ type perModalityEditor struct {
 	orig     ModProfile
 	taken    []string // the other override codes (uppercase) — collision check
 
-	codeEntry     *widget.Entry
-	fields        *modProfileFieldSet
-	keepPrivCheck *widget.Check
+	codeEntry      *widget.Entry
+	fields         *modProfileFieldSet
+	keepPrivCheck  *widget.Check
+	ignoreSOPEntry *widget.Entry
+	ignoreSOPNames *widget.Label
 }
 
 func newPerModalityEditor(code string, p ModProfile, taken []string) *perModalityEditor {
@@ -705,6 +722,11 @@ func newPerModalityEditor(code string, p ModProfile, taken []string) *perModalit
 
 	e.keepPrivCheck = widget.NewCheck("", nil)
 	e.keepPrivCheck.SetChecked(p.KeepPrivate)
+
+	e.ignoreSOPEntry = widget.NewEntry()
+	e.ignoreSOPEntry.SetText(strings.Join(p.IgnoreSOPClasses, ", "))
+	e.ignoreSOPEntry.SetPlaceHolder("e.g. 1.2.840.10008.5.1.4.1.1.7")
+	e.ignoreSOPNames = sopClassHintLabel(e.ignoreSOPEntry)
 
 	return e
 }
@@ -727,7 +749,26 @@ func (e *perModalityEditor) validate() (string, ModProfile, error) {
 		return "", ModProfile{}, err
 	}
 	updated.KeepPrivate = e.keepPrivCheck.Checked
+	sopClasses, err := validateSOPClassUIDs(splitCommaList(e.ignoreSOPEntry.Text))
+	if err != nil {
+		return "", ModProfile{}, err
+	}
+	updated.IgnoreSOPClasses = sopClasses
 	return newCode, updated, nil
+}
+
+// sopClassHintLabel returns the italic line beneath an Ignore SOP classes
+// entry naming what is typed there, kept current as the text changes: a UID
+// says nothing to a reader, and a typo in one is invisible without the name
+// (or its absence) beside it.
+func sopClassHintLabel(entry *widget.Entry) *widget.Label {
+	l := widget.NewLabel("")
+	l.TextStyle = fyne.TextStyle{Italic: true}
+	l.Wrapping = fyne.TextWrapWord
+	update := func(s string) { l.SetText(sopClassHintText(splitCommaList(s))) }
+	entry.OnChanged = update
+	update(entry.Text)
+	return l
 }
 
 // perModalityPreservedNote describes the fields of a hand-authored
@@ -835,6 +876,10 @@ func showPerModalityEditor(a fyne.App, w fyne.Window, code string, p ModProfile,
 		widget.NewFormItem("Keep tags",
 			tagListField(a, w, ed.fields.keep, "Choose tags to keep")),
 		widget.NewFormItem("Keep private tags", ed.keepPrivCheck),
+		// Adds to the profile's SOP class filter for this modality alone: the
+		// way to skip Secondary Capture in CT/MR/NM/PT without touching an
+		// ultrasound study's measurement screens.
+		widget.NewFormItem("Ignore SOP classes", container.NewVBox(ed.ignoreSOPEntry, ed.ignoreSOPNames)),
 		// Regions here replace the profile's rather than adding to them: this
 		// modality's images have their own layout, which is the whole reason
 		// for stating them separately.

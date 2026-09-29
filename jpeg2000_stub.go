@@ -12,7 +12,7 @@ import "errors"
 // transcode a JPEG 2000 file.
 const jpeg2000Available = false
 
-func decodeJPEG2000Frame(_ []byte, _, _ float64, _ bool, _, _ float64, _ string) (*decodedFrame, error) {
+func decodeJPEG2000Frame(_ []byte, _ frameDecodeOpts, _, _ float64, _ bool, _, _ float64, _ string) (*decodedFrame, error) {
 	return nil, errors.New("JPEG 2000 support is not built into this version of dicomqr\n\nUse Open in Viewer to open this file in an external DICOM viewer.")
 }
 

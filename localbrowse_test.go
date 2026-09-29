@@ -544,3 +544,66 @@ func TestLocalMetaMaxGroupCoversEveryTag(t *testing.T) {
 		}
 	}
 }
+
+// scopeFixture is one patient with two studies (three series and one series)
+// plus a second patient with one series.
+func scopeFixture() *resultsModel {
+	m := newResultsModel()
+	m.addStudy("Doe^John", "P1", "S1", "20240101", "", "", "")
+	m.addSeries("S1", "R1", "CT", "1", "", 0)
+	m.addSeries("S1", "R2", "CT", "2", "", 0)
+	m.addSeries("S1", "R3", "CT", "3", "", 0)
+	m.addStudy("Doe^John", "P1", "S2", "20240201", "", "", "")
+	m.addSeries("S2", "R4", "MR", "1", "", 0)
+	m.addStudy("Roe^Jane", "P2", "S3", "20240301", "", "", "")
+	m.addSeries("S3", "R5", "CT", "1", "", 0)
+	return m
+}
+
+// TestModificationScope covers how a Local Browse selection maps onto a
+// Modification run: a subset of one study's series is a study-level run, a
+// selection across studies of one patient is patient-level, and one spanning
+// patients is refused.
+func TestModificationScope(t *testing.T) {
+	m := scopeFixture()
+	cases := []struct {
+		name       string
+		ids        []string
+		studyLevel bool
+		labelTail  string // suffix the label must carry; "" = exactly the node label
+		wantErr    bool
+	}{
+		{name: "series subset of one study", ids: []string{"R:R1", "R:R3"},
+			studyLevel: true, labelTail: " (2 of 3 series selected)"},
+		{name: "whole study via its node", ids: []string{"S:S1", "R:R1", "R:R2", "R:R3"},
+			studyLevel: true},
+		{name: "series across two studies", ids: []string{"R:R1", "R:R4"},
+			labelTail: " (selection from 2 studies)"},
+		{name: "whole patient", ids: []string{"P:P1", "S:S1", "S:S2", "R:R1", "R:R2", "R:R3", "R:R4"}},
+		{name: "two patients", ids: []string{"R:R1", "R:R5"}, wantErr: true},
+		{name: "nothing known", ids: []string{"R:gone"}, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			label, studyLevel, err := modificationScope(m, tc.ids)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected an error, got label %q", label)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if studyLevel != tc.studyLevel {
+				t.Errorf("studyLevel = %v, want %v", studyLevel, tc.studyLevel)
+			}
+			if !strings.HasSuffix(label, tc.labelTail) {
+				t.Errorf("label %q lacks suffix %q", label, tc.labelTail)
+			}
+			if tc.labelTail == "" && strings.Contains(label, "(") && strings.Contains(label, "selected") {
+				t.Errorf("whole-node label %q should not describe a partial selection", label)
+			}
+		})
+	}
+}

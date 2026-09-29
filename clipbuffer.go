@@ -259,9 +259,10 @@ func frameBytes(df *decodedFrame) int {
 		b := df.colorImg.Bounds()
 		return b.Dx() * b.Dy() * 4
 	}
-	// Grayscale: the float buffer the viewer re-windows from, plus the RGBA the
-	// viewport renders it into.
-	return len(df.gray)*4 + df.rows*df.cols*4
+	// Grayscale: the samples the viewer re-windows from (2 bytes a pixel in the
+	// usual indexed form, 4 in the float form — see grayframe.go), plus the RGBA
+	// the viewport renders it into.
+	return df.sampleBytes() + df.rows*df.cols*4
 }
 
 func minInt(a, b int) int {

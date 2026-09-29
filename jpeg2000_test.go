@@ -44,18 +44,18 @@ func TestDecodeJPEG2000Geometry(t *testing.T) {
 
 func TestDecodeJPEG2000FrameMonochrome(t *testing.T) {
 	// slope=1, intercept=0, no window → gray holds the raw ramp.
-	df, err := decodeJPEG2000Frame(ramp8J2K, 1, 0, false, 0, 0, "MONOCHROME2")
+	df, err := decodeJPEG2000Frame(ramp8J2K, frameDecodeOpts{}, 1, 0, false, 0, 0, "MONOCHROME2")
 	if err != nil {
 		t.Fatalf("decodeJPEG2000Frame: %v", err)
 	}
 	if !df.windowable() {
 		t.Fatal("monochrome J2K frame should be windowable")
 	}
-	if df.cols != 8 || df.rows != 8 || len(df.gray) != 64 {
-		t.Fatalf("frame %d×%d, gray len %d", df.cols, df.rows, len(df.gray))
+	if df.cols != 8 || df.rows != 8 || len(df.displayValues()) != 64 {
+		t.Fatalf("frame %d×%d, gray len %d", df.cols, df.rows, len(df.displayValues()))
 	}
-	if df.gray[0] != 0 || df.gray[7] != 224 {
-		t.Errorf("gray row0 ends = %v, want [0 … 224]", df.gray[:8])
+	if df.displayValues()[0] != 0 || df.displayValues()[7] != 224 {
+		t.Errorf("gray row0 ends = %v, want [0 … 224]", df.displayValues()[:8])
 	}
 	if df.invert {
 		t.Error("MONOCHROME2 must not invert")

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -12,7 +13,6 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	sdicom "github.com/suyashkumar/dicom"
 	"github.com/suyashkumar/dicom/pkg/tag"
 )
 
@@ -21,21 +21,21 @@ import (
 // Returns (dest, true, nil) when the file was copied, (dest, false, nil) when
 // it was already present, or ("", false, err) on failure.
 func importOneFile(srcPath, downloadDir string) (dest string, copied bool, err error) {
-	ds, parseErr := safeParseFile(srcPath, nil, sdicom.SkipPixelData())
+	// Header only: the naming tags all precede the pixel data, which the copy
+	// below reads anyway.
+	ds, parseErr := readDicomHeader(srcPath)
 	if parseErr != nil {
 		return "", false, parseErr
 	}
 
+	// firstElementString rather than sdicom.MustGetStrings, which panics on a
+	// tag stored under an unexpected VR.
 	getString := func(t tag.Tag) string {
 		e, findErr := ds.FindElementByTag(t)
 		if findErr != nil {
 			return ""
 		}
-		strs := sdicom.MustGetStrings(e.Value)
-		if len(strs) == 0 {
-			return ""
-		}
-		return strings.TrimSpace(strs[0])
+		return firstElementString(e)
 	}
 
 	dest = organizeFilePath(
@@ -77,13 +77,7 @@ func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, 
 		func() { tree.Refresh() },
 	)
 
-	onTapped := func(id string, extend bool) {
-		if extend {
-			sel.ExtendTo(id)
-		} else {
-			sel.Toggle(id)
-		}
-	}
+	onTapped := func(id string, mods fyne.KeyModifier) { sel.Click(id, mods) }
 
 	onMenu := func(id string, pos fyne.Position) {
 		rawPaths := filesForNode(id, model, seriesFiles)
@@ -276,7 +270,21 @@ func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, 
 		go func() {
 			var nImported, nSkipped, nFailed int
 			var destPaths []string
-			for i, p := range paths {
+			// Copied one at a time, deliberately: the source is often a CD or
+			// a USB stick, where parallel reads fight over one read head, and
+			// two workers could race on the same destination when the source
+			// holds a duplicate instance. Progress is paced by time — see
+			// startPacedProgress.
+			var doneCount atomic.Int64
+			publish := func() {
+				done := int(doneCount.Load())
+				fyne.Do(func() {
+					progressBar.SetValue(float64(done) / float64(total))
+					importStatusLbl.SetText(fmt.Sprintf("Importing %d / %d…", done, total))
+				})
+			}
+			stopReporting := startPacedProgress(scanProgressInterval, publish)
+			for _, p := range paths {
 				dest, copied, err := importOneFile(p, destDir)
 				switch {
 				case err != nil:
@@ -290,14 +298,10 @@ func buildImportContent(a fyne.App, w fyne.Window, cfg *Settings, cat *catalog, 
 					nSkipped++
 					destPaths = append(destPaths, dest)
 				}
-				done := i + 1
-				if done%10 == 0 || done == total {
-					fyne.Do(func() {
-						progressBar.SetValue(float64(done) / float64(total))
-						importStatusLbl.SetText(fmt.Sprintf("Importing %d / %d…", done, total))
-					})
-				}
+				doneCount.Add(1)
 			}
+			stopReporting()
+			publish()
 			if len(destPaths) > 0 {
 				cat.ingestPaths(destPaths)
 				if reloadLocal != nil {

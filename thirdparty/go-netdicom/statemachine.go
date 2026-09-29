@@ -774,8 +774,22 @@ func sendPDU(sm *stateMachine, v pdu.PDU) {
 		sm.errorCh <- stateEvent{event: evt17, err: err}
 		return
 	}
-	dicomlog.Vprintf(2, "dicom.StateMachine %s: sendPDU: %v", sm.label, v.String())
+	if dicomlog.Level() >= pduTraceLevel {
+		dicomlog.Vprintf(pduTraceLevel, "dicom.StateMachine %s: sendPDU: %v", sm.label, v.String())
+	}
 }
+
+// pduTraceLevel is the dicomlog level of the per-PDU and per-state-transition
+// trace lines (dicomqr local patch). Upstream logs them at level 2, which is the
+// level dicomqr runs at for its per-association and per-DIMSE-message lines:
+// that made every PDU cost about five log lines — each a trip through the
+// global log mutex and, in dicomqr, a write to dicom.log — so a large retrieve
+// was throttled by its own logging and its trace pushed the warnings and errors
+// out of the Activity Log's ring. They are one level up so they can still be
+// turned on for a protocol investigation (DICOMQR_DICOMLOG_LEVEL=3), and their
+// arguments are built only when that level is on: PDU.String() formats the
+// whole PDU, and Go evaluates arguments before Vprintf can discard them.
+const pduTraceLevel = 3
 
 func (sm *stateMachine) startTimer() {
 	ch := make(chan stateEvent, 1)
@@ -811,9 +825,12 @@ func networkReaderThread(ch chan stateEvent, conn net.Conn, maxPDUSize int, smNa
 			close(ch)
 			break
 		}
-		dicomlog.Vprintf(0, "dicom.StateMachine %s: read PDU: %v", smName, v.String())
 		doassert(v != nil)
-		dicomlog.Vprintf(2, "dicom.StateMachine %s: read PDU: %v", smName, v.String())
+		// dicomqr local patch: upstream also logged this line at level 0,
+		// before the nil check, duplicating it on every PDU at any level.
+		if dicomlog.Level() >= pduTraceLevel {
+			dicomlog.Vprintf(pduTraceLevel, "dicom.StateMachine %s: read PDU: %v", smName, v.String())
+		}
 		switch n := v.(type) {
 		case *pdu.AAssociateRQ:
 			ch <- stateEvent{event: evt06, pdu: n, err: nil}
@@ -882,7 +899,10 @@ func (sm *stateMachine) getNextEvent() stateEvent {
 
 func (sm *stateMachine) runOneStep() {
 	event := sm.getNextEvent()
-	dicomlog.Vprintf(2, "dicom.StateMachine %s: Current state: %v, Event %v", sm.label, sm.currentState.String(), event)
+	trace := dicomlog.Level() >= pduTraceLevel
+	if trace {
+		dicomlog.Vprintf(pduTraceLevel, "dicom.StateMachine %s: Current state: %v, Event %v", sm.label, sm.currentState.String(), event)
+	}
 	action := findAction(sm.currentState, &event)
 	if action == nil {
 		msg := fmt.Sprintf("dicom.StateMachine %s: No action found for state %v, event %v", sm.label, sm.currentState.String(), event.String())
@@ -897,13 +917,17 @@ func (sm *stateMachine) runOneStep() {
 
 		action = actionAa2 // This will force connection abortion
 	}
-	dicomlog.Vprintf(2, "dicom.StateMachine %s: Running action %v", sm.label, action)
+	if trace {
+		dicomlog.Vprintf(pduTraceLevel, "dicom.StateMachine %s: Running action %v", sm.label, action)
+	}
 	newState := action.Callback(sm, event)
 	if sm.faults != nil {
 		sm.faults.onStateTransition(sm.currentState, &event, action, newState)
 	}
 	sm.currentState = newState
-	dicomlog.Vprintf(2, "dicom.StateMachine Next state: %v", sm.currentState.String())
+	if trace {
+		dicomlog.Vprintf(pduTraceLevel, "dicom.StateMachine Next state: %v", sm.currentState.String())
+	}
 }
 
 func runStateMachineForServiceUser(

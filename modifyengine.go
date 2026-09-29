@@ -4,7 +4,7 @@ package main
 // Ported from the dicomtool CLI's modify command so both tools transform files
 // identically. Per-file order of operations (matching dicomtool):
 //
-//	parse → ignoretype → ignoremodality → per-modality overrides → fixvr →
+//	parse → ignoretype → ignoremodality → ignoresopclass → per-modality overrides → fixvr →
 //	remove + noprivate + nooverlays → date shift → dob mask → uid remap → set →
 //	transfer syntax
 //
@@ -19,12 +19,16 @@ package main
 import (
 	"archive/zip"
 	"bufio"
+	"bytes"
+	"compress/flate"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
+	"math"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -34,6 +38,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	sdicom "github.com/suyashkumar/dicom"
 	"github.com/suyashkumar/dicom/pkg/tag"
@@ -63,6 +68,7 @@ type modifyParams struct {
 	removeOverlays   bool
 	ignoreTypes      []string
 	ignoreModalities []string
+	ignoreSOPClasses []string
 	perMod           map[string]modalityOverride
 	remapUIDs        bool
 	// targetTS is the transfer syntax UID every output is written in, or "" to
@@ -170,6 +176,14 @@ func compileModifyParams(p ModProfile) (modifyParams, error) {
 			mp.ignoreModalities = append(mp.ignoreModalities, v)
 		}
 	}
+	// SOP class entries are validated rather than trimmed into place: a
+	// misspelt UID matches nothing, and a filter that silently matches
+	// nothing exports exactly the documents it was written to drop.
+	sopClasses, sopErr := validateSOPClassUIDs(p.IgnoreSOPClasses)
+	if sopErr != nil {
+		return mp, sopErr
+	}
+	mp.ignoreSOPClasses = sopClasses
 
 	// Mask regions are validated rather than dropped on the floor, at the top
 	// level and inside every override: buildModalityOverrides skips unparsable
@@ -188,6 +202,9 @@ func compileModifyParams(p ModProfile) (modifyParams, error) {
 		for k, v := range p.PerModality {
 			modKey := strings.ToUpper(k)
 			if err := validateMaskRegions(v.MaskRegions); err != nil {
+				return mp, fmt.Errorf("modality %s: %w", modKey, err)
+			}
+			if _, err := validateSOPClassUIDs(v.IgnoreSOPClasses); err != nil {
 				return mp, fmt.Errorf("modality %s: %w", modKey, err)
 			}
 			// The same refusal as the top level: a hand-authored per-modality
@@ -209,7 +226,7 @@ func compileModifyParams(p ModProfile) (modifyParams, error) {
 	hasAction := len(mp.edits) > 0 || len(mp.removals) > 0 ||
 		mp.dobMask != "" || mp.shiftDays != "" ||
 		mp.removePrivate || mp.removeOverlays || mp.fixvrMode != "" || mp.targetTS != "" ||
-		len(mp.ignoreTypes) > 0 || len(mp.ignoreModalities) > 0 ||
+		len(mp.ignoreTypes) > 0 || len(mp.ignoreModalities) > 0 || len(mp.ignoreSOPClasses) > 0 ||
 		len(mp.perMod) > 0 || mp.remapUIDs || mp.mayMask || mp.dicomdir
 	if !hasAction {
 		return mp, errors.New("the profile contains no actionable parameter (set, remove, dob, shiftdays, noprivate, nooverlays, fixvr, remapuids, transfersyntax, maskregions, dicomdir)")
@@ -227,7 +244,7 @@ type modifyFailure struct {
 // modifyResult summarises a runModification call.
 type modifyResult struct {
 	Processed int // files transformed and written
-	Skipped   int // files skipped by ignoretype/ignoremodality or non-DICOM
+	Skipped   int // files skipped by ignoretype/ignoremodality/ignoresopclass or non-DICOM
 	Failed    int
 	Canceled  bool
 	Failures  []modifyFailure
@@ -438,26 +455,143 @@ func (l exportLayout) relFor(srcPath, rootDir string, before, after exportNames)
 	return filepath.Join(parts[l.dropDirs:]...)
 }
 
-// zipSink serializes finished datasets into a single zip archive. Only the
-// final encode is serialized — a zip writer supports one open entry at a
-// time — so the parse/modify pipeline stays parallel across the worker pool.
+// zipSink collects finished datasets into a single zip archive. A zip writer
+// holds one open entry at a time, so appending to the archive is serialized —
+// and only that: each worker encodes and compresses its own file first, and
+// holds the lock just to copy finished bytes in.
+//
+// It used to hold the lock across the whole encode and the Deflate, so a zip
+// export compressed on one core however many workers fed it: an uncompressed
+// CT study of a gigabyte or so spent tens of seconds deflating single-file
+// behind that lock, and every worker waited there (still holding its memory
+// budget reservation, in a masking run). The standard library's Writer cannot
+// compress concurrently, but CreateRaw accepts an entry already compressed,
+// given its CRC and sizes — see zipRawHeader.
+//
+// Two further choices, both about what is worth compressing:
+//   - Pixel data that is already compressed (JPEG, JPEG 2000, JPEG Lossless) is
+//     stored, not deflated. Deflate recovers a percent or two from such a file
+//     at the full cost of running over it.
+//   - An entry larger than zipParallelMaxBytes is deflated inside the lock from
+//     its encoded bytes instead of into a second in-memory copy first, so a
+//     worker holds at most one full-size copy of a very large file.
+//
+// A panic while encoding now happens before anything reaches the archive, so
+// it leaves no partial entry behind.
 type zipSink struct {
 	mu sync.Mutex
 	zw *zip.Writer
 }
 
+// zipDeflateLevel is archive/zip's own Deflate level, so an entry a worker
+// compresses is byte-for-byte what zw.Create would have written.
+const zipDeflateLevel = 5
+
+// zipParallelMaxBytes is the largest encoded file a worker compresses into
+// memory itself; see zipSink. A var so tests can exercise the large-entry path.
+var zipParallelMaxBytes = 64 << 20
+
+// zipFlatePool reuses Deflate compressors: one per worker per file would
+// otherwise allocate the compressor's ~1 MB of internal state every time.
+var zipFlatePool sync.Pool // *flate.Writer
+
 func (z *zipSink) write(rel string, ds sdicom.Dataset, opts []sdicom.WriteOption) error {
+	var encoded bytes.Buffer
+	if err := sdicom.Write(&encoded, ds, opts...); err != nil {
+		return err
+	}
+	name := filepath.ToSlash(rel)
+	data := encoded.Bytes()
+	crc := crc32.ChecksumIEEE(data)
+
+	if encapsulatedPixelData(&ds) {
+		return z.appendRaw(zipRawHeader(name, zip.Store, crc, len(data), len(data)), data)
+	}
+	if len(data) > zipParallelMaxBytes {
+		z.mu.Lock()
+		defer z.mu.Unlock()
+		w, err := z.zw.Create(name)
+		if err != nil {
+			return err
+		}
+		_, err = w.Write(data)
+		return err
+	}
+
+	var comp bytes.Buffer
+	fw, _ := zipFlatePool.Get().(*flate.Writer)
+	if fw == nil {
+		fw, _ = flate.NewWriter(&comp, zipDeflateLevel)
+	} else {
+		fw.Reset(&comp)
+	}
+	_, werr := fw.Write(data)
+	cerr := fw.Close()
+	zipFlatePool.Put(fw)
+	if werr != nil {
+		return werr
+	}
+	if cerr != nil {
+		return cerr
+	}
+	return z.appendRaw(zipRawHeader(name, zip.Deflate, crc, comp.Len(), len(data)), comp.Bytes())
+}
+
+// appendRaw adds one already-compressed entry — the only work done under the
+// archive's lock.
+func (z *zipSink) appendRaw(h *zip.FileHeader, payload []byte) error {
 	z.mu.Lock()
 	defer z.mu.Unlock()
-	w, err := z.zw.Create(filepath.ToSlash(rel))
+	w, err := z.zw.CreateRaw(h)
 	if err != nil {
 		return err
 	}
-	bw := bufio.NewWriterSize(w, 1<<20)
-	if err := sdicom.Write(bw, ds, opts...); err != nil {
-		return err
+	_, err = w.Write(payload)
+	return err
+}
+
+// zipRawHeader builds the header CreateRaw needs for an entry compressed by the
+// caller, filling in what CreateHeader would otherwise have set itself:
+// CreateRaw writes the header exactly as given.
+//
+//   - The UTF-8 name flag, by CreateHeader's own rule (detectUTF8 in
+//     archive/zip): set when the name has a character outside the ASCII range
+//     CP-437 readers agree on and is valid UTF-8. Folder names come from
+//     patient and study descriptions, which can carry accented letters.
+//   - Version needed to extract: 2.0, or 4.5 when a size needs Zip64.
+//   - For a Zip64-sized entry, the data-descriptor flag, so the 8-byte sizes
+//     follow the data instead of being truncated in the local header.
+func zipRawHeader(name string, method uint16, crc uint32, compressed, uncompressed int) *zip.FileHeader {
+	h := &zip.FileHeader{
+		Name:               name,
+		Method:             method,
+		CRC32:              crc,
+		CompressedSize64:   uint64(compressed),
+		UncompressedSize64: uint64(uncompressed),
+		CreatorVersion:     20,
+		ReaderVersion:      20,
 	}
-	return bw.Flush()
+	if zipNameNeedsUTF8Flag(name) {
+		h.Flags |= 0x800
+	}
+	if h.CompressedSize64 >= math.MaxUint32 || h.UncompressedSize64 >= math.MaxUint32 {
+		h.ReaderVersion = 45
+		h.Flags |= 0x8
+	}
+	return h
+}
+
+// zipNameNeedsUTF8Flag is archive/zip's detectUTF8 rule for a name alone.
+func zipNameNeedsUTF8Flag(name string) bool {
+	if !utf8.ValidString(name) {
+		return false
+	}
+	for _, r := range name {
+		if r < 0x20 || r > 0x7d || r == 0x5c {
+			return true
+		}
+	}
+	return false
 }
 
 // writeRaw serialises data directly into a new zip entry, with none of
@@ -563,23 +697,30 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 		uidRemap = newUIDRemapper()
 	}
 
-	// Modest worker pool: the pipeline is disk-bound for typical studies and
-	// the UI goroutine should keep breathing room (dicomtool, a batch CLI,
-	// uses the full CPU count).
-	numWorkers := min(runtime.NumCPU(), 4, len(files))
+	cpuHeavy := zsink != nil || params.mayMask || params.targetTS != ""
+	numWorkers := modifyWorkerCount(cpuHeavy, len(files))
 
-	// A run that can decompress is admitted by weight as well as by count. Four
-	// workers is the right width for tag edits, where a file costs what it costs
-	// on disk, but decompressing a multi-frame acquisition can cost a hundred
-	// times that — and running out of memory kills the export outright instead
-	// of failing one file. A run that touches no pixels gets no limiter and
-	// behaves exactly as before, down to not paying for the header read below.
-	var budget *memBudget
-	if params.mayMask || params.targetTS != "" {
-		budget = newMemBudget(modifyMemoryBudget)
-		logInfo("modify: memory budget %d MB for in-flight pixel data across %d worker(s)",
-			modifyMemoryBudget>>20, numWorkers)
+	// Every run is admitted by weight as well as by count, so a wider pool can
+	// never mean more memory than the budget (sysmem.go) allows. A file's weight
+	// is what processing it holds at once — see fileWeight — which for a run that
+	// decompresses can be a hundred times its size on disk, and running out of
+	// memory kills the export outright instead of failing one file. For an
+	// ordinary tag-only study the budget never binds: it is there for the run
+	// that meets a handful of very large files at once.
+	budget := newMemBudget(modifyMemoryBudget)
+	decodes := params.mayMask || params.targetTS != ""
+	fileWeight := func(path string, src *os.File) int64 {
+		var w int64
+		if decodes {
+			w = fileMemoryWeight(path)
+		}
+		if info, err := src.Stat(); err == nil {
+			w += info.Size() * encodedCopies(zsink != nil)
+		}
+		return w
 	}
+	logInfo("modify: %d worker(s) at below-normal priority, memory budget %d MB",
+		numWorkers, modifyMemoryBudget>>20)
 
 	var (
 		mu   sync.Mutex
@@ -618,6 +759,10 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// Below-normal priority for the worker's whole life: idle cores are
+			// used in full, but the UI and other applications always come first
+			// (workerpriority.go).
+			defer lowerWorkerPriority()()
 			for path := range jobCh {
 				func() {
 					// partial is the output file while it is mid-write, so a
@@ -635,11 +780,9 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 					// failed, the run continues" concept, so a panic becomes one
 					// more entry in the failure dialog, naming the file.
 					//
-					// A zip run is the one case this cannot fully clean up: the
-					// archive keeps whatever fragment of the entry was written
-					// before the panic. The file is still reported as failed, so
-					// a member that will not open is accounted for rather than
-					// silently present.
+					// A zip run needs no cleanup here: zipSink encodes a file
+					// completely before any of it reaches the archive, so a
+					// panic leaves no partial entry behind.
 					//
 					// recordFailure takes mu, which is safe here: every mu
 					// critical section in this closure is a bare counter
@@ -667,19 +810,17 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 						return
 					}
 					// Weigh the file before allocating anything for it. The
-					// header read never touches pixel data, so it stays cheap
+					// header read stops before the pixel data, so it stays cheap
 					// on exactly the large files this exists to hold back, and
 					// the reservation is held until the write has finished —
 					// the decoded frames stay alive until sdicom.Write has
 					// serialised them.
 					//
-					// A header that will not parse weighs nothing and goes
-					// through: processFile will fail it properly a moment
-					// later, and inventing a weight for a file we cannot read
-					// would be worse than not gating it.
-					if budget != nil {
-						defer budget.acquire(fileMemoryWeight(path))()
-					}
+					// A header that will not parse weighs only its encoded
+					// copies and goes through: processFile will fail it properly
+					// a moment later, and inventing a weight for a file we
+					// cannot read would be worse than not gating it.
+					defer budget.acquire(fileWeight(path, srcFile))()
 					skipped, ds, notes, perr := processFileFn(srcFile, params, uidRemap)
 					if perr != nil {
 						recordFailure(path, fmt.Errorf("process: %w", perr))
@@ -880,6 +1021,39 @@ func elemStringComponents(elem *sdicom.Element) []string {
 	return components
 }
 
+// skipsSOPClass reports whether the file's SOP Class UID (0008,0016) is on
+// the profile's ignoresopclass list or on the list of the per-modality
+// override matching its Modality. Read before the overrides are applied,
+// like the other two filters: a skip decides whether the file is processed
+// at all.
+func skipsSOPClass(ds *sdicom.Dataset, p modifyParams) bool {
+	if len(p.ignoreSOPClasses) == 0 && len(p.perMod) == 0 {
+		return false
+	}
+	elem, err := ds.FindElementByTag(tag.SOPClassUID)
+	if err != nil {
+		return false
+	}
+	lists := [][]string{p.ignoreSOPClasses}
+	if len(p.perMod) > 0 {
+		if modElem, err := ds.FindElementByTag(modalityTag); err == nil {
+			for _, mod := range elemStringComponents(modElem) {
+				if ov, ok := p.perMod[strings.ToUpper(strings.TrimSpace(mod))]; ok && len(ov.ignoreSOPClasses) > 0 {
+					lists = append(lists, ov.ignoreSOPClasses)
+				}
+			}
+		}
+	}
+	for _, value := range elemStringComponents(elem) {
+		for _, list := range lists {
+			if matchesSOPClass(value, list) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // fixvrWriteOpts returns WriteOptions that match the fixvr mode.
 // correct/skip: applyFixVR pre-processes top-level elements, but nested
 // sequence elements are not recursed into, so we still need SkipVRVerification
@@ -935,6 +1109,9 @@ type modalityOverride struct {
 	fixvrMode     string
 	removePrivate bool
 	keepPrivate   bool
+	// ignoreSOPClasses adds to the profile's list for this modality alone —
+	// a skip is a skip, so union is the only merge that cannot surprise.
+	ignoreSOPClasses []string
 	// maskRegions replaces the profile's regions outright for this modality
 	// rather than adding to them — see mergeModProfiles.
 	maskRegions []MaskRegion
@@ -980,6 +1157,9 @@ func buildModalityOverrides(perMod map[string]ModProfile) map[string]modalityOve
 		ov.fixvrMode = p.FixVR
 		ov.removePrivate = p.Priv
 		ov.keepPrivate = p.KeepPrivate
+		// Already validated by compileModifyParams; trimmed here so the
+		// engine compares clean values.
+		ov.ignoreSOPClasses, _ = validateSOPClassUIDs(p.IgnoreSOPClasses)
 		ov.maskRegions = p.MaskRegions
 		result[mod] = ov
 	}
@@ -1106,15 +1286,103 @@ const modifyMemoryOverheadFactor = 2
 
 // fileMemoryWeight is what one file should reserve from the run's budget: the
 // memory its pixels will occupy decoded, with the overhead above. Reads the
-// header only (SkipPixelData never touches the pixels), so it stays cheap on
-// precisely the files it is there to weigh. Returns 0 for a file it cannot read
-// or one with no pixel data — see the call site.
+// header only, stopping before the pixel data (readDicomHeader), so it stays
+// cheap on precisely the files it is there to weigh. It used to parse with
+// SkipPixelData, which despite the name reads every pixel byte to discard it —
+// every file in a masking or conversion run was read in full twice. Returns 0
+// for a file it cannot read or one with no pixel data — see the call site.
 func fileMemoryWeight(path string) int64 {
-	ds, err := safeParseFile(path, nil, sdicom.SkipPixelData())
+	ds, err := readDicomHeader(path)
 	if err != nil {
 		return 0
 	}
 	return projectedPixelBytes(&ds) * modifyMemoryOverheadFactor
+}
+
+// rawPixelPassthrough reports whether a run can carry native pixel data through
+// as the bytes it was stored as, never decoding it into samples.
+//
+// That is every run that cannot mask. Parsing native pixel data into frames
+// costs one io.ReadFull per sample in the library, and writing it back one
+// binary.Write per sample (each a heap allocation) — roughly 15 ms of CPU for a
+// single 512×512 CT slice, which made the pixel data, not the tag rules, most of
+// the cost of a tag-only run over an uncompressed study. With
+// SkipProcessingPixelDataValue the library keeps the element's bytes and the
+// writer copies them out unchanged, so the export's pixel data is byte-identical
+// to the source.
+//
+// Nothing else in the pipeline needs samples. convertDatasetSyntax decodes only
+// encapsulated data (which this option does not affect — its fragments are raw
+// already) and otherwise just re-encodes the header, whose VR change between
+// the two little-endian syntaxes leaves sample bytes as they are. Masking is the
+// exception: it writes sample values, so it needs frames.
+//
+// The one conversion that would have to rewrite native sample bytes — a retired
+// Explicit VR Big Endian source written little-endian — is refused outright by
+// convertDatasetSyntax (checkDecodableSource has no Big Endian path), and a Big
+// Endian source exported without conversion keeps its own syntax, so its raw
+// bytes stay correct. TestRawPassthroughReliesOnBigEndianRefusal fails if that
+// refusal is ever lifted, because the raw path would then need a byte swap.
+func rawPixelPassthrough(p modifyParams) bool {
+	return !p.mayMask
+}
+
+// modifyParseOpts is the parse option set for a modification run's full parse.
+func modifyParseOpts(raw bool) []sdicom.ParseOption {
+	if raw {
+		return []sdicom.ParseOption{sdicom.SkipProcessingPixelDataValue()}
+	}
+	return nil
+}
+
+// encodedCopies is how many times a file's size on disk a worker holds at once
+// besides any decoded pixels: the parsed dataset (with pixel data carried as
+// stored bytes, see rawPixelPassthrough, about the file's own size), the encoded
+// output (the writer buffers each element's value whole, so again about the
+// file's size), and in a zip run the compressed copy zipSink makes. An upper
+// estimate — zipSink makes no compressed copy of an entry past
+// zipParallelMaxBytes, and stores already-compressed images as they are.
+func encodedCopies(zip bool) int64 {
+	if zip {
+		return 3
+	}
+	return 2
+}
+
+// modifyWorkerCount is how many files a run processes at once.
+//
+// A run that burns CPU — a zip export (every entry deflated), masking, a
+// transfer syntax conversion (decode, and for masking re-encode and verify) —
+// gets half the logical processors, between 2 and 8. Logical processors count
+// hyperthreads, so half is about one worker per physical core: that captures
+// most of the throughput the cores have, and leaves each core's sibling thread
+// free for the UI and whatever else the user is running. Paired with the
+// workers' below-normal priority (workerpriority.go) this is what makes a wide
+// pool safe: the cap sets how much the export may use, the priority makes sure
+// it only uses what nobody else wants. 2 as the floor so even a dual-core
+// machine overlaps one file's disk read with another's compression; 8 as the
+// ceiling because past it the memory budget and the disk, not cores, bind.
+//
+// A tag-only folder export keeps the fixed 4 it always had. Since pixel data is
+// carried through as stored bytes it is mostly reading and writing files, and
+// on a spinning disk more concurrent readers mostly add seeking.
+//
+// It used to be min(NumCPU, 4) for every run — every core on a four-thread
+// laptop, a quarter of a sixteen-thread workstation. DICOMQR_MODIFY_WORKERS
+// overrides it (1–64), for settling the default against real hardware, as
+// DICOMQR_SCAN_WORKERS does for the folder scan.
+func modifyWorkerCount(cpuHeavy bool, files int) int {
+	cpus := runtime.NumCPU()
+	w := min(4, cpus)
+	if cpuHeavy {
+		w = max(2, min(cpus/2, 8))
+	}
+	if v := os.Getenv("DICOMQR_MODIFY_WORKERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			w = min(n, 64)
+		}
+	}
+	return max(1, min(w, files))
 }
 
 // processFileFn is the per-file transform the worker pool calls, a variable so
@@ -1146,7 +1414,8 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 		return false, ds, notes, fmt.Errorf("stat: %w", err)
 	}
 	br := bufio.NewReaderSize(src, 1<<20)
-	ds, err = safeParse(br, info.Size(), src.Name(), nil)
+	raw := rawPixelPassthrough(p)
+	ds, err = safeParse(br, info.Size(), src.Name(), nil, modifyParseOpts(raw)...)
 	src.Close()
 	if err != nil {
 		return false, ds, notes, fmt.Errorf("parse: %w", err)
@@ -1183,6 +1452,10 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 				}
 			}
 		}
+	}
+
+	if skipsSOPClass(&ds, p) {
+		return true, ds, notes, nil
 	}
 
 	// Apply per-modality overrides: layer modality-specific settings on top of

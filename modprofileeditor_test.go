@@ -83,6 +83,7 @@ func TestModProfileEditorRoundTrip(t *testing.T) {
 		Flat:             true,
 		IgnoreTypes:      []string{"SECONDARY"},
 		IgnoreModalities: []string{"SR"},
+		IgnoreSOPClasses: []string{"1.2.840.10008.5.1.4.1.1.7"},
 		FixVR:            "correct",
 		TransferSyntax:   tsPrefImplicitLE,
 		PerModality:      map[string]ModProfile{"CT": {Removes: []string{"0018,1030"}}},
@@ -96,6 +97,7 @@ func TestModProfileEditorRoundTrip(t *testing.T) {
 	ed.fields.sets.rows = append(ed.fields.sets.rows, newSetValueRow("0010,0020=ID0000"))
 	ed.ignoreTypesEntry.SetText("SECONDARY, DERIVED")
 	ed.ignoreModsEntry.SetText("SR, PR")
+	ed.ignoreSOPEntry.SetText("1.2.840.10008.5.1.4.1.1.7, 1.2.840.10008.5.1.4.1.1.104.1")
 
 	newName, updated, err := ed.validate()
 	if err != nil {
@@ -112,6 +114,9 @@ func TestModProfileEditorRoundTrip(t *testing.T) {
 	}
 	if want := []string{"SR", "PR"}; !reflect.DeepEqual(updated.IgnoreModalities, want) {
 		t.Errorf("IgnoreModalities = %v, want %v", updated.IgnoreModalities, want)
+	}
+	if want := []string{"1.2.840.10008.5.1.4.1.1.7", "1.2.840.10008.5.1.4.1.1.104.1"}; !reflect.DeepEqual(updated.IgnoreSOPClasses, want) {
+		t.Errorf("IgnoreSOPClasses = %v, want %v", updated.IgnoreSOPClasses, want)
 	}
 	if !updated.KeepPrivate || !updated.Verbose {
 		t.Errorf("control-less fields lost: keepprivate=%v verbose=%v",
@@ -295,6 +300,7 @@ func TestModProfileEditorValidationErrors(t *testing.T) {
 	}{
 		{"empty name", func(ed *modProfileEditor) { ed.nameEntry.SetText("") }, "must not be empty"},
 		{"rename collision", func(ed *modProfileEditor) { ed.nameEntry.SetText("other") }, "already exists"},
+		{"ignore SOP class not a UID", func(ed *modProfileEditor) { ed.ignoreSOPEntry.SetText("SC") }, "not a UID"},
 		// A row can only carry a non-tag reference if it came from a hand-edited
 		// profiles.json; the editor reports it rather than dropping the line.
 		{"unparsable set row", func(ed *modProfileEditor) {
@@ -507,6 +513,7 @@ func TestPerModalityEditorValidation(t *testing.T) {
 	}{
 		{"empty code", func(ed *perModalityEditor) { ed.codeEntry.SetText(" ") }, "must not be empty"},
 		{"internal space", func(ed *perModalityEditor) { ed.codeEntry.SetText("C T") }, "single word"},
+		{"ignore SOP class not a UID", func(ed *perModalityEditor) { ed.ignoreSOPEntry.SetText("SC") }, "not a UID"},
 		// The engine silently drops unparsable per-modality tag lines — the
 		// editor must reject them instead, so the user gets feedback.
 		{"unparsable remove", func(ed *perModalityEditor) { ed.fields.removes.SetText("notatag") }, "not a GGGG,EEEE tag"},
@@ -750,5 +757,35 @@ func TestModProfileEditorSavesMaskRegions(t *testing.T) {
 	}
 	if got, want := perModalitySummary(code, override), "1 mask"; !strings.Contains(got, want) {
 		t.Errorf("summary = %q, want it to mention %q", got, want)
+	}
+}
+
+// The per-modality sub-editor carries its own Ignore SOP classes entry — the
+// one file filter honoured inside an override — with the same hint line and
+// validation as the main editor, and clears to nil rather than an empty list.
+func TestPerModalityEditorIgnoreSOPClasses(t *testing.T) {
+	test.NewApp()
+	ed := newPerModalityEditor("CT", ModProfile{IgnoreSOPClasses: []string{"1.2.840.10008.5.1.4.1.1.7"}}, nil)
+	if ed.ignoreSOPEntry.Text != "1.2.840.10008.5.1.4.1.1.7" {
+		t.Errorf("entry seeded with %q", ed.ignoreSOPEntry.Text)
+	}
+	if ed.ignoreSOPNames.Text != "Secondary Capture Image" {
+		t.Errorf("hint = %q", ed.ignoreSOPNames.Text)
+	}
+	ed.ignoreSOPEntry.SetText("1.2.840.10008.5.1.4.1.1.7, 1.2.3, SC")
+	if want := "Secondary Capture Image; 1.2.3: unknown class; SC: not a UID"; ed.ignoreSOPNames.Text != want {
+		t.Errorf("hint after edit = %q, want %q", ed.ignoreSOPNames.Text, want)
+	}
+	ed.ignoreSOPEntry.SetText("1.2.840.10008.5.1.4.1.1.7, 1.2.3")
+	_, updated, err := ed.validate()
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if want := []string{"1.2.840.10008.5.1.4.1.1.7", "1.2.3"}; !reflect.DeepEqual(updated.IgnoreSOPClasses, want) {
+		t.Errorf("IgnoreSOPClasses = %v, want %v", updated.IgnoreSOPClasses, want)
+	}
+	ed.ignoreSOPEntry.SetText("")
+	if _, updated, err := ed.validate(); err != nil || updated.IgnoreSOPClasses != nil {
+		t.Errorf("cleared entry: %v / %#v, want nil", err, updated.IgnoreSOPClasses)
 	}
 }

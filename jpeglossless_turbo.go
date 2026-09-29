@@ -354,17 +354,19 @@ func decodeJPEGLosslessFrame(data []byte, slope, intercept float64, hasWindow bo
 	// Monochrome: sign-extend when the dataset declares signed pixels (SOF3
 	// precision equals Bits Stored, so extension around 2^(prec-1) is exact),
 	// then rescale into the float buffer the viewer windows.
-	half := int64(1) << uint(prec-1)
-	full := int64(1) << uint(prec)
-	gray := make([]float32, pixels)
-	for i := 0; i < pixels; i++ {
-		v := int64(samples[i])
-		if isSigned && v >= half {
-			v -= full
+	stored := samples[:pixels]
+	if isSigned {
+		half := int32(1) << uint(prec-1)
+		full := int32(1) << uint(prec)
+		stored = make([]int32, pixels)
+		for i, v := range samples[:pixels] {
+			if v >= half {
+				v -= full
+			}
+			stored[i] = v
 		}
-		gray[i] = float32(float64(v)*slope + intercept)
 	}
-	df := &decodedFrame{rows: h, cols: w, gray: gray, invert: photometric == "MONOCHROME1"}
+	df := newGrayFrame(h, w, stored, slope, intercept, photometric == "MONOCHROME1")
 	df.computeDefaultWindow(hasWindow, wc, ww)
 	return df, nil
 }

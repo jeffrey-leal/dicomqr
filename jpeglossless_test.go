@@ -97,8 +97,8 @@ func TestDecodeJPEGLosslessFrameGray16(t *testing.T) {
 			t.Fatal("grayscale frame must be windowable")
 		}
 		for i := 0; i < 64; i++ {
-			if df.gray[i] != float32(i*1024) {
-				t.Fatalf("gray[%d] = %v, want %v", i, df.gray[i], float32(i*1024))
+			if df.displayValues()[i] != float32(i*1024) {
+				t.Fatalf("gray[%d] = %v, want %v", i, df.displayValues()[i], float32(i*1024))
 			}
 		}
 	})
@@ -112,8 +112,8 @@ func TestDecodeJPEGLosslessFrameGray16(t *testing.T) {
 			if v >= 32768 {
 				v -= 65536
 			}
-			if df.gray[i] != float32(v) {
-				t.Fatalf("gray[%d] = %v, want %v (sign extension)", i, df.gray[i], float32(v))
+			if df.displayValues()[i] != float32(v) {
+				t.Fatalf("gray[%d] = %v, want %v (sign extension)", i, df.displayValues()[i], float32(v))
 			}
 		}
 	})

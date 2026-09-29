@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -47,11 +48,11 @@ func loadMaskFrame(path string) (image.Image, *sdicom.Dataset, error) {
 	if len(p.frames) == 0 {
 		return nil, nil, fmt.Errorf("%s has no image data", filepath.Base(path))
 	}
-	state, err := p.frameState(len(p.frames) / 2)
+	state, err := p.frameStateOpts(len(p.frames)/2, interactiveDecodeOpts()) // the user is waiting on this one frame
 	if err != nil {
 		return nil, nil, err
 	}
-	ds, err := safeParseFile(path, nil, sdicom.SkipPixelData())
+	ds, err := readDicomHeader(path)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -354,23 +355,32 @@ func scanMaskSeries(files []string, progress func(done, total int)) (series []ma
 	var (
 		mu    sync.Mutex
 		byUID = map[string]*maskSeries{}
-		done  int
+		done  atomic.Int64
 	)
-	workers := min(4, len(files))
-	if workers == 0 {
+	total := len(files)
+	if total == 0 {
 		return nil, 0
 	}
+	// Paced, never per file: the caller hands each report to the UI. See
+	// startPacedProgress.
+	var publish func()
+	if progress != nil {
+		publish = func() { progress(int(done.Load()), total) }
+	}
+	stopReporting := startPacedProgress(scanProgressInterval, publish)
+
+	// A header read is a seek and a few KB (readDicomHeader never touches the
+	// pixel data), so this is bound by disk latency like the folder scan, and
+	// takes the same worker count.
 	jobs := make(chan string)
 	var wg sync.WaitGroup
-	for range workers {
+	for range scanWorkers(total) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for path := range jobs {
-				ds, err := safeParseFile(path, nil, sdicom.SkipPixelData())
+				ds, err := readDicomHeader(path)
 				mu.Lock()
-				done++
-				d := done
 				cols, rows := 0, 0
 				if err == nil {
 					cols = datasetInt(&ds, tag.Columns, 0)
@@ -403,9 +413,7 @@ func scanMaskSeries(files []string, progress func(done, total int)) (series []ma
 					})
 				}
 				mu.Unlock()
-				if progress != nil {
-					progress(d, len(files))
-				}
+				done.Add(1)
 			}
 		}()
 	}
@@ -414,6 +422,10 @@ func scanMaskSeries(files []string, progress func(done, total int)) (series []ma
 	}
 	close(jobs)
 	wg.Wait()
+	stopReporting()
+	if progress != nil {
+		progress(total, total)
+	}
 
 	out := make([]maskSeries, 0, len(byUID))
 	for _, sr := range byUID {
@@ -674,9 +686,7 @@ func showMaskPreview(a fyne.App, parent fyne.Window, profileName string,
 
 	go func() {
 		series, skipped := scanMaskSeries(files, func(done, total int) {
-			if total > 0 && (done%25 == 0 || done == total) {
-				fyne.Do(func() { prog.SetValue(float64(done) / float64(total)) })
-			}
+			fyne.Do(func() { prog.SetValue(float64(done) / float64(total)) })
 		})
 		fyne.Do(func() {
 			busy.Hide()

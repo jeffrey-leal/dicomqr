@@ -29,10 +29,11 @@ const (
 	// file larger than the whole budget is clamped to it by memBudget.acquire
 	// and runs alone, so a low budget slows a run down rather than stalling it.
 	//
-	// Above the ceiling the four-worker cap is the binding constraint anyway —
-	// a larger budget simply means the gate never engages, which is the right
-	// behaviour on a large workstation — so raising it further would buy
-	// nothing while giving the application licence to make a machine swap.
+	// Above the ceiling the worker cap (at most 8, see modifyWorkerCount) is the
+	// binding constraint for all but the very largest files — a larger budget
+	// simply means the gate rarely engages, which is the right behaviour on a
+	// large workstation — so raising it further would buy little while giving
+	// the application licence to make a machine swap.
 	modifyMemoryFloor   = 512 << 20
 	modifyMemoryCeiling = 4 << 30
 

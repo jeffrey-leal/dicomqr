@@ -44,8 +44,9 @@ var defaultModProfilesJSON []byte
 // JSON keys are identical to dicomtool's Profile so the stores interoperate,
 // except: Zip and Flat are dicomqr-only (dicomtool's zip is a CLI-run
 // parameter, not a profile field, and has no flat equivalent at all),
-// TransferSyntax is dicomqr-only (dicomtool has no equivalent), and
-// dicomtool's maskrows has no field here by design.
+// TransferSyntax and IgnoreSOPClasses are dicomqr-only (dicomtool has no
+// equivalent for either), and dicomtool's maskrows has no field here by
+// design.
 type ModProfile struct {
 	Base    string   `json:"base,omitempty"`
 	Sets    []string `json:"set,omitempty"`
@@ -66,6 +67,17 @@ type ModProfile struct {
 	Zip              bool     `json:"zip,omitempty"`
 	IgnoreTypes      []string `json:"ignoretype,omitempty"`
 	IgnoreModalities []string `json:"ignoremodality,omitempty"`
+	// IgnoreSOPClasses skips a file whose SOP Class UID (0008,0016) is listed.
+	// The filter for objects that carry the study's imaging modality without
+	// being images the modality acquired — scanned documents, dose and
+	// protocol pages, saved screens — which arrive as Secondary Capture
+	// objects whatever Modality they are labelled with, invisible to the two
+	// filters above (see sopclass.go). dicomqr-only. Unlike ignoretype and
+	// ignoremodality it is also honored inside a per-modality override, where
+	// it adds to the profile's list for that modality alone: a base can skip
+	// Secondary Capture for CT, MR, NM and PT and leave an echo study's
+	// measurement screens — Secondary Capture too — to the mask review.
+	IgnoreSOPClasses []string `json:"ignoresopclass,omitempty"`
 	FixVR            string   `json:"fixvr,omitempty"`
 
 	// Dicomdir writes a DICOMDIR (PS3.10 File-set) index alongside the export,
@@ -439,6 +451,17 @@ func mergeModProfiles(base, override ModProfile) ModProfile {
 		if !seenM[key] {
 			seenM[key] = true
 			result.IgnoreModalities = append(result.IgnoreModalities, v)
+		}
+	}
+
+	// IgnoreSOPClasses: union, deduplicated (UIDs compare exactly once trimmed).
+	seenS := make(map[string]bool, len(base.IgnoreSOPClasses)+len(override.IgnoreSOPClasses))
+	result.IgnoreSOPClasses = nil
+	for _, v := range append(base.IgnoreSOPClasses, override.IgnoreSOPClasses...) {
+		key := strings.TrimSpace(v)
+		if key != "" && !seenS[key] {
+			seenS[key] = true
+			result.IgnoreSOPClasses = append(result.IgnoreSOPClasses, v)
 		}
 	}
 

@@ -243,7 +243,9 @@ func (s *chapterStrip) loadThumbnails(chapters []chapter) {
 					return
 				}
 				c := chapters[i]
-				st, err := loadDicomFrame(c.path, c.frames/2)
+				// Twice the cell: the box filter below still has pixels to
+				// average, but a large JPEG 2000 frame no longer decodes in full.
+				st, err := loadDicomThumbnail(c.path, c.frames/2, 2*chapterThumbSide)
 				if err != nil || st.img == nil || s.isStopped() {
 					continue
 				}

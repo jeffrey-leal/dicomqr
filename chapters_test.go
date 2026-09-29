@@ -324,6 +324,73 @@ func TestScanChaptersUnreadableFileIsOneFrameChapter(t *testing.T) {
 	}
 }
 
+// The study overview scans every series of a study on one shared pool
+// (scanChapterGroups) instead of a pool per series. Sharing the pool must not
+// change what any series gets: each group comes back exactly as scanChapters
+// would return it alone — its own instance order, and an unreadable file's
+// fallback numbered by its place in its own series, not in the whole study.
+func TestScanChapterGroupsMatchesPerSeriesScan(t *testing.T) {
+	dirA, dirB := t.TempDir(), t.TempDir()
+	groupA := []string{
+		writeMultiframeTestFile(t, dirA, 2, 3),
+		writeMultiframeTestFile(t, dirA, 5, 1),
+		writeMultiframeTestFile(t, dirA, 1, 2),
+	}
+	junk := filepath.Join(dirB, "junk.dcm")
+	if err := os.WriteFile(junk, []byte("not dicom"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	groupB := []string{writeMultiframeTestFile(t, dirB, 3, 7), junk}
+
+	var last, calls int
+	got := scanChapterGroups([][]string{groupA, groupB, nil}, func(done, total int) {
+		calls++
+		last = done
+		if total != len(groupA)+len(groupB) {
+			t.Errorf("progress total = %d, want every file of every group", total)
+		}
+	})
+	if calls == 0 || last != len(groupA)+len(groupB) {
+		t.Errorf("last progress = %d after %d report(s), want %d", last, calls, len(groupA)+len(groupB))
+	}
+	if len(got) != 3 || len(got[2]) != 0 {
+		t.Fatalf("got %d groups (last holding %d), want 3 with the empty one empty", len(got), len(got[2]))
+	}
+	for g, paths := range [][]string{groupA, groupB} {
+		want := scanChapters(paths, nil)
+		if len(got[g]) != len(want) {
+			t.Fatalf("group %d: %d chapters, want %d", g, len(got[g]), len(want))
+		}
+		for i := range want {
+			if got[g][i].path != want[i].path || got[g][i].instanceNum != want[i].instanceNum ||
+				got[g][i].frames != want[i].frames || got[g][i].label != want[i].label {
+				t.Errorf("group %d chapter %d = %s #%d (%d frames), want %s #%d (%d frames)", g, i,
+					filepath.Base(got[g][i].path), got[g][i].instanceNum, got[g][i].frames,
+					filepath.Base(want[i].path), want[i].instanceNum, want[i].frames)
+			}
+		}
+	}
+	// The unreadable file is second in its own series, so its fallback label
+	// numbers it 2 — not 5, its position across the whole study.
+	for _, c := range got[1] {
+		if want := fallbackChapterLabel(2, 1); c.path == junk && c.label != want {
+			t.Errorf("unreadable file labelled %q, want %q (its place in its own series)", c.label, want)
+		}
+	}
+}
+
+func TestOverviewThumbWorkersBounds(t *testing.T) {
+	if got := overviewThumbWorkers(0); got != 1 {
+		t.Errorf("workers for no series = %d, want 1", got)
+	}
+	if got := overviewThumbWorkers(2); got > 2 {
+		t.Errorf("workers for 2 series = %d, want no more than the series", got)
+	}
+	if got := overviewThumbWorkers(100); got > 4 {
+		t.Errorf("workers for 100 series = %d, want at most 4", got)
+	}
+}
+
 func TestScanChaptersReportsProgress(t *testing.T) {
 	dir := t.TempDir()
 	paths := []string{
@@ -331,10 +398,24 @@ func TestScanChaptersReportsProgress(t *testing.T) {
 		writeMultiframeTestFile(t, dir, 2, 2),
 		writeMultiframeTestFile(t, dir, 2, 3),
 	}
+	// Reports are paced by time from one goroutine, never one per file (the
+	// caller hands each straight to the UI), so the contract is: counts never
+	// go backwards, and the last one says every file is done. A tiny interval
+	// lets the ticker fire mid-scan too; appending without a lock is itself
+	// part of the test under -race, since reports must never overlap.
+	saved := scanProgressInterval
+	scanProgressInterval = time.Microsecond
+	t.Cleanup(func() { scanProgressInterval = saved })
+
 	var seen []int
 	scanChapters(paths, func(done int) { seen = append(seen, done) })
-	if len(seen) != 3 || seen[0] != 1 || seen[2] != 3 {
-		t.Errorf("progress = %v, want 1,2,3", seen)
+	if len(seen) == 0 || seen[len(seen)-1] != len(paths) {
+		t.Fatalf("progress = %v, want the last report to be %d", seen, len(paths))
+	}
+	for i := 1; i < len(seen); i++ {
+		if seen[i] < seen[i-1] {
+			t.Errorf("progress went backwards: %v", seen)
+		}
 	}
 }
 

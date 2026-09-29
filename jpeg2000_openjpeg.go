@@ -70,7 +70,40 @@ static void dq_free(int32_t *p) { free(p); }
 // Quietly swallow OpenJPEG's diagnostic messages.
 static void dq_quiet(const char *msg, void *client) { (void)msg; (void)client; }
 
-static void dq_decode_j2k(const unsigned char *data, int len, dq_j2k_result *r) {
+// dq_reduce_for picks how many resolution levels to discard so the decoded
+// image is still at least max_side on its longer side: each level halves both
+// dimensions (rounding up), and a codestream with N resolutions can drop at
+// most N-1. max_side <= 0 means full resolution.
+static OPJ_UINT32 dq_reduce_for(opj_codec_t *codec, opj_image_t *image, int max_side) {
+    if (max_side <= 0) return 0;
+    opj_codestream_info_v2_t *info = opj_get_cstr_info(codec);
+    if (!info) return 0;
+    OPJ_UINT32 numres = 0;
+    if (info->m_default_tile_info.tccp_info) {
+        numres = info->m_default_tile_info.tccp_info[0].numresolutions;
+        for (OPJ_UINT32 c = 1; c < info->nbcomps; c++) {
+            OPJ_UINT32 n = info->m_default_tile_info.tccp_info[c].numresolutions;
+            if (n < numres) numres = n;
+        }
+    }
+    opj_destroy_cstr_info(&info);
+    if (numres <= 1) return 0;
+    OPJ_UINT32 w = image->x1 - image->x0, h = image->y1 - image->y0;
+    OPJ_UINT32 side = w > h ? w : h;
+    OPJ_UINT32 reduce = 0;
+    while (reduce + 1 < numres) {
+        OPJ_UINT32 next = (side + (1u << (reduce + 1)) - 1) >> (reduce + 1);
+        if ((int)next < max_side) break;
+        reduce++;
+    }
+    return reduce;
+}
+
+// dq_decode_j2k decodes one codestream. threads > 1 decodes code-blocks on that
+// many worker threads (when the library was built with thread support);
+// max_side > 0 decodes at the lowest resolution level still at least that
+// large, for a thumbnail.
+static void dq_decode_j2k(const unsigned char *data, int len, int threads, int max_side, dq_j2k_result *r) {
     memset(r, 0, sizeof(*r));
     if (len < 12) { dq_err(r, "JPEG 2000 codestream too short"); return; }
 
@@ -114,6 +147,12 @@ static void dq_decode_j2k(const unsigned char *data, int len, dq_j2k_result *r) 
         dq_err(r, "opj_setup_decoder failed");
         return;
     }
+    // Thread count has to be set between setup and reading the header. A
+    // library built without thread support decodes on the calling thread, as
+    // before, so failure here is not an error.
+    if (threads > 1 && opj_has_thread_support()) {
+        opj_codec_set_threads(codec, threads);
+    }
 
     opj_image_t *image = NULL;
     if (!opj_read_header(stream, codec, &image)) {
@@ -122,6 +161,12 @@ static void dq_decode_j2k(const unsigned char *data, int len, dq_j2k_result *r) 
         opj_stream_destroy(stream);
         dq_err(r, "opj_read_header failed");
         return;
+    }
+    // A factor the codec refuses leaves it at full resolution, which still
+    // makes a thumbnail — so its result is deliberately not treated as fatal.
+    OPJ_UINT32 reduce = dq_reduce_for(codec, image, max_side);
+    if (reduce > 0) {
+        opj_set_decoded_resolution_factor(codec, reduce);
     }
     if (!opj_decode(codec, stream, image) || !opj_end_decompress(codec, stream)) {
         opj_image_destroy(image);
@@ -362,15 +407,27 @@ import (
 // transcode a JPEG 2000 file.
 const jpeg2000Available = true
 
+// jpeg2000ThreadSupport reports whether the linked OpenJPEG can decode on
+// several threads; without it frameDecodeOpts.threads is silently ignored.
+func jpeg2000ThreadSupport() bool { return C.opj_has_thread_support() != 0 }
+
 // decodeJPEG2000 decodes a JPEG 2000 codestream (or JP2) into planar int32
 // component samples plus geometry. samples holds numComps planes of
-// width*height values (plane 0 first).
+// width*height values (plane 0 first). Single-threaded, full resolution: what
+// every conversion and verification path needs.
 func decodeJPEG2000(data []byte) (width, height, numComps, prec int, signed bool, samples []int32, err error) {
+	return decodeJPEG2000Opts(data, frameDecodeOpts{})
+}
+
+// decodeJPEG2000Opts is decodeJPEG2000 tuned for where the image is going: see
+// frameDecodeOpts. With maxSide set, width and height are the reduced size.
+func decodeJPEG2000Opts(data []byte, opts frameDecodeOpts) (width, height, numComps, prec int, signed bool, samples []int32, err error) {
 	if len(data) == 0 {
 		return 0, 0, 0, 0, false, nil, errors.New("empty JPEG 2000 data")
 	}
 	var res C.dq_j2k_result
-	C.dq_decode_j2k((*C.uchar)(unsafe.Pointer(&data[0])), C.int(len(data)), &res)
+	C.dq_decode_j2k((*C.uchar)(unsafe.Pointer(&data[0])), C.int(len(data)),
+		C.int(opts.threads), C.int(opts.maxSide), &res)
 	if res.ok == 0 {
 		return 0, 0, 0, 0, false, nil, fmt.Errorf("jpeg2000: %s", C.GoString(&res.err[0]))
 	}
@@ -387,8 +444,8 @@ func decodeJPEG2000(data []byte) (width, height, numComps, prec int, signed bool
 // decodeJPEG2000Frame decodes a JPEG 2000 frame into a decodedFrame, mapping
 // monochrome samples through rescale slope/intercept into the windowing pipeline
 // (so window/level and colour maps apply) and colour samples into an RGB image.
-func decodeJPEG2000Frame(data []byte, slope, intercept float64, hasWindow bool, wc, ww float64, photometric string) (*decodedFrame, error) {
-	w, h, nc, prec, _, samples, err := decodeJPEG2000(data)
+func decodeJPEG2000Frame(data []byte, opts frameDecodeOpts, slope, intercept float64, hasWindow bool, wc, ww float64, photometric string) (*decodedFrame, error) {
+	w, h, nc, prec, _, samples, err := decodeJPEG2000Opts(data, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -416,12 +473,8 @@ func decodeJPEG2000Frame(data []byte, slope, intercept float64, hasWindow bool, 
 		return &decodedFrame{rows: h, cols: w, colorImg: img}, nil
 	}
 
-	// Monochrome: rescale into the float buffer the viewer windows.
-	gray := make([]float32, pixels)
-	for i := 0; i < pixels; i++ {
-		gray[i] = float32(float64(samples[i])*slope + intercept)
-	}
-	df := &decodedFrame{rows: h, cols: w, gray: gray, invert: photometric == "MONOCHROME1"}
+	// Monochrome: the stored values the viewer windows (see grayframe.go).
+	df := newGrayFrame(h, w, samples[:pixels], slope, intercept, photometric == "MONOCHROME1")
 	df.computeDefaultWindow(hasWindow, wc, ww)
 	return df, nil
 }

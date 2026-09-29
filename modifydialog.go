@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -67,10 +68,12 @@ func pathWithinDir(dir, root string) bool {
 }
 
 // showModificationDialog opens the profile confirmation dialog for applying
-// profileName to files (the local files of one Patient or Study node).
+// profileName to files — the local files of one Patient or Study node, or
+// Local Browse's selection within one patient (see modificationScope).
 // rootDir is the download-folder root the files live under; studyLevel is
-// true when the selection is a Study node, false for a Patient node — it
-// drives the PHI-safe output layout (see exportLayout).
+// true when every file lies within one study, false when they span a
+// patient's studies — it drives the PHI-safe output layout (see
+// exportLayout).
 func showModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabel string, files []string, rootDir string, studyLevel bool) {
 	if len(files) == 0 {
 		dialog.ShowInformation("Modification",
@@ -304,6 +307,23 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	}
 	if len(resolved.IgnoreModalities) > 0 {
 		notes = append(notes, "skip Modality "+strings.Join(resolved.IgnoreModalities, ", "))
+	}
+	if len(resolved.IgnoreSOPClasses) > 0 {
+		notes = append(notes, "skip SOP Class "+sopClassListSummary(resolved.IgnoreSOPClasses))
+	}
+	// An override's SOP class filter adds to the profile's for its modality;
+	// named per modality, since each can list different classes.
+	if len(resolved.PerModality) > 0 {
+		codes := make([]string, 0, len(resolved.PerModality))
+		for k := range resolved.PerModality {
+			codes = append(codes, k)
+		}
+		sort.Strings(codes)
+		for _, k := range codes {
+			if list := resolved.PerModality[k].IgnoreSOPClasses; len(list) > 0 {
+				notes = append(notes, k+": skip SOP Class "+sopClassListSummary(list))
+			}
+		}
 	}
 	if len(runMasks.PerModality) > 0 {
 		mods := make([]string, 0, len(runMasks.PerModality))
@@ -720,20 +740,44 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 
 	go func() {
 		logInfo("modify: profile %q, %d file(s) → %s", profileName, total, outDir)
-		onProgress := func(done, tot int) {
-			if done%10 == 0 || done == tot {
-				fyne.Do(func() {
-					progressBar.SetValue(float64(done) / float64(tot))
-					statusLbl.SetText(fmt.Sprintf("Processing %d / %d…", done, tot))
-				})
+		// The workers only record how far they have got; one reporter posts
+		// it at a fixed rate (see startPacedProgress). A per-10-files trigger
+		// fired at whatever rate files finished, and once a tag-only run
+		// stopped decoding pixel data (rawPixelPassthrough) that became a burst
+		// of updates the UI goroutine had to drain one by one.
+		// Workers report concurrently and can arrive out of order, so keep
+		// the highest count rather than the latest.
+		var doneFiles atomic.Int64
+		onProgress := func(done, _ int) {
+			for {
+				cur := doneFiles.Load()
+				if int64(done) <= cur || doneFiles.CompareAndSwap(cur, int64(done)) {
+					return
+				}
 			}
 		}
+		shown := int64(-1)
+		publish := func() {
+			done := doneFiles.Load()
+			if done == shown {
+				return
+			}
+			shown = done
+			fyne.Do(func() {
+				progressBar.SetValue(float64(done) / float64(total))
+				if ctx.Err() == nil {
+					statusLbl.SetText(fmt.Sprintf("Processing %d / %d…", done, total))
+				}
+			})
+		}
+		stopProgress := startPacedProgress(scanProgressInterval, publish)
 		var res modifyResult
 		if asZip {
 			res = runModificationToZip(ctx, files, rootDir, outDir, params, outLayout, onProgress)
 		} else {
 			res = runModification(ctx, files, rootDir, outDir, params, outLayout, onProgress)
 		}
+		stopProgress()
 		logInfo("modify: %q finished — %d written, %d skipped, %d failed, %d recompressed after masking, %d lossy re-encoded lossless, %d decompressed for masking, cancelled=%v → %s",
 			profileName, res.Processed, res.Skipped, res.Failed, res.MaskRecompressed, res.MaskRecodedLossless, res.MaskDecompressed, res.Canceled, outDir)
 		fyne.Do(func() {

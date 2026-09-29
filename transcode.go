@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -232,7 +234,15 @@ func transcodeDICOMFileToTemp(path, targetTS, tmpDir string) (string, bool, erro
 		return "", false, err
 	}
 	tmpPath := tmp.Name()
-	writeErr := sdicom.Write(tmp, ds, sdicom.SkipVRVerification(), sdicom.SkipValueTypeVerification())
+	// Buffered: the writer emits every element as several small writes, and
+	// unbuffered each one was a syscall on the receive path — where the PACS
+	// waits for this file's C-STORE response before sending the next object.
+	// The modification engine has always wrapped the same call this way.
+	bw := bufio.NewWriterSize(tmp, 1<<20)
+	writeErr := sdicom.Write(bw, ds, sdicom.SkipVRVerification(), sdicom.SkipValueTypeVerification())
+	if writeErr == nil {
+		writeErr = bw.Flush()
+	}
 	closeErr := tmp.Close()
 	if writeErr != nil || closeErr != nil {
 		os.Remove(tmpPath)
@@ -382,20 +392,50 @@ func jpegFrameToNative(fr *frame.Frame, bitsAlloc int) (frame.INativeFrame, bool
 		return nf, false, err
 	default:
 		// Colour (YCbCr from the JPEG decoder) → interleaved 8-bit RGB.
+		rgb := interleavedRGB(img)
 		nf, err := newNativeFromSamples(bitsAlloc, h, w, 3, func(i int) int32 {
-			pixel, comp := i/3, i%3
-			r, g, bl, _ := img.At(b.Min.X+pixel%w, b.Min.Y+pixel/w).RGBA()
-			switch comp {
-			case 0:
-				return int32(r >> 8)
-			case 1:
-				return int32(g >> 8)
-			default:
-				return int32(bl >> 8)
-			}
+			return int32(rgb[i])
 		})
 		return nf, true, err
 	}
+}
+
+// interleavedRGB converts a decoded colour image to 8-bit RGB triples in pixel
+// order — each pixel converted once.
+//
+// The loop it replaces asked img.At(x, y).RGBA() three times per pixel, once
+// per component: each call a YCbCr→RGB conversion plus a colour boxed into an
+// interface (a heap allocation), so an 800×600 echo frame cost 1.4 million of
+// them — more than the JPEG decode itself, on every frame a masked JPEG
+// Baseline export decompresses. For the *image.YCbCr the JPEG decoder returns,
+// this reads the planes directly and calls color.YCbCrToRGB, which the standard
+// library guarantees equals YCbCr.RGBA()>>8 (image/color's
+// TestYCbCrToRGBConsistency), so the samples are bit-identical. Any other image
+// type keeps the generic path, converted once per pixel rather than thrice.
+func interleavedRGB(img image.Image) []uint8 {
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	out := make([]uint8, w*h*3)
+	if ycc, ok := img.(*image.YCbCr); ok {
+		for y := 0; y < h; y++ {
+			for x := 0; x < w; x++ {
+				yi := ycc.YOffset(b.Min.X+x, b.Min.Y+y)
+				ci := ycc.COffset(b.Min.X+x, b.Min.Y+y)
+				r, g, bl := color.YCbCrToRGB(ycc.Y[yi], ycc.Cb[ci], ycc.Cr[ci])
+				o := (y*w + x) * 3
+				out[o], out[o+1], out[o+2] = r, g, bl
+			}
+		}
+		return out
+	}
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			r, g, bl, _ := img.At(b.Min.X+x, b.Min.Y+y).RGBA()
+			o := (y*w + x) * 3
+			out[o], out[o+1], out[o+2] = uint8(r>>8), uint8(g>>8), uint8(bl>>8)
+		}
+	}
+	return out
 }
 
 // newNativeFromSamples builds a NativeFrame of the width the dataset's

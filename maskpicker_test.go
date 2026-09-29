@@ -307,6 +307,7 @@ func TestScanMaskSeriesReadsCalibrationPerFile(t *testing.T) {
 				t.Fatalf("parse: %v", err)
 			}
 			ds.Elements = append(ds.Elements, usRegionElement(t, 10, 40, 789, 559))
+			sortElementsByTag(&ds)
 			f, err := os.Create(p)
 			if err != nil {
 				t.Fatalf("create: %v", err)
@@ -491,6 +492,7 @@ func TestScanMaskSeriesBuildsChapters(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	ds.Elements = append(ds.Elements, mustTestElement(t, tag.NumberOfFrames, []string{"7"}))
+	sortElementsByTag(&ds)
 	f, err := os.Create(clip)
 	if err != nil {
 		t.Fatalf("create: %v", err)
