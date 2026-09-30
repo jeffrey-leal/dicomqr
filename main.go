@@ -154,6 +154,12 @@ func main() {
 	// Persistent SQLite index of the download directory backing the Local
 	// Browse tree. A nil catalog (open failure) degrades gracefully — every
 	// catalog method is nil-safe and the tab falls back to in-memory scans.
+	// Received objects needing a transfer syntax conversion are converted
+	// after their C-STORE/C-GET response, on this background converter
+	// (receiveconvert.go) — shared by the SCP and the C-GET path, drained at
+	// the end of every retrieve.
+	recvConv := newReceiveConverter()
+
 	cat, catErr := openCatalog(cfg.DownloadDir)
 	if catErr != nil {
 		logError("catalog: open: %v", catErr)
@@ -300,6 +306,13 @@ func main() {
 	// a restart (Phase 5-2F). It is safe to call multiple times — clearConn
 	// returns a nil SCP after the first call.
 	shutdownSCP := func() {
+		// Conversions still queued are not waited for — shutdown must stay
+		// prompt — and are not lost either: their pending files are finished
+		// at the next start (recoverPendingConversions). Say so, since the
+		// files will be missing from the download folder until then.
+		if n := recvConv.pendingCount(); n > 0 {
+			logWarn("receive: %d received file(s) still converting at shutdown — they will be finished at the next start", n)
+		}
 		if s, cancel := clearConn(); s != nil {
 			if cancel != nil {
 				cancel()
@@ -837,6 +850,7 @@ func main() {
 
 			s := NewStorageSCP(cfg.LocalAETitle, cfg.LocalSCPPort, cfg.DownloadDir)
 			s.SetTransferPolicy(profile.requiredTransferSyntax())
+			s.SetReceiveConverter(recvConv)
 			if err := s.Start(); err != nil {
 				fyne.Do(func() {
 					scpLED.FillColor = ledRed
@@ -1087,10 +1101,11 @@ func main() {
 			// per-target error path with its retry offer.
 			requiredTS := prof.requiredTransferSyntax()
 			var getConverted, getSkipped atomic.Int64
-			scpConvBase, scpSkipBase := int64(0), int64(0)
+			scpConvBase, scpSkipBase, scpFailedBase := int64(0), int64(0), int64(0)
 			if sc != nil {
 				scpConvBase = sc.ConvertedCount()
 				scpSkipBase = sc.SkippedCount()
+				scpFailedBase = sc.FailedLocalCount()
 			}
 			// srvFailedCur holds the in-flight target's latest failed-sub-op
 			// count (counts are cumulative within one target); the loop folds
@@ -1143,6 +1158,27 @@ func main() {
 				}
 			}
 
+			// recordGet counts one finished C-GET object — inline, or later on a
+			// converter worker (hence the atomics). An unconvertible object
+			// (logged by finishReceivedFile) still reports success for the
+			// sub-operation, so the retrieve continues; a copy already present
+			// counts as received, as it always has on the C-GET path.
+			var getFailedLocal atomic.Int64
+			recordGet := func(res receiveResult) {
+				if res.outcome == receiveSkipped {
+					getSkipped.Add(1)
+					return
+				}
+				if res.converted {
+					getConverted.Add(1)
+				}
+				atomic.AddInt64(&fileCount, 1)
+				path := res.dest
+				recordPath(path)
+				touch()
+				lastReceived.Store(&path)
+			}
+
 			// For C-GET: callback writes each received instance to the download folder.
 			getCallback := func(txUID, scUID, siUID string, data []byte) (err error) {
 				// The netdicom library runs this on its own goroutine, where an
@@ -1157,24 +1193,25 @@ func main() {
 						err = fmt.Errorf("receiver internal error: %v", r)
 					}
 				}()
-				path, converted, skippedFile, saveErr := saveGetFile(cfg.DownloadDir, txUID, scUID, siUID, data, requiredTS)
+				res, queued, saveErr := saveGetFile(cfg.DownloadDir, txUID, scUID, siUID, data, requiredTS,
+					recvConv, func(res receiveResult, err error) {
+						// Converted after the sub-operation's response: a
+						// failure to save can only be counted here now.
+						if err != nil {
+							getFailedLocal.Add(1)
+							logError("c-get: %s was converted after the PACS was told it had arrived, but could not be saved: %v",
+								siUID, err)
+							return
+						}
+						recordGet(res)
+					})
 				if saveErr != nil {
 					logError("c-get: save file: %v", saveErr)
 					return saveErr
 				}
-				if skippedFile {
-					// Unconvertible object — logged by saveGetFile. Report
-					// success for the sub-operation so the retrieve continues.
-					getSkipped.Add(1)
-					return nil
+				if !queued {
+					recordGet(res)
 				}
-				if converted {
-					getConverted.Add(1)
-				}
-				atomic.AddInt64(&fileCount, 1)
-				recordPath(path)
-				touch()
-				lastReceived.Store(&path)
 				return nil
 			}
 
@@ -1251,6 +1288,17 @@ func main() {
 				setBar(float64(idx) / float64(count))
 			}
 
+			// Objects converted after their response may still be in the
+			// converter. They report through the callbacks installed above, so
+			// wait for them before restoring the SCP's callback and reading
+			// the counters — otherwise their files would be neither counted
+			// nor indexed. (Also after a cancel: what already arrived is kept.)
+			if n := recvConv.pendingCount(); n > 0 {
+				fyne.Do(func() {
+					statusLabel.SetText(fmt.Sprintf("Converting %d received file(s) to %s…", n, transferSyntaxLabel(requiredTS)))
+				})
+				recvConv.wait()
+			}
 			restoreSCP()
 			// The ticker can miss the last change (the bar reaching 100% on
 			// the final target), so publish once more after it has stopped.
@@ -1290,6 +1338,14 @@ func main() {
 			if skippedTotal > 0 {
 				logWarn("retrieve: %d object(s) could not be converted to %s and were skipped (not saved) — see the SKIPPED entries above for details",
 					skippedTotal, requiredTS)
+			}
+			failedLocalTotal := getFailedLocal.Load()
+			if sc != nil {
+				failedLocalTotal += sc.FailedLocalCount() - scpFailedBase
+			}
+			if failedLocalTotal > 0 {
+				logError("retrieve: %d object(s) were converted after the PACS was told they had arrived, but could not be saved — see the entries above",
+					failedLocalTotal)
 			}
 			if srvFailedTotal > 0 {
 				if requiredTS != "" {
@@ -1364,6 +1420,9 @@ func main() {
 					}
 					if srvFailedTotal > 0 {
 						msg += fmt.Sprintf(" — %d not delivered by the server, see Activity Log", srvFailedTotal)
+					}
+					if failedLocalTotal > 0 {
+						msg += describeLocalFailures(failedLocalTotal)
 					}
 					statusLabel.SetText(msg)
 				}
@@ -1652,6 +1711,31 @@ func main() {
 	)
 
 	w.SetContent(container.NewBorder(nil, statusBar, nil, nil, tabs))
+
+	// Finish any received objects an earlier session queued for conversion but
+	// was closed or crashed before converting (receiveconvert.go): the PACS
+	// was told they had arrived, so they must not be lost. They land in the
+	// hierarchy and are indexed like any retrieve's files.
+	go func() {
+		var mu sync.Mutex
+		var saved []string
+		found := recoverPendingConversions(cfg.DownloadDir, recvConv, func(dest string) {
+			mu.Lock()
+			saved = append(saved, dest)
+			mu.Unlock()
+		})
+		if found == 0 {
+			return
+		}
+		recvConv.wait()
+		mu.Lock()
+		paths := saved
+		mu.Unlock()
+		if len(paths) > 0 {
+			cat.ingestPaths(paths)
+			reloadLocalBrowse()
+		}
+	}()
 
 	// Persist settings on close and stop the SCP so the port is released before
 	// the window — and the app — closes. Window size is only updated when valid

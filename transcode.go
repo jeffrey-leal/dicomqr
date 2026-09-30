@@ -192,7 +192,14 @@ func convertDatasetSyntax(ds *sdicom.Dataset, sourceTS, targetTS string, tokens 
 // decoder or the rewrite fails — the original file is left untouched on every
 // error path.
 func transcodeDICOMFile(path, targetTS string) (bool, error) {
-	tmpPath, changed, err := transcodeDICOMFileToTemp(path, targetTS, filepath.Dir(path))
+	return transcodeDICOMFileTokens(path, targetTS, nil)
+}
+
+// transcodeDICOMFileTokens is transcodeDICOMFile with a CPU-token set, so a
+// multi-frame file decodes across whichever cores the set has free (see
+// forEachFrame) — the receive converter's path. nil decodes frame by frame.
+func transcodeDICOMFileTokens(path, targetTS string, tokens cpuTokens) (bool, error) {
+	tmpPath, changed, err := transcodeToTemp(path, targetTS, filepath.Dir(path), tokens)
 	if err != nil || !changed {
 		return false, err
 	}
@@ -210,6 +217,10 @@ func transcodeDICOMFile(path, targetTS string) (bool, error) {
 // nil) when the file is already in targetTS. On success the caller owns the
 // returned temp file and must remove or rename it.
 func transcodeDICOMFileToTemp(path, targetTS, tmpDir string) (string, bool, error) {
+	return transcodeToTemp(path, targetTS, tmpDir, nil)
+}
+
+func transcodeToTemp(path, targetTS, tmpDir string, tokens cpuTokens) (string, bool, error) {
 	tsUID := fileTransferSyntaxUID(path)
 	if tsUID == "" {
 		return "", false, errors.New("cannot determine transfer syntax")
@@ -230,7 +241,7 @@ func transcodeDICOMFileToTemp(path, targetTS, tmpDir string) (string, bool, erro
 	if err != nil {
 		return "", false, fmt.Errorf("parse: %w", err)
 	}
-	if _, err := convertDatasetSyntax(&ds, tsUID, targetTS, nil); err != nil {
+	if _, err := convertDatasetSyntax(&ds, tsUID, targetTS, tokens); err != nil {
 		return "", false, err
 	}
 

@@ -243,7 +243,7 @@ func TestDimseCommand_AppendDataWithOpenReader(t *testing.T) {
 	}
 
 	// Verify dataReader is set
-	if dc.dataReader == nil {
+	if dc.r == nil {
 		t.Fatal("dataReader should be set after ReadData")
 	}
 
@@ -255,7 +255,7 @@ func TestDimseCommand_AppendDataWithOpenReader(t *testing.T) {
 	}
 
 	// Verify dataReader was closed
-	if dc.dataReader != nil {
+	if dc.r != nil {
 		t.Error("dataReader should be nil after AppendData")
 	}
 

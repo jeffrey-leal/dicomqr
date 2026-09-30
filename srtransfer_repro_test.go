@@ -299,15 +299,18 @@ func TestCStoreSkipsUnconvertibleObject(t *testing.T) {
 func TestSaveGetFileSkipsUnconvertible(t *testing.T) {
 	dir := t.TempDir()
 	payload := bytes.Repeat([]byte{0xDE, 0xAD, 0xBE, 0xEF}, 64)
-	path, converted, skipped, err := saveGetFile(dir, tsJPEGBaseline, "1.2.840.10008.5.1.4.1.1.7", "1.2.3.4.5.6.8", payload, tsExplicitVRLE)
+	res, queued, err := saveGetFile(dir, tsJPEGBaseline, "1.2.840.10008.5.1.4.1.1.7", "1.2.3.4.5.6.8", payload, tsExplicitVRLE, nil, nil)
 	if err != nil {
 		t.Fatalf("saveGetFile error = %v, want nil (skip, not failure)", err)
 	}
-	if !skipped {
-		t.Error("skipped = false, want true")
+	if queued {
+		t.Fatal("queued with no converter; want the inline path")
 	}
-	if converted || path != "" {
-		t.Errorf("path = %q, converted = %v — want empty and false for a skipped object", path, converted)
+	if res.outcome != receiveSkipped {
+		t.Errorf("outcome = %v, want skipped", res.outcome)
+	}
+	if res.converted || res.dest != "" {
+		t.Errorf("dest = %q, converted = %v — want empty and false for a skipped object", res.dest, res.converted)
 	}
 	if n := countDCM(t, dir); n != 0 {
 		t.Errorf("%d .dcm file(s) written, want 0", n)

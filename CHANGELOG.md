@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **Retrieves that convert files no longer hold up the PACS.** When a server profile requires a transfer syntax and the PACS sends files in another one, each file used to be converted before the PACS was told it had arrived — and the PACS waits for that answer before sending the next file, so the whole transfer ran at the speed of one decoder. Files are now acknowledged as soon as they arrive and converted in the background, several at a time on the same resource limits as a modification export (about one per physical core, below-normal priority, within the memory limit), with large multi-frame files spread across idle cores. Measured on 20 multi-frame JPEG 2000 objects: the PACS finished sending after 0.25 s instead of 6.6 s, and every file was converted and saved after 3.1 s instead of 6.6 s. The retrieve waits for the last conversions before reporting ("Converting N received file(s) to …"), so every file is counted and appears in Local Browse. Files that need no conversion are handled exactly as before.
+  - One consequence, chosen deliberately: a converted file that then cannot be saved — a folder that cannot be created, say — can no longer be reported to the PACS as a failure, since it was already told the file arrived. It is reported locally instead, in the Activity Log and as "N received file(s) could not be saved after conversion" in the retrieve's summary.
+  - If dicomqr is closed, or stops, while conversions are still running, nothing is lost: the received files wait in the download folder under names that record the syntax they need, and are converted, filed and indexed the next time dicomqr starts.
+- **Received data no longer goes through temporary files.** Every query result and every received image was first written to a temporary file in the Windows temp folder — the file reopened for every network packet — and each image then copied again into the download folder. Each message is now held in memory up to 8 MB, which covers every query result and ordinary CT, MR and nuclear medicine images; only larger objects (radiographs, multi-frame acquisitions) still use a temporary file, now kept open while it fills rather than reopened packet by packet. Memory use stays bounded however many transfers run at once.
+
 ## [1.21.0] — 2026-09-29
 
 ### Added

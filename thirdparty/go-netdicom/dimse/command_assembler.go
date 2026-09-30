@@ -3,7 +3,6 @@ package dimse
 import (
 	"bytes"
 	"fmt"
-	"os"
 
 	"github.com/algm/go-netdicom/pdu"
 	"github.com/suyashkumar/dicom"
@@ -42,14 +41,10 @@ func (commandAssembler *CommandAssembler) AddDataPDU(pdu *pdu.PDataTf) (byte, Me
 				commandAssembler.readAllCommand = true
 			}
 		} else {
-			// Data fragment. Persist to temporary file using DimseCommand.
+			// Data fragment. Held in memory, spilling to a temp file only when
+			// large (dicomqr local patch — see DimseCommand).
 			if commandAssembler.dataCmd == nil {
-				tmpFile, err := os.CreateTemp("", "dimse_data_*")
-				if err != nil {
-					return 0, nil, nil, fmt.Errorf("failed to create temp file for DIMSE data: %w", err)
-				}
-				tmpFile.Close()
-				commandAssembler.dataCmd = NewDimseCommand(tmpFile.Name())
+				commandAssembler.dataCmd = NewBufferedDimseCommand()
 			}
 			if err := commandAssembler.dataCmd.AppendData(item.Value); err != nil {
 				return 0, nil, nil, fmt.Errorf("failed to append data fragment: %w", err)

@@ -67,7 +67,24 @@ type StorageSCP struct {
 	// image SOP class that the built-in decoders cannot handle); the retrieve
 	// loop reads deltas to report them at the end of a retrieve.
 	skipped atomic.Int64
+
+	// conv converts objects needing a transfer syntax conversion after their
+	// C-STORE response (receiveconvert.go); nil converts inline, before it.
+	conv *receiveConverter
+
+	// failedLocal counts objects converted after their response that then
+	// could not be saved — the PACS was already told Success, so the retrieve
+	// loop reads deltas to report them locally.
+	failedLocal atomic.Int64
 }
+
+// SetReceiveConverter makes conversions happen after the C-STORE response, on
+// conv. Call before Start.
+func (s *StorageSCP) SetReceiveConverter(conv *receiveConverter) { s.conv = conv }
+
+// FailedLocalCount returns how many objects, converted after their response,
+// could not be saved. Callers snapshot it around a retrieve.
+func (s *StorageSCP) FailedLocalCount() int64 { return s.failedLocal.Load() }
 
 // DownloadDir returns the download directory (thread-safe, Phase 1-B).
 func (s *StorageSCP) DownloadDir() string {
@@ -313,68 +330,57 @@ func (s *StorageSCP) handleCStore(
 	}
 	tmpFile.Close()
 
-	// Re-open the completed temp file to extract the metadata tags needed to
-	// build the organized subfolder path. The streaming parser stops at group
-	// 0x0020, so SR Content Sequences (0x0040+) are never visited.
-	patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber := scpParseMetadata(tmpPath)
-
-	dest := organizeFilePath(s.DownloadDir(), patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber, sopInstanceUID)
-
-	// Skip writing if the file already exists; discard the temp file and return
-	// success so the PACS doesn't retry. callOnFileReceived is not invoked for
-	// a skipped file — the UI file count reflects only newly written files.
-	// Exception: when a specific transfer syntax is required and the existing
-	// copy is in a different one (downloaded before the requirement was set),
-	// fall through and replace it with the incoming copy, which the conversion
-	// step below guarantees is in the required syntax.
+	dir := s.DownloadDir()
 	req := s.transferPolicy()
-	if _, statErr := os.Stat(dest); statErr == nil {
-		if req == "" || fileTransferSyntaxUID(dest) == req {
+
+	// An object that must be converted is queued, and the PACS gets its
+	// response now rather than after the conversion (receiveconvert.go): the
+	// PACS waits for each response before sending the next object, so a
+	// conversion done here held up the whole transfer. What happens to it
+	// afterwards — saved, skipped as unconvertible, or failed to save — is
+	// counted locally; the PACS has already been told Success.
+	if req != "" && transferSyntaxUID != req && s.conv != nil {
+		pending, err := markPendingConversion(tmpPath, req)
+		if err != nil {
 			os.Remove(tmpPath)
-			return dimse.Success
+			return dimse.Status{Status: dimse.CStoreOutOfResources, ErrorComment: err.Error()}
 		}
+		s.conv.submit(fileMemoryWeight(pending), func(tokens cpuTokens) {
+			res, err := finishReceivedFile(pending, dir, sopInstanceUID, sopClassUID, transferSyntaxUID, req, "scp", tokens)
+			if err != nil {
+				s.failedLocal.Add(1)
+				logError("scp: %s was converted after the PACS was told it had arrived, but could not be saved: %v",
+					sopInstanceUID, err)
+				return
+			}
+			s.recordReceived(res)
+		})
+		return dimse.Success
 	}
 
-	// Enforce the required transfer syntax BEFORE the file reaches its final
-	// destination: a file in the wrong syntax is transcoded in place while
-	// still a temp file, so the destination only ever holds conforming files.
-	// An object that cannot be converted — typically a screenshot or vendor
-	// graphic stored under an image SOP class whose pixel data the built-in
-	// decoders cannot handle — is skipped: nothing lands in the download
-	// folder, the skip is reported in the Activity Log and counted for the
-	// end-of-retrieve summary, and Success is returned so the PACS keeps
-	// sending the rest of the retrieve.
-	if req != "" && transferSyntaxUID != req {
-		changed, convErr := transcodeDICOMFile(tmpPath, req)
-		if convErr != nil {
-			s.skipped.Add(1)
-			logWarn("scp: SKIPPED %s — cannot convert to %s: %v (series %q, SOP class %s); object not saved, retrieve continues",
-				sopInstanceUID, transferSyntaxLabel(req), convErr, seriesDesc, sopClassUID)
-			os.Remove(tmpPath)
-			return dimse.Success
-		}
-		if changed {
-			s.converted.Add(1)
-		}
-	}
-
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		os.Remove(tmpPath)
+	// Everything else is finished before the response, so a folder that cannot
+	// be created or a rename that fails still reaches the PACS as a failure.
+	res, err := finishReceivedFile(tmpPath, dir, sopInstanceUID, sopClassUID, transferSyntaxUID, req, "scp", nil)
+	if err != nil {
 		return dimse.Status{Status: dimse.CStoreOutOfResources, ErrorComment: err.Error()}
 	}
-
-	// os.Rename is atomic on the same filesystem. Fall back to copy+delete if
-	// downloadDir and the OS temp directory are on different volumes.
-	if err := os.Rename(tmpPath, dest); err != nil {
-		if copyErr := scpCopyFile(tmpPath, dest); copyErr != nil {
-			os.Remove(tmpPath)
-			return dimse.Status{Status: dimse.CStoreOutOfResources, ErrorComment: copyErr.Error()}
-		}
-		os.Remove(tmpPath)
-	}
-
-	s.callOnFileReceived(dest)
+	s.recordReceived(res)
 	return dimse.Success
+}
+
+// recordReceived counts a finished object and announces a newly saved one.
+// callOnFileReceived is not invoked for a copy that was already present — the
+// UI's file count reflects only newly written files.
+func (s *StorageSCP) recordReceived(res receiveResult) {
+	switch res.outcome {
+	case receiveSkipped:
+		s.skipped.Add(1)
+	case receiveSaved:
+		if res.converted {
+			s.converted.Add(1)
+		}
+		s.callOnFileReceived(res.dest)
+	}
 }
 
 // patientFolderName, studyFolderName and seriesFolderName build one path
@@ -589,22 +595,23 @@ func scpCopyFile(src, dst string) error {
 // the same organized subfolder hierarchy as the C-STORE SCP. The data argument
 // is the raw DICOM dataset bytes as received from the C-GET callback (no Group
 // 2 prefix); this function prepends the proper DICOM File Meta Information
-// header before writing. Returns the path of the saved file, whether the
-// payload was transcoded locally to requiredTS, and whether the object was
-// skipped because conversion failed.
-// requiredTS, when non-empty, is enforced exactly as in handleCStore: an
-// arriving file in a different syntax is converted before it reaches its
-// destination (an unconvertible object is skipped — logged, counted by the
-// caller, nothing saved — so the retrieve continues), and an existing on-disk
-// copy in a different syntax is overwritten instead of skipped.
-func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID string, data []byte, requiredTS string) (path string, converted, skipped bool, err error) {
+// header before writing.
+//
+// requiredTS, when non-empty, is enforced exactly as in handleCStore (see
+// finishReceivedFile). When a conversion is needed and conv is non-nil, the
+// object is queued (receiveconvert.go) and saveGetFile returns queued=true at
+// once, so the PACS gets this sub-operation's response without waiting for the
+// conversion; done is later called, on a converter worker, with the outcome.
+// Otherwise the object is finished before returning and its result returned.
+func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID string, data []byte, requiredTS string,
+	conv *receiveConverter, done func(receiveResult, error)) (res receiveResult, queued bool, err error) {
 	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
-		return "", false, false, fmt.Errorf("cannot create download directory: %w", err)
+		return res, false, fmt.Errorf("cannot create download directory: %w", err)
 	}
 
 	tmpFile, err := os.CreateTemp(downloadDir, ".recv_*.tmp")
 	if err != nil {
-		return "", false, false, err
+		return res, false, err
 	}
 	tmpPath := tmpFile.Name()
 
@@ -617,60 +624,30 @@ func saveGetFile(downloadDir, transferSyntaxUID, sopClassUID, sopInstanceUID str
 	if encErr := enc.Error(); encErr != nil {
 		tmpFile.Close()
 		os.Remove(tmpPath)
-		return "", false, false, encErr
+		return res, false, encErr
 	}
 
 	if _, err := tmpFile.Write(data); err != nil {
 		tmpFile.Close()
 		os.Remove(tmpPath)
-		return "", false, false, err
+		return res, false, err
 	}
 	tmpFile.Close()
 
-	patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber := scpParseMetadata(tmpPath)
-
-	dest := organizeFilePath(downloadDir, patientName, patientID, studyDesc, studyDate, seriesDesc, seriesNumber, sopInstanceUID)
-
-	// Skip writing if the file already exists; discard the temp file.
-	// The caller does not invoke the status callback for skipped files.
-	// Exception: replace an existing copy whose transfer syntax differs from
-	// the required one (mirrors handleCStore).
-	if _, statErr := os.Stat(dest); statErr == nil {
-		if requiredTS == "" || fileTransferSyntaxUID(dest) == requiredTS {
+	if requiredTS != "" && transferSyntaxUID != requiredTS && conv != nil {
+		pending, err := markPendingConversion(tmpPath, requiredTS)
+		if err != nil {
 			os.Remove(tmpPath)
-			return dest, false, false, nil
+			return res, false, err
 		}
+		conv.submit(fileMemoryWeight(pending), func(tokens cpuTokens) {
+			done(finishReceivedFile(pending, downloadDir, sopInstanceUID, sopClassUID, transferSyntaxUID, requiredTS, "c-get", tokens))
+		})
+		return res, true, nil
 	}
 
-	// Enforce the required transfer syntax before the file reaches its final
-	// destination (mirrors handleCStore): an unconvertible object is skipped —
-	// logged here, counted by the caller, nothing saved — so the retrieve
-	// continues instead of aborting.
-	if requiredTS != "" && transferSyntaxUID != requiredTS {
-		changed, convErr := transcodeDICOMFile(tmpPath, requiredTS)
-		if convErr != nil {
-			logWarn("c-get: SKIPPED %s — cannot convert to %s: %v (series %q, SOP class %s); object not saved, retrieve continues",
-				sopInstanceUID, transferSyntaxLabel(requiredTS), convErr, seriesDesc, sopClassUID)
-			os.Remove(tmpPath)
-			return "", false, true, nil
-		}
-		converted = changed
-	}
-
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		os.Remove(tmpPath)
-		return "", false, false, err
-	}
-
-	if err := os.Rename(tmpPath, dest); err != nil {
-		if copyErr := scpCopyFile(tmpPath, dest); copyErr != nil {
-			os.Remove(tmpPath)
-			return "", false, false, copyErr
-		}
-		os.Remove(tmpPath)
-	}
-
-	return dest, converted, false, nil
+	res, err = finishReceivedFile(tmpPath, downloadDir, sopInstanceUID, sopClassUID, transferSyntaxUID, requiredTS, "c-get", nil)
+	return res, false, err
 }
 
 // dirWritable verifies that dir exists (creating it if necessary) and is

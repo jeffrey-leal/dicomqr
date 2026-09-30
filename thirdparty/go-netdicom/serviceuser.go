@@ -6,7 +6,6 @@ package netdicom
 
 import (
 	"fmt"
-	"io"
 	"net"
 	"sort"
 	"sync"
@@ -493,7 +492,9 @@ func (su *ServiceUser) CFind(qrLevel QRLevel, filter []*dicom.Element) chan CFin
 			}
 			var payload []byte
 			if event.data != nil {
-				payload, _ = io.ReadAll(event.data)
+				// The buffer itself (dicomqr local patch): no copy, and valid
+				// until the Ack below.
+				payload, _ = event.data.Bytes()
 			}
 			// 0xFF00 = Pending; 0xFF01 = Pending with warnings (PS3.7 C.4.1).
 			// Only pending responses carry dataset results; the final success
@@ -562,8 +563,10 @@ func (su *ServiceUser) CGetWithProgress(qrLevel QRLevel, filter []*dicom.Element
 		c := msg.(*dimse.CStoreRq)
 		var payload []byte
 		if data != nil {
+			// The buffer itself, not a copy (dicomqr local patch); the
+			// callback consumes it before the Ack below releases it.
 			var _err error
-			payload, _err = io.ReadAll(data)
+			payload, _err = data.Bytes()
 			if _err != nil {
 				payload = nil
 			}
