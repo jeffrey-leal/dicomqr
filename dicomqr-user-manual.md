@@ -1,6 +1,6 @@
 # dicomqr
 
-**User Manual  v1.21.0**
+**User Manual  v1.22.0**
 
 September 30, 2026
 
@@ -838,6 +838,17 @@ Converting on export, rather than on retrieve. A transfer syntax can be required
 
 The Pixel masking section lists the areas of the image this run will blank (Section 14.3.1), and its Review masking… button opens the images themselves to check that coverage and add to it. The section is always present, even for a profile that masks nothing: a study whose analysis screens carry a patient banner is exactly the case where the absence of masking is what needs to be noticed. A profile whose per-modality overrides carry their own regions says so beneath, since those replace the ones listed rather than adding to them.
 
+The PHI check section, at the top of the window, looks for content the profile would leave untouched. As the window opens it reads the header of every file the run will export — in the background, so Modify… can be pressed at any time — skipping any file the profile's own filters would skip, and then lists what it found:
+
+- Images that declare burned-in annotation (Burned In Annotation = YES) with no mask covering them
+- Encapsulated documents (PDF, CDA or STL). The document travels inside the file as it arrived: no tag rule reads into it and no mask reaches it
+- Ultrasound images with no mask. Ultrasound screens nearly always carry a banner with the patient's name
+- Screen captures (Secondary Capture objects) and colour images filed under a modality that acquires greyscale — CT, MR, CR, DX, MG, NM, PT, XA, RF — with no mask. Dose pages, scanned forms, saved screens and 3D renders take this shape, and their text is part of the image
+- Overlay planes, which can hold annotations, while Remove overlay planes is off
+An image counts as covered when a mask region blanks part of it or it has been marked as needing no masking in the review window. Each finding offers its remedy: Review the N flagged image(s) in masking… opens the review window on just those images (regions drawn there apply to the whole run, as always); Leave these files out of this run drops the flagged documents from the export; Remove overlay planes ticks that option. The list updates as masking is reviewed and options change. Modify… asks for a confirmation only while a file declares burned-in text or an embedded document is still included — those two are statements the files make about themselves; the other findings are advice. After the run, the completion summary states how many exported files still carried each kind, counted from the files as written, and the Activity Log names each one.
+
+What the check cannot do. It reads headers, not pixels, so text burned into an ordinary greyscale image — a name on a scanned film, say — is invisible to it. It names the kinds of object where burned-in text and embedded documents are found in practice and whether the run deals with them; finding nothing is not proof an export is clean.
+
 If any file fails during a run, the progress dialog is replaced by a dialog listing what failed and why — a file missing from an export is otherwise easy to miss, and a failed conversion means the export is incomplete. Up to twenty failures are listed by name; the Activity Log holds the full list. Every other file in the run is still exported.
 
 Checking Zip export in the dialog (pre-checked when the profile's Zip export option is set) writes the run into a single compressed <output folder>\<export folder name>.zip instead of a folder, with the same PHI-safe layout inside the archive. The archive is assembled as a hidden temporary file and renamed into place when the run finishes, so a cancelled run keeps the files completed before the cancel, while a run that writes nothing — or fails while finalizing the archive — leaves no zip behind. An existing zip of the same name is replaced after confirmation.
@@ -853,7 +864,7 @@ The status bar at the bottom of the window provides real-time feedback. A colour
 
 | Situation | Status bar text |
 |---|---|
-| Application started, not connected | `v1.21.0` |
+| Application started, not connected | `v1.22.0` |
 | Connecting to server | `Connecting…` |
 | Connected | `Connected: <AE>@<host>:<port>` |
 | Connection cancelled | `Connection cancelled` |

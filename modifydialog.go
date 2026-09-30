@@ -249,7 +249,10 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	// Sections are built with prefSection, the same header/separator block the
 	// profile editor and Preferences use, so the two Options blocks are framed
 	// identically as well as ordered identically.
-	sections := []fyne.CanvasObject{header}
+	// PHI check sits directly under the header — it is about the whole run —
+	// and is filled in further down, once runMasks exists.
+	phiBox := container.NewVBox()
+	sections := []fyne.CanvasObject{header, prefSection("PHI check", phiBox)}
 	if len(setRows) > 0 {
 		sections = append(sections, prefSection("Set values", setForm))
 	}
@@ -287,14 +290,132 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	// fractional rectangles fail on a study that mixes image sizes, and nothing
 	// in the profile says so. It is offered even when the profile masks nothing,
 	// because that is exactly when a study's analysis screens go out unmasked.
-	reviewBtn := widget.NewButton("Review masking…", func() {
-		showMaskPreview(fyne.CurrentApp(), win, profileName, files, runMasks, func(updated ModProfile) {
+	//
+	// reviewFiles opens it over any subset — the whole run from this section,
+	// just the flagged images from the PHI check — and either way the regions
+	// drawn join runMasks for the whole run, the same as always.
+	var refreshPHI func()
+	reviewFiles := func(subset []string) {
+		showMaskPreview(fyne.CurrentApp(), win, profileName, subset, runMasks, func(updated ModProfile) {
 			runMasks = updated
 			maskList.SetText(maskLines())
+			refreshPHI()
 		})
-	})
+	}
+	reviewBtn := widget.NewButton("Review masking…", func() { reviewFiles(files) })
 	sections = append(sections, prefSection("Pixel masking", maskList, maskNote,
 		container.NewHBox(reviewBtn)))
+
+	// PHI check (phiscreen.go): every file's header is read in the background
+	// as the panel opens, and the findings are re-evaluated against this run's
+	// settings whenever masking or Remove overlay planes changes — pure
+	// arithmetic over the scan, so it never re-reads a file. Advisory: Modify…
+	// never waits for it, and only the two unambiguous findings (a file that
+	// declares burned-in text, an embedded document) ask for a confirmation.
+	var (
+		phiFiles      []phiScreenFile
+		phiDone       bool
+		phiUnreadable int
+		phiSkipDocs   bool
+		phiLast       phiFindings
+		phiStop       atomic.Bool
+	)
+	phiStatus := widget.NewLabel(fmt.Sprintf("Checking %d file(s) for content this profile's rules and masking would not reach…", len(files)))
+	phiStatus.Wrapping = fyne.TextWrapWord
+	phiProg := widget.NewProgressBar()
+	phiRows := container.NewVBox()
+	phiCaveat := widget.NewLabel("Reads headers only. It names the kinds of object where burned-in text and embedded " +
+		"documents are found and whether this run deals with them; it cannot see text in an ordinary image, so finding " +
+		"nothing is not proof the export is clean.")
+	phiCaveat.TextStyle = fyne.TextStyle{Italic: true}
+	phiCaveat.Wrapping = fyne.TextWrapWord
+	phiBox.Objects = []fyne.CanvasObject{phiStatus, phiProg, phiRows, phiCaveat}
+	wrapped := func(text string) *widget.Label {
+		l := widget.NewLabel(text)
+		l.Wrapping = fyne.TextWrapWord
+		return l
+	}
+	refreshPHI = func() {
+		if !phiDone {
+			return
+		}
+		work := newMaskWorkingSet(runMasks)
+		phiLast = evaluatePHIScreen(phiFiles, func(modality string) []MaskRegion {
+			regions, _ := work.governing(modality)
+			return regions
+		}, overlaysCheck.Checked)
+
+		exported := 0
+		for _, f := range phiFiles {
+			if !f.skipped {
+				exported++
+			}
+		}
+		status := fmt.Sprintf("Checked the %d file(s) this run will export", exported)
+		if skipped := len(phiFiles) - exported; skipped > 0 {
+			status += fmt.Sprintf(" (%d more skipped by the profile's filters)", skipped)
+		}
+		if phiUnreadable > 0 {
+			status += fmt.Sprintf("; %d could not be read and were not checked", phiUnreadable)
+		}
+		if phiLast.empty() {
+			status += ". Nothing found that this profile's rules and masking would leave uncovered."
+		} else {
+			status += ". Review before exporting:"
+		}
+		phiStatus.SetText(status)
+
+		var rows []fyne.CanvasObject
+		for _, k := range phiRiskKinds {
+			n := len(phiLast.byRisk[k])
+			if n == 0 {
+				continue
+			}
+			rows = append(rows, wrapped("• "+k.finding(n)))
+			switch k {
+			case phiRiskDocument:
+				// Left out by path, not by adding their SOP class to the run's
+				// filter: a class filter would also drop files nobody flagged.
+				skip := widget.NewCheck("Leave these files out of this run", func(b bool) { phiSkipDocs = b })
+				skip.SetChecked(phiSkipDocs)
+				rows = append(rows, container.NewHBox(skip))
+			case phiRiskOverlay:
+				rows = append(rows, container.NewHBox(widget.NewButton("Remove overlay planes", func() {
+					overlaysCheck.SetChecked(true) // OnChanged re-evaluates
+				})))
+			}
+		}
+		if pix := phiLast.pixelFiles(); len(pix) > 0 {
+			rows = append(rows, container.NewHBox(widget.NewButton(
+				fmt.Sprintf("Review the %d flagged image(s) in masking…", len(pix)),
+				// The flagged images' whole series — see reviewSetFor.
+				func() { reviewFiles(reviewSetFor(phiFiles, phiLast.pixelFiles())) })))
+		}
+		phiRows.Objects = rows
+		phiRows.Refresh()
+		phiBox.Refresh()
+	}
+	overlaysCheck.OnChanged = func(bool) { refreshPHI() }
+	// The screen applies the profile's own file filters so it never flags a
+	// file the run skips. A profile that does not compile fails at Modify…
+	// with its own message; until then the screen checks every file.
+	phiFilters, ferr := compileModifyParams(resolved)
+	if ferr != nil {
+		phiFilters = modifyParams{}
+	}
+	go func() {
+		screened, unreadable := screenPHIFiles(files, phiFilters, &phiStop, func(done, total int) {
+			fyne.Do(func() { phiProg.SetValue(float64(done) / float64(total)) })
+		})
+		fyne.Do(func() {
+			if phiStop.Load() {
+				return // the panel closed mid-scan
+			}
+			phiFiles, phiUnreadable, phiDone = screened, unreadable, true
+			phiProg.Hide()
+			refreshPHI()
+		})
+	}()
 
 	sections = append(sections,
 		prefSection(fmt.Sprintf("Tags removed (%d)", len(removeLines)), removeBox),
@@ -595,6 +716,18 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 			return
 		}
 
+		// Flagged documents the user chose to leave out go by path — see the
+		// PHI check above.
+		runFiles := files
+		if phiDone && phiSkipDocs {
+			runFiles = withoutFiles(files, phiLast.byRisk[phiRiskDocument])
+			if len(runFiles) == 0 {
+				dialog.ShowInformation("Modification",
+					"Every file in this run is a document you chose to leave out, so there is nothing to export.", win)
+				return
+			}
+		}
+
 		// startRun launches the modification into outBase\exportName — a folder
 		// tree, or a single .zip archive when Zip export is checked — using the
 		// PHI-safe layout (runs on the UI goroutine). The export root stands in
@@ -617,7 +750,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 				zipPath := filepath.Join(outBase, zipName)
 				begin := func() {
 					win.Close()
-					showModificationRunDialog(w, profileName, files, rootDir, zipPath, params, outLayout, true)
+					showModificationRunDialog(w, profileName, runFiles, rootDir, zipPath, params, outLayout, true)
 				}
 				if _, serr := os.Stat(zipPath); serr == nil {
 					dialog.ShowConfirm("Zip file exists",
@@ -635,7 +768,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 			exportRoot := filepath.Join(outBase, exportName)
 			begin := func() {
 				win.Close()
-				showModificationRunDialog(w, profileName, files, rootDir, exportRoot, params, outLayout, false)
+				showModificationRunDialog(w, profileName, runFiles, rootDir, exportRoot, params, outLayout, false)
 			}
 			if entries, rerr := os.ReadDir(exportRoot); rerr == nil && len(entries) > 0 {
 				dialog.ShowConfirm("Export folder exists",
@@ -650,27 +783,59 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 			begin()
 		}
 
-		if chosenOutDir != "" {
-			startRun(chosenOutDir)
-			return
-		}
-		// No output folder configured yet — ask once; the choice is persisted
-		// as the default so later runs skip the picker.
-		go func() {
-			outDir, ok := browseFolder(win.Title(), "Choose output folder for modified files", cfg.ModifyOutputDir)
-			if !ok {
-				return // picker cancelled
+		launch := func() {
+			if chosenOutDir != "" {
+				startRun(chosenOutDir)
+				return
 			}
-			fyne.Do(func() {
-				if !validOutDir(outDir) {
-					return
+			// No output folder configured yet — ask once; the choice is persisted
+			// as the default so later runs skip the picker.
+			go func() {
+				outDir, ok := browseFolder(win.Title(), "Choose output folder for modified files", cfg.ModifyOutputDir)
+				if !ok {
+					return // picker cancelled
 				}
-				rememberFirstOutDir(outDir)
-				chosenOutDir = outDir
-				setOutDirLabel()
-				startRun(outDir)
-			})
-		}()
+				fyne.Do(func() {
+					if !validOutDir(outDir) {
+						return
+					}
+					rememberFirstOutDir(outDir)
+					chosenOutDir = outDir
+					setOutDirLabel()
+					startRun(outDir)
+				})
+			}()
+		}
+
+		// One confirmation, and only for the two findings that are facts
+		// rather than inferences: a file stating it has burned-in text, and an
+		// embedded document the run cannot reach into. The rest stay advisory
+		// — a confirmation on every ultrasound run would soon be clicked
+		// through unread. A check still running never holds the run up; the
+		// completion summary reports what shipped either way.
+		if phiDone {
+			var facts []string
+			if n := len(phiLast.byRisk[phiRiskBurnedIn]); n > 0 {
+				facts = append(facts, phiRiskBurnedIn.finding(n))
+			}
+			if n := len(phiLast.byRisk[phiRiskDocument]); n > 0 && !phiSkipDocs {
+				facts = append(facts, phiRiskDocument.finding(n))
+			}
+			if len(facts) > 0 {
+				msg := widget.NewLabel(strings.Join(facts, "\n\n") + "\n\nExport anyway?")
+				msg.Wrapping = fyne.TextWrapWord
+				confirm := dialog.NewCustomConfirm("Possible PHI in this export", "Export anyway", "Go back",
+					msg, func(ok bool) {
+						if ok {
+							launch()
+						}
+					}, win)
+				confirm.Resize(fyne.NewSize(520, 0))
+				confirm.Show()
+				return
+			}
+		}
+		launch()
 	}
 
 	// A window rather than a dialog, and the reason is the button row: a Fyne
@@ -684,6 +849,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		Size:     fyne.NewSize(700, 700),
 		Parent:   w,
 		Blocking: true,
+		OnClosed: func() { phiStop.Store(true) },
 	}, func(owned fyne.Window) fyne.CanvasObject {
 		win = owned
 		// Right inset is the scroll gutter when that is wider: the Tags removed
@@ -837,6 +1003,10 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 					"the birth date mask reaches the top-level field only, so removing 0400,0561 "+
 					"(Original Attributes Sequence) is what clears it", res.NestedDOBKept)
 			}
+			// The PHI check's evidence half: what the written files still
+			// carried, counted by the engine per file, so this is a fact about
+			// the export whether or not the pre-run check had finished.
+			msg += phiRiskSummary(res.PHIRisks)
 			// Informational, like the mask-outcome clauses above: the exported
 			// DICOM files are unaffected either way, so a DICOMDIR failure never
 			// routes through the hard-failure dialog below.

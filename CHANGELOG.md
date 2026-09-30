@@ -1,6 +1,17 @@
 # Changelog
 
-## [Unreleased]
+## [1.22.0] — 2026-09-30
+
+### Added
+
+- **The Modification window checks a run for PHI its profile would not reach.** As the window opens, a new *PHI check* section reads the header of every file the run will export — in the background, never holding up Modify… — and lists what the profile's tag rules and pixel masking would leave untouched:
+  - images that declare burned-in annotation (Burned In Annotation = YES) with no mask covering them;
+  - encapsulated documents (PDF, CDA, STL) — the document inside travels as it arrived, since no tag rule or mask reaches into it;
+  - ultrasound images with no mask, whose screens nearly always carry a banner with the patient's name;
+  - screen captures and colour images filed under a greyscale modality (CT, MR, NM, PT and others) with no mask — the shape dose pages, scanned forms, saved screens and 3D renders take;
+  - overlay planes kept while Remove overlay planes is off.
+
+  Each finding offers its remedy: *Review the N flagged image(s) in masking…* opens the review window on just those images, *Leave these files out of this run* drops the flagged documents, and *Remove overlay planes* ticks that option. The list updates as masking is reviewed or options change. It honours the profile's own filters, so a file the run would skip is never flagged. Modify… asks for one confirmation only when a file declares burned-in text or an embedded document is still included; the other findings stay advisory. After the run, the completion summary states how many exported files still carried each kind — counted from the files as written, so it reports what the export holds whether or not the check had finished. The check reads headers only: it cannot see text burned into an ordinary greyscale image, so finding nothing is not proof an export is clean.
 
 ### Changed
 

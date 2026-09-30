@@ -279,6 +279,12 @@ type modifyResult struct {
 	// profile-shape advisory in the editors — that an export actually carries
 	// more than the profile implies.
 	NestedDOBKept int
+	// PHIRisks counts written files by the PHI screen's reasons (phiscreen.go)
+	// — burned-in annotation, ultrasound or capture images left unmasked,
+	// encapsulated documents, overlay planes kept. Counted only once a file is
+	// actually written, so the summary states what the export holds. Nil when
+	// nothing risky shipped.
+	PHIRisks map[phiRisk]int
 	// DicomdirWritten reports whether a DICOMDIR (PS3.10 File-set) index was
 	// requested and written alongside the export.
 	DicomdirWritten bool
@@ -768,6 +774,32 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 		ddMu.Unlock()
 	}
 
+	// recordWritten counts a file once it is actually on disk or in the
+	// archive — the only point at which what it carries has shipped.
+	recordWritten := func(path string, ds sdicom.Dataset, rel string, risk phiRisk) {
+		mu.Lock()
+		res.Processed++
+		for _, k := range phiRiskKinds {
+			if risk&k != 0 {
+				if res.PHIRisks == nil {
+					res.PHIRisks = map[phiRisk]int{}
+				}
+				res.PHIRisks[k]++
+			}
+		}
+		mu.Unlock()
+		if risk != 0 {
+			var why []string
+			for _, k := range phiRiskKinds {
+				if risk&k != 0 {
+					why = append(why, strings.TrimPrefix(k.shipped(1), "1 "))
+				}
+			}
+			logWarn("modify: %s — %s", path, strings.Join(why, "; "))
+		}
+		recordDicomdirSource(ds, rel)
+	}
+
 	jobCh := make(chan string)
 	var wg sync.WaitGroup
 	for range numWorkers {
@@ -906,10 +938,7 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 						if zerr := zsink.write(rel, ds, writeOpts); zerr != nil {
 							recordFailure(path, fmt.Errorf("zip write: %w", zerr))
 						} else {
-							mu.Lock()
-							res.Processed++
-							mu.Unlock()
-							recordDicomdirSource(ds, rel)
+							recordWritten(path, ds, rel, notes.phiRisk)
 						}
 						return
 					}
@@ -941,10 +970,7 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 					case clerr != nil:
 						recordFailure(path, fmt.Errorf("close: %w", clerr))
 					default:
-						mu.Lock()
-						res.Processed++
-						mu.Unlock()
-						recordDicomdirSource(ds, rel)
+						recordWritten(path, ds, rel, notes.phiRisk)
 					}
 				}()
 				mu.Lock()
@@ -1261,6 +1287,9 @@ type fileNotes struct {
 	// nestedDOBKept: a birth-date mask was applied and a birth date still
 	// survives inside a sequence in the exported file — see hasNestedTag.
 	nestedDOBKept bool
+	// phiRisk: the PHI screen's reasons this file still carried when written
+	// (see phiscreen.go), counted into modifyResult.PHIRisks once it is.
+	phiRisk phiRisk
 }
 
 // hasNestedTag reports whether t appears anywhere BELOW the top level of
@@ -1482,33 +1511,15 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 	// was drawn on.
 	maskSrc := newMaskSource(&ds)
 
-	if len(p.ignoreTypes) > 0 {
-		if elem, err := ds.FindElementByTag(imageTypeTag); err == nil {
-			for _, component := range elemStringComponents(elem) {
-				for _, ignore := range p.ignoreTypes {
-					if strings.EqualFold(component, strings.TrimSpace(ignore)) {
-						return true, ds, notes, nil
-					}
-				}
-			}
-		}
-	}
-
-	if len(p.ignoreModalities) > 0 {
-		if elem, err := ds.FindElementByTag(modalityTag); err == nil {
-			for _, component := range elemStringComponents(elem) {
-				for _, ignore := range p.ignoreModalities {
-					if strings.EqualFold(component, strings.TrimSpace(ignore)) {
-						return true, ds, notes, nil
-					}
-				}
-			}
-		}
-	}
-
-	if skipsSOPClass(&ds, p) {
+	// Shared with the Modification dialog's PHI screen, so the screen never
+	// flags a file the run skips.
+	if skippedByFilters(&ds, p) {
 		return true, ds, notes, nil
 	}
+	// The PHI screen's facts as the file arrived — a profile may set Burned In
+	// Annotation to NO, but the pixels still hold whatever they held.
+	phiIn := readPHIHeader(&ds)
+	phiIn.src = maskSrc
 
 	// Apply per-modality overrides: layer modality-specific settings on top of
 	// the base parameters before any modifications are applied.
@@ -1679,6 +1690,14 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 	if dobMask != "" && hasNestedTag(ds.Elements, tag.PatientBirthDate) {
 		notes.nestedDOBKept = true
 	}
+
+	// The PHI screen's evidence half: what this file still carries as written.
+	// Documents and overlays are re-read from the finished dataset (a removal
+	// rule can take either out); the pixel reasons use the regions that
+	// actually governed the file, the same resolution the dialog's screen ran.
+	phiIn.document = hasEncapsulatedDocument(&ds)
+	phiIn.overlay = hasOverlayPlanes(&ds)
+	notes.phiRisk = phiIn.risks(maskRegions, false)
 
 	notes.namesAfter = readExportNames(&ds)
 	return false, ds, notes, nil
