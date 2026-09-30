@@ -277,6 +277,30 @@ func groupPickerLabel(group uint16, shown, selected int) string {
 	return label + fmt.Sprintf("  (%d)", shown)
 }
 
+var (
+	searchKeysOnce sync.Once
+	searchKeys     []string
+)
+
+// dictionarySearchKeys is each dictionaryTags entry's search text, in the same
+// order: everything tagMatchesQuery compares, lowercased once and joined by NUL
+// (which no typed query contains, so a match can never straddle two fields —
+// matching the joined key is exactly matching any one field). The tag picker
+// filters on every keystroke; building these per entry per keystroke was five
+// string allocations times ~5,000 entries each time.
+func dictionarySearchKeys() []string {
+	searchKeysOnce.Do(func() {
+		infos := dictionaryTags()
+		searchKeys = make([]string, len(infos))
+		for i, info := range infos {
+			ref := strings.ToLower(formatTagRef(info.Tag))
+			searchKeys[i] = strings.ToLower(info.Name) + "\x00" + strings.ToLower(info.Keyword) + "\x00" +
+				ref + "\x00" + strings.ReplaceAll(ref, ",", "")
+		}
+	})
+	return searchKeys
+}
+
 // tagMatchesQuery reports whether info matches a lowercased search query,
 // tested against the tag's name, keyword and GGGG,EEEE reference.
 func tagMatchesQuery(info tag.Info, query string) bool {

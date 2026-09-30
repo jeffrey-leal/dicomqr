@@ -57,13 +57,24 @@ type clipBuffer struct {
 	cancelled atomic.Bool
 	failed    atomic.Bool
 	complete  atomic.Bool
+
+	// parse opens the chapter's file: parseDicomFile, or the viewer window's
+	// dicomFileCache.parse, so the buffer and the on-demand first-frame load
+	// share one parse of a newly selected chapter instead of making one each.
+	parse func(path string) (*parsedDicom, error)
 }
 
 // startClipBuffer begins decoding a chapter in the background and returns
 // immediately. onProgress is posted to the Fyne UI goroutine as frames land,
 // with the count decoded so far, and once more when the fill stops.
 func startClipBuffer(c chapter, onProgress func(decoded int)) *clipBuffer {
-	b := &clipBuffer{chapter: c, frames: make([]atomic.Pointer[decodedFrame], maxInt(1, c.frames))}
+	return startClipBufferParsed(c, parseDicomFile, onProgress)
+}
+
+// startClipBufferParsed is startClipBuffer with the parse supplied (see
+// clipBuffer.parse).
+func startClipBufferParsed(c chapter, parse func(string) (*parsedDicom, error), onProgress func(decoded int)) *clipBuffer {
+	b := &clipBuffer{chapter: c, frames: make([]atomic.Pointer[decodedFrame], maxInt(1, c.frames)), parse: parse}
 	b.cap.Store(int32(maxInt(1, c.frames)))
 	go b.fill(onProgress)
 	return b
@@ -127,7 +138,7 @@ func (b *clipBuffer) fill(onProgress func(decoded int)) {
 }
 
 func (b *clipBuffer) fillFrames(onProgress func(decoded int)) {
-	parsed, err := parseDicomFile(b.chapter.path)
+	parsed, err := b.parse(b.chapter.path)
 	if err != nil {
 		// An unreadable clip leaves the buffer empty; every read falls back to the
 		// on-demand path, which surfaces the same failure through the viewer's

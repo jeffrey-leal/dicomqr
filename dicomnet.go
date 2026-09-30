@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	netdicom "github.com/algm/go-netdicom"
@@ -432,8 +434,17 @@ func (c *DicomClient) StoreFiles(ctx context.Context, paths []string, onProgress
 			offerTS = append(offerTS, ts)
 		}
 	}
-	for _, p := range paths {
-		addTS(fileTransferSyntaxUID(p))
+	// Each file's identity (SOP UIDs, stored syntax, where its data set
+	// starts) is read once, here, on the scan worker pool, and reused by the
+	// send loop. The pass used to read every file's syntax one at a time
+	// before connecting — about 9 ms a file on a cold spinning disk, so a
+	// minute and a half of silence for 10,000 files — and then each file was
+	// opened again for its identity and a third time for its bytes.
+	idents := readPushIdentities(paths)
+	for _, id := range idents {
+		if id.err == nil {
+			addTS(id.transferSyntaxUID)
+		}
 	}
 	addTS(tsExplicitVRLE)
 	addTS(tsImplicitVRLE)
@@ -464,15 +475,47 @@ func (c *DicomClient) StoreFiles(ctx context.Context, paths []string, onProgress
 		defer su.Release()
 		su.Connect(fmt.Sprintf("%s:%d", c.profile.Host, c.profile.Port))
 
+		// The next file is read from disk while the current one is on the
+		// wire — one file ahead, so memory holds at most the file being sent,
+		// the one read ahead and the one being read.
+		type loaded struct {
+			i   int
+			raw []byte
+			err error
+		}
+		next := make(chan loaded, 1)
+		stopRead := make(chan struct{})
+		defer close(stopRead)
+		go func() {
+			defer close(next)
+			for i, path := range paths {
+				l := loaded{i: i}
+				if idents[i].err != nil {
+					l.err = fmt.Errorf("read file meta: %w", idents[i].err)
+				} else {
+					l.raw, l.err = os.ReadFile(path)
+				}
+				select {
+				case next <- l:
+				case <-stopRead:
+					return
+				}
+			}
+		}()
+
 		total := len(paths)
-		for i, path := range paths {
+		for l := range next {
 			if ctx.Err() != nil {
 				resultCh <- result{ctx.Err()}
 				return
 			}
-			fileErr := storeFileRaw(su, path)
+			path := paths[l.i]
+			fileErr := l.err
+			if fileErr == nil {
+				fileErr = storeFileRaw(su, path, idents[l.i].dicomFileIdentity, l.raw)
+			}
 			if onProgress != nil {
-				onProgress(StoreProgress{Done: i + 1, Total: total, Path: path, Err: fileErr})
+				onProgress(StoreProgress{Done: l.i + 1, Total: total, Path: path, Err: fileErr})
 			}
 		}
 		resultCh <- result{nil}
@@ -487,27 +530,52 @@ func (c *DicomClient) StoreFiles(ctx context.Context, paths []string, onProgress
 	}
 }
 
-// storeFileRaw sends one stored file verbatim over an established push
-// association. On a transfer-syntax mismatch it converts a temp copy to the
-// negotiated uncompressed syntax and resends; any other error — including an
-// unconvertible mismatch — is returned for per-file reporting.
-func storeFileRaw(su *netdicom.ServiceUser, path string) error {
-	ident, err := fileMetaIdentity(path)
-	if err != nil {
-		return fmt.Errorf("read file meta: %w", err)
+// pushIdentity is one file's File Meta identity, or why it could not be read.
+type pushIdentity struct {
+	dicomFileIdentity
+	err error
+}
+
+// readPushIdentities reads every file's identity on the scan worker pool —
+// each is a few hundred bytes at the start of the file, so the pass is bound by
+// disk seeks, which several readers at once overlap — returning them in the
+// order given.
+func readPushIdentities(paths []string) []pushIdentity {
+	out := make([]pushIdentity, len(paths))
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range scanWorkers(len(paths)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= len(paths) {
+					return
+				}
+				id, err := fileMetaIdentity(paths[i])
+				out[i] = pushIdentity{dicomFileIdentity: id, err: err}
+			}
+		}()
 	}
-	sendFrom := func(p string, offset int64, ts string) error {
-		raw, rerr := os.ReadFile(p)
-		if rerr != nil {
-			return rerr
-		}
+	wg.Wait()
+	return out
+}
+
+// storeFileRaw sends one stored file verbatim over an established push
+// association, given its identity and bytes (both already read by StoreFiles).
+// On a transfer-syntax mismatch it converts a temp copy to the negotiated
+// uncompressed syntax and resends; any other error — including an
+// unconvertible mismatch — is returned for per-file reporting.
+func storeFileRaw(su *netdicom.ServiceUser, path string, ident dicomFileIdentity, raw []byte) error {
+	send := func(raw []byte, offset int64, ts string) error {
 		if int64(len(raw)) <= offset {
 			return errors.New("file holds no dataset after the meta group")
 		}
 		return su.CStoreRaw(ident.sopClassUID, ident.sopInstanceUID, ts, raw[offset:])
 	}
 
-	err = sendFrom(path, ident.datasetOffset, ident.transferSyntaxUID)
+	err := send(raw, ident.datasetOffset, ident.transferSyntaxUID)
 	var mismatch *netdicom.TransferSyntaxMismatchError
 	if !errors.As(err, &mismatch) {
 		return err
@@ -531,7 +599,11 @@ func storeFileRaw(su *netdicom.ServiceUser, path string) error {
 	}
 	logInfo("c-store: %s converted %s → %s for push (server did not accept the stored syntax)",
 		filepath.Base(path), transferSyntaxLabel(ident.transferSyntaxUID), transferSyntaxLabel(mismatch.Negotiated))
-	return sendFrom(tmpPath, tmpIdent.datasetOffset, tmpIdent.transferSyntaxUID)
+	converted, rerr := os.ReadFile(tmpPath)
+	if rerr != nil {
+		return rerr
+	}
+	return send(converted, tmpIdent.datasetOffset, tmpIdent.transferSyntaxUID)
 }
 
 // WorklistResult holds one Modality Worklist C-FIND response item.

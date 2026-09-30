@@ -36,6 +36,7 @@ import (
 
 type tagNode struct {
 	label       string
+	lower       string            // label lowercased, filled on first use by buildVisible
 	key         string            // identity used to match datasets to this node; not displayed
 	children    []string          // child node IDs, in display order
 	childKeys   map[string]string // key -> child ID, for O(1) findOrCreate (structural nodes only; lazily created)
@@ -58,6 +59,15 @@ type tagTreeModel struct {
 	nodes      map[string]*tagNode
 	counter    int
 	filterText string
+
+	// The filtered view, built once per (filter, tree version) — see
+	// childUIDs. version counts changes to the tree (addDataset), so a view
+	// built while files were still loading is rebuilt when more arrive.
+	version       int
+	visible       map[string][]string // node ID -> its children that match or lead to a match
+	visibleFilter string
+	visibleOf     int // the version visible was built for
+	visibleValid  bool
 }
 
 func newTagTreeModel() *tagTreeModel {
@@ -80,41 +90,70 @@ func (m *tagTreeModel) setFilter(text string) {
 	m.mu.Unlock()
 }
 
-// subtreeMatchesFilter reports whether node id or any descendant has a label
-// containing m.filterText. Must be called with m.mu read lock held.
-func (m *tagTreeModel) subtreeMatchesFilter(id string) bool {
-	n, ok := m.nodes[id]
-	if !ok {
-		return false
-	}
-	if strings.Contains(strings.ToLower(n.label), m.filterText) {
-		return true
-	}
-	for _, childID := range n.children {
-		if m.subtreeMatchesFilter(childID) {
-			return true
-		}
-	}
-	return false
-}
-
+// childUIDs returns id's children as the tree shows them: all of them, or with
+// a search active, those whose own label or some descendant's contains the
+// search text.
+//
+// The filtered view is built in one pass over the whole tree and cached until
+// the search text or the tree changes. Fyne asks for the children of every open
+// branch on every layout — every scroll frame — and after a search the viewer
+// opens every branch, so the old per-call check (recursing into each child's
+// subtree, lowercasing every label as it went) redid the whole tree's matching,
+// and allocated a lowercase copy of every label, once per branch per frame: on
+// a large study, hundreds of thousands of element nodes, scrolling crawled.
 func (m *tagTreeModel) childUIDs(id string) []string {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
 	n, ok := m.nodes[id]
 	if !ok {
+		m.mu.RUnlock()
 		return nil
 	}
 	if m.filterText == "" {
+		m.mu.RUnlock()
 		return n.children
 	}
-	var visible []string
-	for _, childID := range n.children {
-		if m.subtreeMatchesFilter(childID) {
-			visible = append(visible, childID)
-		}
+	if m.visibleValid && m.visibleFilter == m.filterText && m.visibleOf == m.version {
+		v := m.visible[id]
+		m.mu.RUnlock()
+		return v
 	}
-	return visible
+	m.mu.RUnlock()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !(m.visibleValid && m.visibleFilter == m.filterText && m.visibleOf == m.version) {
+		m.buildVisible()
+	}
+	return m.visible[id]
+}
+
+// buildVisible computes the filtered view: a post-order walk marks each node
+// matching when its label or any descendant's contains the filter, recording
+// the matching children of each node on the way. Caller holds the write lock.
+func (m *tagTreeModel) buildVisible() {
+	visible := make(map[string][]string)
+	var walk func(id string) bool
+	walk = func(id string) bool {
+		n := m.nodes[id]
+		if n == nil {
+			return false
+		}
+		var kept []string
+		for _, c := range n.children {
+			if walk(c) {
+				kept = append(kept, c)
+			}
+		}
+		if len(kept) > 0 {
+			visible[id] = kept
+		}
+		if n.lower == "" && n.label != "" {
+			n.lower = strings.ToLower(n.label) // labels never change once created
+		}
+		return len(kept) > 0 || strings.Contains(n.lower, m.filterText)
+	}
+	walk("")
+	m.visible, m.visibleFilter, m.visibleOf, m.visibleValid = visible, m.filterText, m.version, true
 }
 
 // tooltipFor returns a formatted DICOM standard description for the node's tag.
@@ -261,6 +300,7 @@ func (m *tagTreeModel) addDataset(ds sdicom.Dataset) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.version++ // the tree is changing: any cached filtered view is stale
 
 	patientID := m.findOrCreate("", patientKey, patientName)
 	studyID := m.findOrCreateSorted(patientID, studyKey, studyLabel, studySortKey)

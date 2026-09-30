@@ -1000,6 +1000,9 @@ type frameDecodeOpts struct {
 	// windows the frame itself: the still image is never looked at there, and
 	// would cost a render plus 4 bytes a pixel in every cached slice.
 	skipRender bool
+	// displayRGBA converts a colour frame to *image.RGBA as part of the
+	// decode (see frameStateOpts), for the viewer.
+	displayRGBA bool
 }
 
 // interactiveDecodeOpts is for the frame on screen that the user is waiting on:
@@ -1011,7 +1014,7 @@ func interactiveDecodeOpts() frameDecodeOpts {
 // viewerDecodeOpts is interactiveDecodeOpts for the viewer window, which renders
 // through its viewport and never uses the still image.
 func viewerDecodeOpts(interactive bool) frameDecodeOpts {
-	opts := frameDecodeOpts{skipRender: true}
+	opts := frameDecodeOpts{skipRender: true, displayRGBA: true}
 	if interactive {
 		opts.threads = runtime.NumCPU()
 	}
@@ -1046,6 +1049,15 @@ func (p *parsedDicom) frameStateOpts(idx int, opts frameDecodeOpts) (viewerState
 	}
 
 	df.modality = p.ann.modality
+	// A colour frame arrives as whatever the decoder produced — NRGBA from
+	// JPEG 2000 and JPEG Lossless, YCbCr from JPEG Baseline — and Fyne uploads
+	// only *image.RGBA without converting: anything else went through a
+	// draw.Draw into a fresh RGBA on the UI goroutine at every refresh (each
+	// pan, zoom and resize). Converting once here, on the decoding goroutine,
+	// does that work once per frame; the clip buffer has always done the same.
+	if opts.displayRGBA && df.colorImg != nil {
+		df.colorImg = toRGBA(df.colorImg)
+	}
 	// Overlay planes are positioned in the file's own pixel grid; a frame
 	// decoded at reduced resolution (a thumbnail) would place them wrongly.
 	if p.rows <= 0 || df.rows == p.rows {
@@ -1081,6 +1093,22 @@ type dicomFileCache struct {
 // is not the one already cached. The lock is held across the decode so that two
 // navigation events cannot parse the same file concurrently.
 func (c *dicomFileCache) load(path string, frameIdx int) (viewerState, error) {
+	p, err := c.parse(path)
+	if err != nil {
+		return viewerState{}, err
+	}
+	// The viewer's on-demand path: one frame, and the user is waiting on it.
+	// A parsedDicom decodes concurrently (the clip buffer's workers share one),
+	// so the decode needs no lock.
+	return p.frameStateOpts(frameIdx, viewerDecodeOpts(true))
+}
+
+// parse returns path's parsed file, parsing it only when it is not the one
+// already cached. The lock is held across the parse, so two callers asking for
+// the same file — the clip buffer starting on a newly selected chapter and the
+// on-demand load of that chapter's first frame, which used to parse it once
+// each — parse it once between them.
+func (c *dicomFileCache) parse(path string) (*parsedDicom, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.parsed == nil || c.path != path {
@@ -1089,12 +1117,11 @@ func (c *dicomFileCache) load(path string, frameIdx int) (viewerState, error) {
 			// Drop the stale entry: the next attempt should re-parse rather than
 			// serve frames of a file the viewer has navigated away from.
 			c.path, c.parsed = "", nil
-			return viewerState{}, err
+			return nil, err
 		}
 		c.path, c.parsed = path, p
 	}
-	// The viewer's on-demand path: one frame, and the user is waiting on it.
-	return c.parsed.frameStateOpts(frameIdx, viewerDecodeOpts(true))
+	return c.parsed, nil
 }
 
 // decodeViewerSlice decodes one slice-mode slice for the viewer: a single-frame
@@ -1327,7 +1354,18 @@ func decodeFrame(f *frame.Frame, opts frameDecodeOpts, transferSyntax string, ha
 		if isJPEGLosslessTransferSyntax(transferSyntax) {
 			return decodeJPEGLosslessFrame(f.EncapsulatedData.Data, slope, intercept, hasWindow, wc, ww, photometric, isSigned)
 		}
-		img, err := f.GetImage()
+		// JPEG Baseline/Extended decodes through libjpeg-turbo when it is
+		// built in (jpegbaseline_turbo.go) — several times faster, straight to
+		// RGBA, and at reduced size for a thumbnail — falling back to the
+		// library's Go decoder for anything it declines.
+		var img image.Image
+		var err error
+		if transferSyntax == tsJPEGBaseline || transferSyntax == tsJPEGExtended {
+			img, err = decodeJPEGForDisplay(f.EncapsulatedData.Data, opts.maxSide)
+		}
+		if img == nil {
+			img, err = f.GetImage()
+		}
 		if err != nil {
 			return nil, fmt.Errorf("cannot decode compressed pixel data (%w)\n\nUse Open in Viewer to open this file in an external DICOM viewer.", err)
 		}
@@ -1820,8 +1858,9 @@ func (v *imageViewport) setContent(df *decodedFrame, wc, ww float64, ann imageAn
 		v.panCY = clampFloat(v.panCY, 0, float64(df.rows))
 	}
 
-	// A new frame may differ in size, so drop any stale windowing buffer.
-	v.buf = nil
+	// The windowing buffer is kept: renderBase reallocates it only when the
+	// new frame's size differs. Dropping it here reallocated a whole frame's
+	// RGBA — up to tens of MB for a large radiograph — on every slice step.
 	v.renderBase(wc, ww)
 	v.applyDisplay()
 	v.refreshOverlay()
@@ -2596,7 +2635,7 @@ func openViewerWindow(a fyne.App, title string, chapters []chapter, collectErr e
 			current = clampInt(remembered.frame, 0, maxInt(0, c.frames-1))
 			total = c.frames
 
-			clipRef.Store(startClipBuffer(c, func(decoded int) {
+			clipRef.Store(startClipBufferParsed(c, cache.parse, func(decoded int) {
 				clip := clipRef.Load()
 				if clip == nil || clip.chapter.path != chapters[curChapter].path {
 					return // progress from a chapter already switched away from

@@ -927,9 +927,10 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 					// incomplete on disk; the deferred recover closes and removes
 					// it if the encode panics.
 					partial = f
-					bw := bufio.NewWriterSize(f, 1<<20)
+					bw := getBufWriter(f)
 					werr := sdicom.Write(bw, ds, writeOpts...)
 					fherr := bw.Flush()
+					putBufWriter(bw)
 					clerr := f.Close()
 					partial = nil
 					switch {
@@ -1403,6 +1404,38 @@ func modifyWorkerCount(cpuHeavy bool, files int) int {
 	return max(1, min(w, files))
 }
 
+// Pooled 1 MB read and write buffers for the per-file parse and write. Each
+// file used to allocate a fresh pair (zeroed megabytes; gigabytes of garbage
+// over a large study) though a worker only ever uses one of each at a time.
+var (
+	bufReaderPool = sync.Pool{New: func() any { return bufio.NewReaderSize(nil, 1<<20) }}
+	bufWriterPool = sync.Pool{New: func() any { return bufio.NewWriterSize(nil, 1<<20) }}
+)
+
+func getBufReader(r io.Reader) *bufio.Reader {
+	br := bufReaderPool.Get().(*bufio.Reader)
+	br.Reset(r)
+	return br
+}
+
+// putBufReader returns br to the pool, dropping its reference to the file.
+func putBufReader(br *bufio.Reader) {
+	br.Reset(nil)
+	bufReaderPool.Put(br)
+}
+
+func getBufWriter(w io.Writer) *bufio.Writer {
+	bw := bufWriterPool.Get().(*bufio.Writer)
+	bw.Reset(w)
+	return bw
+}
+
+// putBufWriter returns bw to the pool; call only after Flush.
+func putBufWriter(bw *bufio.Writer) {
+	bw.Reset(nil)
+	bufWriterPool.Put(bw)
+}
+
 // processFileFn is the per-file transform the worker pool calls, a variable so
 // tests can substitute a panicking implementation and prove the worker's
 // backstop turns it into a recorded failure — the same seam encodeMaskedFrame
@@ -1431,9 +1464,10 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 	if err != nil {
 		return false, ds, notes, fmt.Errorf("stat: %w", err)
 	}
-	br := bufio.NewReaderSize(src, 1<<20)
+	br := getBufReader(src)
 	raw := rawPixelPassthrough(p)
 	ds, err = safeParse(br, info.Size(), src.Name(), nil, modifyParseOpts(raw)...)
+	putBufReader(br) // the parse copies every value out; the buffer is free again
 	src.Close()
 	if err != nil {
 		return false, ds, notes, fmt.Errorf("parse: %w", err)

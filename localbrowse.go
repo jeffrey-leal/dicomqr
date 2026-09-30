@@ -729,6 +729,48 @@ func pruneEmptyDirs(dir, root string) {
 	}
 }
 
+// filesMissingOnDisk returns those of paths that are no longer on disk.
+//
+// It lists each folder once rather than stat-ing each file: the files of a
+// series share one folder, so a patient of 20,000 files is a few dozen
+// directory reads instead of 20,000 stats — on a cold disk, the difference
+// between an instant check and many seconds of disk seeks every time a large
+// node is touched. Names are compared case-insensitively, as Windows resolves
+// them.
+//
+// Only a file genuinely absent counts as missing: absent from a folder that
+// was read, or inside a folder that does not exist. A folder that exists but
+// cannot be read (permissions, a drive that is momentarily unavailable) counts
+// nothing as missing — the previous per-file check treated any stat error as
+// "deleted" and pruned those files from the index, the unsafe direction.
+func filesMissingOnDisk(paths []string) []string {
+	byDir := make(map[string][]string)
+	for _, p := range paths {
+		d := filepath.Dir(p)
+		byDir[d] = append(byDir[d], p)
+	}
+	var missing []string
+	for dir, files := range byDir {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				missing = append(missing, files...)
+			}
+			continue
+		}
+		present := make(map[string]bool, len(entries))
+		for _, e := range entries {
+			present[strings.ToLower(e.Name())] = true
+		}
+		for _, p := range files {
+			if !present[strings.ToLower(filepath.Base(p))] {
+				missing = append(missing, p)
+			}
+		}
+	}
+	return missing
+}
+
 // formatBytes returns a human-readable byte count.
 func formatBytes(n int64) string {
 	switch {
@@ -751,24 +793,50 @@ func showDeleteDialog(w fyne.Window, cfg *Settings, paths []string, description 
 		return
 	}
 
-	// Deduplicate paths and calculate total size.
+	// Deduplicate paths; the total size is worked out in the background below.
 	seen := make(map[string]bool)
 	var unique []string
-	var totalBytes int64
 	for _, p := range paths {
 		if !seen[p] {
 			seen[p] = true
 			unique = append(unique, p)
-			if info, err := os.Stat(p); err == nil {
-				totalBytes += info.Size()
-			}
 		}
 	}
 
-	msgLbl := widget.NewLabel(fmt.Sprintf(
-		"%s\n\n%d file(s) (%s) will be permanently deleted from disk. This cannot be undone.",
-		description, len(unique), formatBytes(totalBytes)))
+	message := func(size string) string {
+		return fmt.Sprintf("%s\n\n%d file(s) (%s) will be permanently deleted from disk. This cannot be undone.",
+			description, len(unique), size)
+	}
+	msgLbl := widget.NewLabel(message("calculating size…"))
 	msgLbl.Wrapping = fyne.TextWrapWord
+
+	// Summing the sizes used to stat every file on the UI goroutine before the
+	// dialog appeared — a patient of 20,000 files froze the window for as long
+	// as that took, on a cold disk many seconds. The dialog now opens at once
+	// and fills the size in when it is known; Delete does not depend on it.
+	sized := make(chan struct{})
+	go func() {
+		var total int64
+		for _, p := range unique {
+			select {
+			case <-sized:
+				return // deletion started or dialog cancelled: no longer needed
+			default:
+			}
+			if info, err := os.Stat(p); err == nil {
+				total += info.Size()
+			}
+		}
+		fyne.Do(func() {
+			select {
+			case <-sized:
+			default:
+				msgLbl.SetText(message(formatBytes(total)))
+			}
+		})
+	}()
+	var stopSizing sync.Once
+	stopSize := func() { stopSizing.Do(func() { close(sized) }) }
 
 	statusLbl := widget.NewLabel("")
 	statusLbl.Wrapping = fyne.TextWrapWord
@@ -788,9 +856,10 @@ func showDeleteDialog(w fyne.Window, cfg *Settings, paths []string, description 
 	dlg := dialog.NewCustomWithoutButtons("Confirm Delete", container.NewPadded(content), w)
 	dlg.Resize(fyne.NewSize(420, 0))
 
-	cancelBtn.OnTapped = func() { dlg.Hide() }
+	cancelBtn.OnTapped = func() { stopSize(); dlg.Hide() }
 
 	deleteBtn.OnTapped = func() {
+		stopSize()
 		deleteBtn.Disable()
 		cancelBtn.Disable()
 		msgLbl.Hide()
@@ -1141,15 +1210,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 		}()
 	}
 
-	statMissing := func(paths []string) []string {
-		var missing []string
-		for _, p := range paths {
-			if _, err := os.Stat(p); err != nil {
-				missing = append(missing, p)
-			}
-		}
-		return missing
-	}
+	statMissing := filesMissingOnDisk
 
 	// pruneMissing stats paths in the background and removes those no longer on
 	// disk from the catalog and tree, keeping both consistent with the folder.
@@ -1167,8 +1228,14 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 	// verifyNode checks in the background that a touched node's files still
 	// exist, pruning entries that were removed outside the app. A per-node
 	// in-flight guard stops repeated taps from re-statting large subtrees.
+	// A node checked in the last verifyTTL is not checked again: every tap and
+	// right-click touches a node, and without this, clicking around a large
+	// patient re-read its folders each time (the guard above only stops
+	// overlapping checks, not back-to-back ones).
 	var verifyMu sync.Mutex
 	verifying := make(map[string]bool)
+	verifiedAt := make(map[string]time.Time)
+	const verifyTTL = 30 * time.Second
 	verifyNode = func(id string) {
 		if cat == nil {
 			return
@@ -1179,9 +1246,13 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 		}
 		verifyMu.Lock()
 		inFlight := verifying[id]
-		verifying[id] = true
+		recent := time.Since(verifiedAt[id]) < verifyTTL
+		if !inFlight && !recent {
+			verifying[id] = true
+			verifiedAt[id] = time.Now()
+		}
 		verifyMu.Unlock()
-		if inFlight {
+		if inFlight || recent {
 			return
 		}
 		captured := make([]string, len(paths))

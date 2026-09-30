@@ -299,31 +299,42 @@ func scaleToThumb(img image.Image, side int) *image.RGBA {
 	h := maxInt(1, int(float64(b.Dy())*scale))
 	dst := image.NewRGBA(image.Rect(0, 0, w, h))
 
+	// The box filter reads 8-bit RGBA bytes directly. It used to call
+	// img.At(x, y).RGBA() for every source pixel — a boxed colour (a heap
+	// allocation) and a dynamic call each, and for a JPEG frame a YCbCr→RGB
+	// conversion per pixel too, some 770,000 per echo frame. A frame that is
+	// not already RGBA is converted once, by image/draw's fast paths.
+	src := toRGBA(img)
+	sb := src.Bounds()
 	for y := 0; y < h; y++ {
-		sy0 := b.Min.Y + y*b.Dy()/h
-		sy1 := maxInt(sy0+1, b.Min.Y+(y+1)*b.Dy()/h)
+		sy0 := sb.Min.Y + y*sb.Dy()/h
+		sy1 := maxInt(sy0+1, sb.Min.Y+(y+1)*sb.Dy()/h)
 		for x := 0; x < w; x++ {
-			sx0 := b.Min.X + x*b.Dx()/w
-			sx1 := maxInt(sx0+1, b.Min.X+(x+1)*b.Dx()/w)
+			sx0 := sb.Min.X + x*sb.Dx()/w
+			sx1 := maxInt(sx0+1, sb.Min.X+(x+1)*sb.Dx()/w)
 			var r, g, bl, a, n uint64
 			for sy := sy0; sy < sy1; sy++ {
+				row := src.PixOffset(sx0, sy)
 				for sx := sx0; sx < sx1; sx++ {
-					cr, cg, cb, ca := img.At(sx, sy).RGBA()
-					r += uint64(cr)
-					g += uint64(cg)
-					bl += uint64(cb)
-					a += uint64(ca)
+					r += uint64(src.Pix[row])
+					g += uint64(src.Pix[row+1])
+					bl += uint64(src.Pix[row+2])
+					a += uint64(src.Pix[row+3])
+					row += 4
 					n++
 				}
 			}
 			if n == 0 {
 				continue
 			}
+			// The mean taken in 16-bit colour (×257) and shifted back down —
+			// the arithmetic the At-based version used — so an RGBA frame
+			// gives the same thumbnail byte for byte.
 			i := dst.PixOffset(x, y)
-			dst.Pix[i+0] = uint8(r / n >> 8)
-			dst.Pix[i+1] = uint8(g / n >> 8)
-			dst.Pix[i+2] = uint8(bl / n >> 8)
-			dst.Pix[i+3] = uint8(a / n >> 8)
+			dst.Pix[i+0] = uint8(r * 257 / n >> 8)
+			dst.Pix[i+1] = uint8(g * 257 / n >> 8)
+			dst.Pix[i+2] = uint8(bl * 257 / n >> 8)
+			dst.Pix[i+3] = uint8(a * 257 / n >> 8)
 		}
 	}
 	return dst

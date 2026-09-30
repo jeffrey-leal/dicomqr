@@ -438,15 +438,15 @@ func TestScanMaskSeriesSkipsUnreadable(t *testing.T) {
 func TestMaskFileStatusColor(t *testing.T) {
 	calibrated := maskSeriesFile{
 		cols: 800, rows: 600,
-		src:  maskSource{modality: "US", usDeclared: true, usBounds: pixelRect{10, 40, 790, 560}},
+		src: maskSource{modality: "US", usDeclared: true, usBounds: pixelRect{10, 40, 790, 560}},
 	}
 	uncalibrated := maskSeriesFile{
 		cols: 800, rows: 600,
-		src:  maskSource{modality: "US"},
+		src: maskSource{modality: "US"},
 	}
 	ct := maskSeriesFile{
 		cols: 512, rows: 512,
-		src:  maskSource{modality: "CT"},
+		src: maskSource{modality: "CT"},
 	}
 	usRule := MaskRegion{Mode: maskModeOutsideUS}
 	rect := MaskRegion{Mode: maskModeRect, W: 1, H: 0.1}

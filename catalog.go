@@ -487,18 +487,21 @@ func (c *catalog) load() ([]localStudy, []localSeries, map[string][]string, erro
 		return nil, nil, empty, err
 	}
 
+	// Instance counts are not asked of SQLite: the query below fetches every
+	// instance row anyway, so the count is the length of each series' list.
+	// The LEFT JOIN … COUNT this replaces walked every instance a second time,
+	// with a row lookup each (the series index does not cover path), on every
+	// reload — after each retrieve, import, prune and scan.
 	var series []localSeries
 	rows, err = c.db.Query(`
-		SELECT se.series_uid, se.study_uid, se.modality, se.series_number, se.series_desc, COUNT(i.path)
-		FROM series se LEFT JOIN instances i ON i.series_uid = se.series_uid
-		GROUP BY se.series_uid`)
+		SELECT series_uid, study_uid, modality, series_number, series_desc FROM series`)
 	if err != nil {
 		return nil, nil, empty, err
 	}
 	for rows.Next() {
 		var sr localSeries
 		if err := rows.Scan(&sr.seriesUID, &sr.studyUID, &sr.modality,
-			&sr.seriesNumber, &sr.seriesDesc, &sr.numInstances); err != nil {
+			&sr.seriesNumber, &sr.seriesDesc); err != nil {
 			rows.Close()
 			return nil, nil, empty, err
 		}
@@ -525,6 +528,9 @@ func (c *catalog) load() ([]localStudy, []localSeries, map[string][]string, erro
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, nil, empty, err
+	}
+	for i := range series {
+		series[i].numInstances = len(filesByUID[series[i].seriesUID])
 	}
 
 	return studies, series, filesByUID, nil

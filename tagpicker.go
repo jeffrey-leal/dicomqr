@@ -23,7 +23,9 @@ import (
 	"fmt"
 	"image/color"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -98,6 +100,7 @@ func mergeTagSelection(existing []string, selected map[tag.Tag]bool) []string {
 // tree. Rebuilt whenever the search text or either toggle changes.
 type tagPickerModel struct {
 	all              []tag.Info
+	keys             []string // all's search text, lowercased once (dictionarySearchKeys)
 	selected         map[tag.Tag]bool
 	filter           string
 	hideRetired      bool
@@ -106,6 +109,11 @@ type tagPickerModel struct {
 	groups  []uint16              // visible groups, in dictionary order
 	byGroup map[uint16][]tag.Info // visible tags of each group
 	byID    map[widget.TreeNodeID]tag.Info
+	// The tree's node IDs, built with the view in rebuild rather than
+	// formatted afresh each time childUIDs is asked — which Fyne does for
+	// every open branch on every layout.
+	rootIDs  []widget.TreeNodeID
+	groupIDs map[uint16][]widget.TreeNodeID
 	// selByGroup counts checked tags per group over the whole dictionary, not
 	// just the visible slice, so a collapsed or filtered-out group still
 	// reports its share of the selection. Maintained incrementally by
@@ -121,6 +129,7 @@ type tagPickerModel struct {
 func newTagPickerModel(selected map[tag.Tag]bool) *tagPickerModel {
 	m := &tagPickerModel{
 		all:        dictionaryTags(),
+		keys:       dictionarySearchKeys(),
 		selected:   selected,
 		selByGroup: make(map[uint16]int),
 	}
@@ -170,46 +179,42 @@ func (m *tagPickerModel) rebuild() {
 	m.groups = nil
 	m.byGroup = make(map[uint16][]tag.Info)
 	m.byID = make(map[widget.TreeNodeID]tag.Info)
-	for _, info := range m.all {
+	m.rootIDs = nil
+	m.groupIDs = make(map[uint16][]widget.TreeNodeID)
+	for i, info := range m.all {
 		if m.hideRetired && info.Retired {
 			continue
 		}
 		if m.showSelectedOnly && !m.selected[info.Tag] {
 			continue
 		}
-		if !tagMatchesQuery(info, query) {
+		if query != "" && !strings.Contains(m.keys[i], query) {
 			continue
 		}
 		g := info.Tag.Group
 		if _, ok := m.byGroup[g]; !ok {
 			m.groups = append(m.groups, g)
+			m.rootIDs = append(m.rootIDs, groupNodeID(g))
 		}
 		m.byGroup[g] = append(m.byGroup[g], info)
-		m.byID[tagNodeID(info.Tag)] = info
+		id := tagNodeID(info.Tag)
+		m.byID[id] = info
+		m.groupIDs[g] = append(m.groupIDs[g], id)
 	}
 }
 
 func (m *tagPickerModel) childUIDs(id widget.TreeNodeID) []widget.TreeNodeID {
 	if id == "" {
-		ids := make([]widget.TreeNodeID, 0, len(m.groups))
-		for _, g := range m.groups {
-			ids = append(ids, groupNodeID(g))
-		}
-		return ids
+		return m.rootIDs
 	}
 	if !strings.HasPrefix(id, "g:") {
 		return nil
 	}
-	var group uint16
-	if _, err := fmt.Sscanf(id[2:], "%04X", &group); err != nil {
+	group, err := strconv.ParseUint(id[2:], 16, 16)
+	if err != nil {
 		return nil
 	}
-	infos := m.byGroup[group]
-	ids := make([]widget.TreeNodeID, 0, len(infos))
-	for _, info := range infos {
-		ids = append(ids, tagNodeID(info.Tag))
-	}
-	return ids
+	return m.groupIDs[uint16(group)]
 }
 
 // isBranch reports group rows as branches. The virtual root must answer true
@@ -346,9 +351,20 @@ func showTagPicker(a fyne.App, parent fyne.Window, title, current string,
 
 	searchEntry := widget.NewEntry()
 	searchEntry.SetPlaceHolder("Search by name, keyword or number — e.g. patient, 0010, InstitutionName")
+	// Filtered 150 ms after typing stops, like the Local Browse and Import
+	// filters: a rebuild per keystroke re-laid-out a 5,000-row tree for every
+	// character of a word being typed.
+	var searchDebounce *time.Timer
 	searchEntry.OnChanged = func(s string) {
-		m.filter = s
-		applyFilter()
+		if searchDebounce != nil {
+			searchDebounce.Stop()
+		}
+		searchDebounce = time.AfterFunc(150*time.Millisecond, func() {
+			fyne.Do(func() {
+				m.filter = s
+				applyFilter()
+			})
+		})
 	}
 
 	retiredCheck := widget.NewCheck("Hide retired", func(v bool) {

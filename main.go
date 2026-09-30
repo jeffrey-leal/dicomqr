@@ -138,7 +138,19 @@ func main() {
 	// Before any GL context exists: make sure this executable's NVIDIA driver
 	// profile has Threaded Optimization off (see nvthreadctl.go — it corrupts
 	// multi-window rendering during cine playback). No-op on other GPUs.
-	disableNvidiaThreadedOptimization()
+	//
+	// It runs alongside the rest of startup and is waited for just before
+	// ShowAndRun: the session logs show it taking ~0.25–0.3 s (NVAPI and
+	// driver-profile loading, even when the setting is already off), all of
+	// which used to delay building the window. Fyne creates the GL window and
+	// its context only in Show (glfw window_desktop.go create, called from
+	// window.Show), and nothing is shown before ShowAndRun — so the "before any
+	// GL context" guarantee holds as long as the wait stays ahead of it.
+	nvidiaDone := make(chan struct{})
+	go func() {
+		defer close(nvidiaDone)
+		disableNvidiaThreadedOptimization()
+	}()
 	a := app.NewWithID("com.jeffreyleal.dicomqr")
 	a.SetIcon(appIcon)
 	w := a.NewWindow("dicomqr")
@@ -1768,6 +1780,7 @@ func main() {
 	// to run — it must only repeat cleanup already done elsewhere.
 	a.Lifecycle().SetOnStopped(func() { stopClock(); shutdownSCP(); cat.Close(); armExitWatchdog() })
 
+	<-nvidiaDone // the driver profile must be settled before the first GL context (see above)
 	w.ShowAndRun()
 }
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -62,7 +63,9 @@ func (m *resultsModel) sortedInsert(list *[]string, id string) {
 	pos := sort.Search(len(*list), func(i int) bool {
 		return m.nodes[(*list)[i]].sortKey >= m.nodes[id].sortKey
 	})
-	*list = append((*list)[:pos], append([]string{id}, (*list)[pos:]...)...)
+	// In place: the old append-of-an-append copied the whole tail into a new
+	// slice on every insert, so building a large tree allocated quadratically.
+	*list = slices.Insert(*list, pos, id)
 }
 
 func (m *resultsModel) clear() {

@@ -58,6 +58,14 @@ func EncodePDU(pdu PDU) ([]byte, error) {
 	default:
 		panic(fmt.Sprintf("Unknown PDU %v", pdu))
 	}
+	// P-DATA-TF carries every data set, so it gets a direct path (dicomqr local
+	// patch): header and items written once into a buffer allocated at its
+	// final size. The generic path below builds the payload in a growing
+	// bytes.Buffer — copying a multi-megabyte payload at each doubling — and
+	// then copies it once more to put the header in front.
+	if p, ok := pdu.(*PDataTf); ok {
+		return p.encode(), nil
+	}
 	payload, err := pdu.Write()
 	if err != nil {
 		return nil, err
@@ -73,21 +81,18 @@ func EncodePDU(pdu PDU) ([]byte, error) {
 // EncodePDU reads a "pdu" from a stream. maxPDUSize defines the maximum
 // possible PDU size, in bytes, accepted by the caller.
 func ReadPDU(in io.Reader, maxPDUSize int) (PDU, error) {
-	var pduType Type
-	var skip byte
-	var length uint32
-	err := binary.Read(in, binary.BigEndian, &pduType)
-	if err != nil {
+	// The 6-byte header in one read (dicomqr local patch): three binary.Reads
+	// straight from the connection were three socket reads, and three small
+	// allocations, per PDU.
+	var hdr [6]byte
+	if _, err := io.ReadFull(in, hdr[:]); err != nil {
+		if err == io.ErrUnexpectedEOF {
+			err = io.EOF // a peer that closed mid-header is still a close
+		}
 		return nil, err
 	}
-	err = binary.Read(in, binary.BigEndian, &skip)
-	if err != nil {
-		return nil, err
-	}
-	err = binary.Read(in, binary.BigEndian, &length)
-	if err != nil {
-		return nil, err
-	}
+	pduType := Type(hdr[0])
+	length := binary.BigEndian.Uint32(hdr[2:6])
 	if length >= uint32(maxPDUSize)*2 {
 		// Avoid using too much memory. *2 is just an arbitrary slack.
 		return nil, fmt.Errorf("Invalid length %d; it's much larger than max PDU size of %d", length, maxPDUSize)
