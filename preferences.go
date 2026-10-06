@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"image/color"
 	"io/fs"
@@ -13,13 +15,16 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	netdicom "github.com/algm/go-netdicom"
 	catppuccin "github.com/catppuccin/fyne"
 	sqweekdialog "github.com/sqweek/dialog"
 )
@@ -364,6 +369,9 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 	// Server profiles list
 	pendingProfiles := append([]ServerProfile(nil), cfg.Profiles...)
 	profileList := container.NewVBox()
+	// The local AE title a server profile's Test calls from: the Network
+	// section's pending value, once that entry exists below.
+	pendingLocalAE := func() string { return cfg.LocalAETitle }
 
 	var buildProfileList func()
 	buildProfileList = func() {
@@ -372,7 +380,7 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 			i := i
 			nameLabel := widget.NewLabel(fmt.Sprintf("%s  (%s@%s:%d)", pendingProfiles[i].Name, pendingProfiles[i].RemoteAETitle, pendingProfiles[i].Host, pendingProfiles[i].Port))
 			editBtn := widget.NewButton("Edit", func() {
-				showServerProfileEditor(w, pendingProfiles[i], func(updated ServerProfile) {
+				showServerProfileEditor(a, w, pendingProfiles[i], pendingLocalAE, func(updated ServerProfile) {
 					pendingProfiles[i] = updated
 					buildProfileList()
 				})
@@ -410,7 +418,7 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 	buildProfileList()
 
 	addProfileBtn := widget.NewButton("Add server…", func() {
-		showServerProfileEditor(w, ServerProfile{Name: "New Server", Port: 104, InfoModel: "study"}, func(added ServerProfile) {
+		showServerProfileEditor(a, w, ServerProfile{Name: "New Server", Port: 104, InfoModel: "study"}, pendingLocalAE, func(added ServerProfile) {
 			pendingProfiles = append(pendingProfiles, added)
 			buildProfileList()
 		})
@@ -424,6 +432,12 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 	// Network — local SCP identity, download folder, stall watchdog
 	localAEEntry := widget.NewEntry()
 	localAEEntry.SetText(cfg.LocalAETitle)
+	pendingLocalAE = func() string {
+		if ae := strings.TrimSpace(localAEEntry.Text); ae != "" {
+			return ae
+		}
+		return cfg.LocalAETitle
+	}
 	localPortEntry := widget.NewEntry()
 	localPortEntry.SetText(fmt.Sprintf("%d", cfg.LocalSCPPort))
 
@@ -847,8 +861,12 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 	})
 }
 
-// showServerProfileEditor opens an edit dialog for a single ServerProfile.
-func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerProfile)) {
+// showServerProfileEditor opens an editor window for a single ServerProfile,
+// owned by and blocking parent (the Preferences window). localAE supplies the
+// local AE title the Test button calls from — Preferences' pending value, so
+// an AE title edited but not yet applied is the one tested.
+func showServerProfileEditor(a fyne.App, parent fyne.Window, p ServerProfile, localAE func() string,
+	onSave func(ServerProfile)) {
 	nameEntry := widget.NewEntry()
 	nameEntry.SetText(p.Name)
 
@@ -915,6 +933,118 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 		tsSelect.SetSelected(tsLabelAny)
 	}
 
+	parallelEntry := widget.NewEntry()
+	if p.ParallelTransfers > 1 {
+		parallelEntry.SetText(strconv.Itoa(p.ParallelTransfers))
+	}
+	parallelEntry.SetPlaceHolder("1 (default)")
+	parallelEntry.Validator = func(s string) error {
+		if strings.TrimSpace(s) == "" {
+			return nil
+		}
+		v, err := strconv.Atoi(strings.TrimSpace(s))
+		if err != nil || v < 1 || v > maxParallelTransfers {
+			return fmt.Errorf("parallel transfers must be 1–%d", maxParallelTransfers)
+		}
+		return nil
+	}
+	parallelValue := func() int {
+		v, err := strconv.Atoi(strings.TrimSpace(parallelEntry.Text))
+		if err != nil {
+			return 1
+		}
+		return min(max(v, 1), maxParallelTransfers)
+	}
+
+	// The form as edited so far, for Save and for Test. Starting from p keeps
+	// every field this window does not edit — a fresh struct literal here
+	// once would have silently zeroed any field added later.
+	edited := func() ServerProfile {
+		out := p
+		out.Name = nameEntry.Text
+		out.RemoteAETitle = strings.ToUpper(strings.TrimSpace(aeEntry.Text))
+		out.Host = strings.TrimSpace(hostEntry.Text)
+		if v, err := strconv.Atoi(strings.TrimSpace(portEntry.Text)); err == nil && v > 0 && v < 65536 {
+			out.Port = v
+		}
+		out.ConnectTimeout = 0
+		if v, err := strconv.Atoi(strings.TrimSpace(timeoutEntry.Text)); err == nil && v > 0 {
+			out.ConnectTimeout = v
+		}
+		out.InfoModel = modelSelect.Selected
+		out.RetrieveMethod = "MOVE"
+		switch retrieveMethodSelect.Selected {
+		case "C-GET":
+			out.RetrieveMethod = "GET"
+		case "Auto":
+			out.RetrieveMethod = "AUTO"
+		}
+		out.TransferSyntax = tsPrefAny
+		switch tsSelect.Selected {
+		case tsLabelExplicit:
+			out.TransferSyntax = tsPrefExplicitLE
+		case tsLabelImplicit:
+			out.TransferSyntax = tsPrefImplicitLE
+		}
+		out.ParallelTransfers = 0 // omitted from settings.json when one
+		if v := parallelValue(); v > 1 {
+			out.ParallelTransfers = v
+		}
+		return out
+	}
+
+	var win fyne.Window // assigned in openOwnedWindow's build callback
+
+	// Test opens the entered number of associations at once with C-ECHO — the
+	// one thing that can be checked without retrieving anything.
+	testResult := widget.NewLabel("")
+	testResult.Wrapping = fyne.TextWrapWord
+	var testBtn *widget.Button
+	testBtn = widget.NewButton("Test", func() {
+		if err := aeEntry.Validate(); err != nil {
+			dialog.ShowError(err, win)
+			return
+		}
+		if err := portEntry.Validate(); err != nil {
+			dialog.ShowError(err, win)
+			return
+		}
+		if err := parallelEntry.Validate(); err != nil {
+			dialog.ShowError(err, win)
+			return
+		}
+		prof := edited()
+		n := parallelValue()
+		connect := 10 * time.Second
+		if prof.ConnectTimeout > 0 {
+			connect = time.Duration(prof.ConnectTimeout) * time.Second
+		}
+		testBtn.Disable()
+		testResult.SetText(fmt.Sprintf("Opening %d connection(s) to %s at once…", n, prof.RemoteAETitle))
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), connect+5*time.Second)
+			defer cancel()
+			errs := NewDicomClient(prof, localAE()).EchoConcurrent(ctx, n)
+			text := describeConcurrentEcho(errs)
+			logInfo("server profile test: %s@%s:%d, %d at once — %s", prof.RemoteAETitle, prof.Host, prof.Port, n,
+				strings.ReplaceAll(text, "\n", "; "))
+			fyne.Do(func() {
+				testResult.SetText(text)
+				testBtn.Enable()
+			})
+		}()
+	})
+
+	parallelNote := widget.NewLabel(fmt.Sprintf(
+		"How many studies or series to retrieve at once, each on its own connection (1–%d). "+
+			"More than one helps only if the server allows several connections from this AE at once; "+
+			"if it refuses, the retrieve carries on one at a time. "+
+			"Test opens that many connections together — it shows the server accepts them, "+
+			"not that retrieves get faster: some servers send C-MOVE deliveries one at a time regardless.",
+		maxParallelTransfers))
+	parallelNote.Wrapping = fyne.TextWrapWord
+	parallelNote.TextStyle = fyne.TextStyle{Italic: true}
+
 	form := widget.NewForm(
 		widget.NewFormItem("Profile name", nameEntry),
 		widget.NewFormItem("Remote AE Title", aeEntry),
@@ -924,61 +1054,87 @@ func showServerProfileEditor(w fyne.Window, p ServerProfile, onSave func(ServerP
 		widget.NewFormItem("Info model", modelSelect),
 		widget.NewFormItem("Retrieve method", retrieveMethodSelect),
 		widget.NewFormItem("Transfer syntax", tsSelect),
+		widget.NewFormItem("Parallel transfers", container.NewBorder(nil, nil, nil, testBtn, parallelEntry)),
 	)
 
-	d := dialog.NewCustomConfirm("Edit Server", "Save", "Cancel", form, func(save bool) {
-		if !save {
-			return
-		}
+	// The window stays open until the profile validates, so a validation
+	// failure never throws away the edits — which a confirm dialog, hiding
+	// before its callback runs, used to.
+	cancelBtn := widget.NewButton("Cancel", func() { win.Close() })
+	saveBtn := widget.NewButton("Save", func() {
 		// Inline validation (Phase 3-I): show error and abort if invalid.
-		if err := aeEntry.Validate(); err != nil {
-			dialog.ShowError(err, w)
-			return
+		for _, e := range []*widget.Entry{aeEntry, portEntry, parallelEntry} {
+			if err := e.Validate(); err != nil {
+				dialog.ShowError(err, win)
+				return
+			}
 		}
-		if err := portEntry.Validate(); err != nil {
-			dialog.ShowError(err, w)
-			return
-		}
-		port := p.Port
-		if v, err := strconv.Atoi(strings.TrimSpace(portEntry.Text)); err == nil && v > 0 && v < 65536 {
-			port = v
-		}
-		timeout := 0
-		if v, err := strconv.Atoi(strings.TrimSpace(timeoutEntry.Text)); err == nil && v > 0 {
-			timeout = v
-		}
-		retrieveMethod := "MOVE"
-		switch retrieveMethodSelect.Selected {
-		case "C-GET":
-			retrieveMethod = "GET"
-		case "Auto":
-			retrieveMethod = "AUTO"
-		}
-		transferSyntax := tsPrefAny
-		switch tsSelect.Selected {
-		case tsLabelExplicit:
-			transferSyntax = tsPrefExplicitLE
-		case tsLabelImplicit:
-			transferSyntax = tsPrefImplicitLE
-		}
-		onSave(ServerProfile{
-			Name:           nameEntry.Text,
-			RemoteAETitle:  strings.ToUpper(strings.TrimSpace(aeEntry.Text)),
-			Host:           strings.TrimSpace(hostEntry.Text),
-			Port:           port,
-			ConnectTimeout: timeout,
-			InfoModel:      modelSelect.Selected,
-			RetrieveMethod: retrieveMethod,
-			TransferSyntax: transferSyntax,
-		})
-	}, w)
-	// Widen beyond the form's natural minimum so the transfer syntax options
-	// ("Explicit VR LE (uncompressed — convert locally if needed)") are fully
-	// readable in the select and its dropdown.
-	sz := d.MinSize()
-	if sz.Width < 640 {
-		sz.Width = 640
+		win.Close()
+		onSave(edited())
+	})
+	saveBtn.Importance = widget.HighImportance
+	buttonRow := container.NewBorder(
+		widget.NewSeparator(), nil, nil, nil,
+		container.New(
+			layout.NewCustomPaddedLayout(modEditorMargin, modEditorMargin, modEditorMargin, modEditorMargin),
+			container.NewHBox(layout.NewSpacer(), cancelBtn, saveBtn)),
+	)
+
+	body := container.NewVScroll(container.New(
+		layout.NewCustomPaddedLayout(modEditorMargin, modEditorMargin, modEditorMargin, modEditorMargin),
+		container.NewVBox(form, parallelNote, testResult)))
+	body.SetMinSize(fyne.NewSize(0, 240))
+	// Wide enough that the transfer syntax options ("Explicit VR LE
+	// (uncompressed — convert locally if needed)") read in full.
+	minWidth := canvas.NewRectangle(color.Transparent)
+	minWidth.SetMinSize(fyne.NewSize(600, 0))
+
+	title := "Edit Server"
+	if p.Name != "" {
+		title = "Edit Server — " + p.Name
 	}
-	d.Resize(sz)
-	d.Show()
+	// Owned by the Preferences window, which it blocks: Save writes into
+	// Preferences' pending profile list, so that list must not change
+	// underneath, and closing Preferences takes this window with it.
+	// Unkeyed: blocking already makes a second one unreachable.
+	openOwnedWindow(a, windowSpec{
+		Title:    title,
+		Size:     fyne.NewSize(660, 620),
+		Parent:   parent,
+		Blocking: true,
+	}, func(w fyne.Window) fyne.CanvasObject {
+		win = w
+		return container.NewStack(minWidth, container.NewBorder(nil, buttonRow, nil, nil, body))
+	})
+}
+
+// describeConcurrentEcho reports a Test of n connections at once: a headline,
+// then one line per connection, naming a refusal's reason.
+func describeConcurrentEcho(errs []error) string {
+	ok := 0
+	var lines []string
+	for i, err := range errs {
+		var rj *netdicom.AssociationRejectedError
+		switch {
+		case err == nil:
+			ok++
+			lines = append(lines, fmt.Sprintf("#%d: OK", i+1))
+		case errors.As(err, &rj):
+			lines = append(lines, fmt.Sprintf("#%d: refused — %s", i+1, rj.ReasonText()))
+		default:
+			lines = append(lines, fmt.Sprintf("#%d: failed — %v", i+1, err))
+		}
+	}
+	head := fmt.Sprintf("The server accepted %d of %d connections at once.", ok, len(errs))
+	switch {
+	case len(errs) == 1 && ok == 1:
+		head = "The server accepted the connection."
+	case ok == len(errs):
+		head = fmt.Sprintf("The server accepted all %d connections at once.", ok)
+	case ok > 1:
+		head += fmt.Sprintf(" Parallel transfers above %d will fall back to one at a time.", ok)
+	case ok == 1:
+		head += " Leave Parallel transfers at 1 for this server."
+	}
+	return head + "\n" + strings.Join(lines, "\n")
 }

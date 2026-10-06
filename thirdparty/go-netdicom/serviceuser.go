@@ -9,9 +9,11 @@ import (
 	"net"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/algm/go-netdicom/commandset"
 	"github.com/algm/go-netdicom/dimse"
+	"github.com/algm/go-netdicom/pdu"
 	"github.com/grailbio/go-dicom"
 	"github.com/grailbio/go-dicom/dicomio"
 	"github.com/grailbio/go-dicom/dicomlog"
@@ -49,9 +51,16 @@ type ServiceUser struct {
 	cond *sync.Cond // Broadcast when status changes.
 	disp *serviceDispatcher
 
+	// closed is closed once the association's transport connection has
+	// gone (dicomqr local patch), for ReleaseAndWait.
+	closed chan struct{}
+
 	// Following fields are guarded by mu.
 	status serviceUserStatus
 	cm     *contextManager // Set only after the handshake completes.
+	// rejected is the peer's A-ASSOCIATE-RJ, if it refused the association
+	// (dicomqr local patch); waitUntilReady reports it.
+	rejected *pdu.AAssociateRj
 	// activeCommands map[uint16]*userCommandState // List of commands running
 }
 
@@ -119,6 +128,7 @@ func NewServiceUser(params ServiceUserParams) (*ServiceUser, error) {
 		mu:       mu,
 		cond:     sync.NewCond(mu),
 		status:   serviceUserInitial,
+		closed:   make(chan struct{}),
 	}
 	go runStateMachineForServiceUser(params, su.upcallCh, su.disp.downcallCh, label)
 	go func() {
@@ -133,6 +143,12 @@ func NewServiceUser(params ServiceUserParams) (*ServiceUser, error) {
 				su.mu.Unlock()
 				continue
 			}
+			if event.eventType == upcallEventRejected {
+				su.mu.Lock()
+				su.rejected = event.rejection
+				su.mu.Unlock()
+				continue
+			}
 			doassert(event.eventType == upcallEventData)
 			su.disp.handleEvent(event)
 		}
@@ -142,6 +158,7 @@ func NewServiceUser(params ServiceUserParams) (*ServiceUser, error) {
 		su.cond.Broadcast()
 		su.status = serviceUserClosed
 		su.mu.Unlock()
+		close(su.closed)
 	}()
 	return su, nil
 }
@@ -154,6 +171,11 @@ func (su *ServiceUser) waitUntilReady() error {
 	}
 	if su.status != serviceUserAssociationActive {
 		// Will get an error when waiting for a response.
+		if rj := su.rejected; rj != nil {
+			err := &AssociationRejectedError{Result: rj.Result, Source: rj.Source, Reason: rj.Reason}
+			dicomlog.Vprintf(0, "%v", err)
+			return err
+		}
 		dicomlog.Vprintf(0, "dicom.serviceUser: Connection failed")
 		return fmt.Errorf("dicom.serviceUser: Connection failed")
 	}
@@ -731,6 +753,19 @@ func (su *ServiceUser) Release() {
 	su.status = serviceUserClosed
 	su.cond.Broadcast()
 	su.disp.close()
+}
+
+// ReleaseAndWait releases the association like Release, then waits — at most
+// timeout — until the transport connection has actually closed (dicomqr local
+// patch). Release only queues the A-RELEASE-RQ; a caller that opens its next
+// association straight afterwards briefly holds two, which a server enforcing
+// a per-AE association limit may refuse.
+func (su *ServiceUser) ReleaseAndWait(timeout time.Duration) {
+	su.Release()
+	select {
+	case <-su.closed:
+	case <-time.After(timeout):
+	}
 }
 
 // Abort tears the association down immediately with an A-ABORT PDU and closes

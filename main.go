@@ -284,13 +284,15 @@ func main() {
 		defer connMu.Unlock()
 		return activeProfile
 	}
-	// setActiveProfileTransfer updates the connected profile's transfer syntax
-	// requirement in place when Preferences change, so the next retrieve
+	// setActiveProfileRetrieve updates the connected profile's retrieve
+	// settings — the transfer syntax requirement and the number of parallel
+	// transfers — in place when Preferences change, so the next retrieve
 	// follows the edited settings without a reconnect.
-	setActiveProfileTransfer := func(transferSyntax string) {
+	setActiveProfileRetrieve := func(p ServerProfile) {
 		connMu.Lock()
 		defer connMu.Unlock()
-		activeProfile.TransferSyntax = transferSyntax
+		activeProfile.TransferSyntax = p.TransferSyntax
+		activeProfile.ParallelTransfers = p.ParallelTransfers
 	}
 	getConnCtx := func() context.Context {
 		connMu.Lock()
@@ -1025,8 +1027,15 @@ func main() {
 		}
 
 		count := len(targets)
-		logInfo("retrieve: %d targets, destAE=%s port=%d method=%s requiredTS=%q",
-			count, cfg.LocalAETitle, cfg.LocalSCPPort, method, prof.requiredTransferSyntax())
+		// Settings the run reads, copied here on the UI goroutine: Preferences
+		// replaces cfg on Apply, and the run's goroutines must not read it
+		// underneath that.
+		localAE := cfg.LocalAETitle
+		downloadDir := cfg.DownloadDir
+		stallSetting := cfg.RetrieveStallTimeoutSec
+		parallel := min(prof.parallelTransfers(), count)
+		logInfo("retrieve: %d targets, destAE=%s port=%d method=%s requiredTS=%q parallel=%d",
+			count, localAE, cfg.LocalSCPPort, method, prof.requiredTransferSyntax(), parallel)
 		for i, t := range targets {
 			logInfo("  target[%d]: level=%s patientID=%s studyUID=%s seriesUID=%s", i, t.level, t.patientID, t.studyUID, t.seriesUID)
 		}
@@ -1068,18 +1077,30 @@ func main() {
 			// label is not truncated, so every "Received: <path>" re-text
 			// changed its width and repainted the whole window frame — once per
 			// file, at whatever rate the PACS delivered.
+			//
+			// The bar is the mean of every target's own fraction, so several
+			// targets running at once each move it by their share.
 			var lastReceived atomic.Pointer[string]
-			var barFrac atomic.Uint64 // math.Float64bits of the bar position
-			var shownPath *string     // reporter-owned: the path last put on screen
-			shownFrac := -1.0         // reporter-owned
-			setBar := func(frac float64) { barFrac.Store(math.Float64bits(frac)) }
+			var targetStatus atomic.Pointer[string]    // set as each target starts
+			targetFrac := make([]atomic.Uint64, count) // math.Float64bits, per target
+			var shownPath, shownStatus *string         // reporter-owned
+			shownFrac := -1.0                          // reporter-owned
+			setFrac := func(i int, frac float64) { targetFrac[i].Store(math.Float64bits(frac)) }
 			publishRetrieve := func() {
-				if p := lastReceived.Load(); p != nil && p != shownPath && ctx.Err() == nil {
+				if s := targetStatus.Load(); s != nil && s != shownStatus && ctx.Err() == nil {
+					shownStatus = s
+					text := *s
+					fyne.Do(func() { statusLabel.SetText(text) })
+				} else if p := lastReceived.Load(); p != nil && p != shownPath && ctx.Err() == nil {
 					shownPath = p
 					path := *p
 					fyne.Do(func() { statusLabel.SetText("Received: " + path) })
 				}
-				if f := math.Float64frombits(barFrac.Load()); f != shownFrac {
+				var sum float64
+				for i := range targetFrac {
+					sum += math.Float64frombits(targetFrac[i].Load())
+				}
+				if f := sum / float64(count); f != shownFrac {
 					shownFrac = f
 					fyne.Do(func() { progressBar.SetValue(f) })
 				}
@@ -1093,11 +1114,19 @@ func main() {
 			// ever arrives, leaving the retrieve stuck forever. Track the last
 			// activity (progress responses and received files) and abort the
 			// retrieve when the configured window passes in silence.
+			//
+			// With several associations open the watchdog still watches the
+			// run as a whole — a C-MOVE delivery cannot be attributed to the
+			// move that caused it — so it fires only once every open
+			// association has gone silent. Under a parallel limit its first
+			// resort is sched.onStall: drop to one association and re-run the
+			// silent targets, in case the server accepted associations it never
+			// meant to serve; only a stall after that aborts the retrieve.
 			stallTimeout := 120 * time.Second
-			if cfg.RetrieveStallTimeoutSec > 0 {
-				stallTimeout = time.Duration(cfg.RetrieveStallTimeoutSec) * time.Second
+			if stallSetting > 0 {
+				stallTimeout = time.Duration(stallSetting) * time.Second
 			}
-			stallDetection := cfg.RetrieveStallTimeoutSec >= 0
+			stallDetection := stallSetting >= 0
 			var lastActivity atomic.Int64
 			lastActivity.Store(time.Now().UnixNano())
 			touch := func() { lastActivity.Store(time.Now().UnixNano()) }
@@ -1119,17 +1148,20 @@ func main() {
 				scpSkipBase = sc.SkippedCount()
 				scpFailedBase = sc.FailedLocalCount()
 			}
-			// srvFailedCur holds the in-flight target's latest failed-sub-op
-			// count (counts are cumulative within one target); the loop folds
-			// it into srvFailedTotal when the target finishes. Written from the
-			// progress callbacks on the association goroutine, hence atomic.
-			var srvFailedTotal int64
-			var srvFailedCur atomic.Int64
-			trackSubOpFailures := func(p MoveProgress) {
-				if p.Failed > 0 {
-					srvFailedCur.Store(int64(p.Failed))
-				}
+			// srvFailed[i] holds target i's latest failed-sub-op count (counts
+			// are cumulative within one attempt, so the latest is the final
+			// one); the run's total is their sum once every target is done. A
+			// re-run attempt (AUTO's C-MOVE fallback, or a re-queue after the
+			// run dropped to one association) starts its target's count afresh,
+			// since it re-delivers the whole target. Written from progress
+			// callbacks on the association goroutines, hence atomic.
+			srvFailed := make([]atomic.Int64, count)
+
+			sched := newRetrieveRun(count, parallel)
+			sched.onDegrade = func(err error) {
+				logWarn("retrieve: dropping to one association at a time — %v", err)
 			}
+
 			watchdogDone := make(chan struct{})
 			defer close(watchdogDone)
 			if stallDetection {
@@ -1142,6 +1174,12 @@ func main() {
 							return
 						case <-ticker.C:
 							idle := time.Duration(time.Now().UnixNano() - lastActivity.Load())
+							if idle > stallTimeout && sched.onStall() {
+								logWarn("retrieve: no server activity for %v with parallel associations open — re-running them one at a time",
+									stallTimeout)
+								touch() // the re-runs get a fresh stall window
+								continue
+							}
 							if idle > stallTimeout {
 								stalled.Store(true)
 								logWarn("retrieve: no server activity for %v — aborting stalled retrieve", stallTimeout)
@@ -1205,7 +1243,7 @@ func main() {
 						err = fmt.Errorf("receiver internal error: %v", r)
 					}
 				}()
-				res, queued, saveErr := saveGetFile(cfg.DownloadDir, txUID, scUID, siUID, data, requiredTS,
+				res, queued, saveErr := saveGetFile(downloadDir, txUID, scUID, siUID, data, requiredTS,
 					recvConv, func(res receiveResult, err error) {
 						// Converted after the sub-operation's response: a
 						// failure to save can only be counted here now.
@@ -1227,78 +1265,85 @@ func main() {
 				return nil
 			}
 
-			var cancelled bool
-			var errCount int
-			var failed []retrieveTarget
-			for i, tgt := range targets {
-				if ctx.Err() != nil {
-					cancelled = true
-					break
-				}
+			// retrieveOne runs one attempt at target i on its own association,
+			// under tctx (cancelled with the run, or alone when the scheduler
+			// takes it off the air to re-run). sched runs up to `parallel` of
+			// these at once — one at a time unless the profile asks for more.
+			retrieveOne := func(tctx context.Context, i int) error {
+				tgt := targets[i]
 				idx := i + 1
 				label := "study"
 				if tgt.level == "SERIES" {
 					label = "series"
 				}
 				touch() // each target gets a fresh stall window
-				fyne.Do(func() {
-					statusLabel.SetText(fmt.Sprintf("Retrieving %s %d/%d…", label, idx, count))
-				})
+				srvFailed[i].Store(0)
+				setFrac(i, 0)
+				started, limit, degraded := sched.status()
+				status := retrieveStatusText(label, started, count, parallel, limit, degraded)
+				targetStatus.Store(&status)
 
 				// One progress callback per target: feeds the stall watchdog,
-				// the failed-sub-op tracker, and the fine-grained progress bar
-				// (C-GET reports counts too via CGetWithProgress).
+				// the failed-sub-op tracker, and the target's share of the
+				// progress bar (C-GET reports counts too via CGetWithProgress).
 				onProg := func(p MoveProgress) {
 					touch()
-					trackSubOpFailures(p)
+					if p.Failed > 0 {
+						srvFailed[i].Store(int64(p.Failed))
+					}
 					sub := p.Remaining + p.Completed + p.Failed + p.Warning
 					if sub > 0 {
-						setBar((float64(i) + float64(p.Completed)/float64(sub)) / float64(count))
+						setFrac(i, float64(p.Completed)/float64(sub))
 					}
 				}
 
 				var err error
 				switch method {
 				case "GET":
-					err = cl.Get(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, getCallback, onProg)
+					err = cl.Get(tctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, getCallback, onProg)
 				case "AUTO":
-					err = cl.Get(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, getCallback, onProg)
-					if err != nil && ctx.Err() == nil {
+					err = cl.Get(tctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, getCallback, onProg)
+					if err != nil && tctx.Err() == nil {
 						logWarn("retrieve: c-get failed (%v), falling back to c-move", err)
 						// The C-MOVE retry re-delivers the whole target; counts
 						// from the failed C-GET attempt are superseded.
-						srvFailedCur.Store(0)
-						err = cl.Move(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, cfg.LocalAETitle, onProg)
+						srvFailed[i].Store(0)
+						err = cl.Move(tctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, localAE, onProg)
 					}
 				default: // "MOVE"
-					err = cl.Move(ctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, cfg.LocalAETitle, onProg)
+					err = cl.Move(tctx, tgt.level, tgt.patientID, tgt.studyUID, tgt.seriesUID, localAE, onProg)
 				}
 
-				// Fold the finished target's failed-sub-op count into the
-				// running total; counts are cumulative within a target, so the
-				// latest value is its final one.
-				if f := srvFailedCur.Swap(0); f > 0 {
-					srvFailedTotal += f
+				if f := srvFailed[i].Load(); f > 0 {
 					logWarn("retrieve: server could not deliver %d object(s) for %s %d/%d — continuing",
 						f, label, idx, count)
 				}
-
-				if err != nil {
-					if ctx.Err() != nil {
-						cancelled = true
-						break
-					}
+				if err != nil && tctx.Err() == nil {
 					logError("retrieve: %s %d/%d error (continuing): %v", label, idx, count, err)
-					errCount++
-					failed = append(failed, tgt)
 				}
 
-				// Advance the bar per completed target. The progress callback
-				// above also updates it finely for both C-MOVE and C-GET; this
-				// guarantees the bar reaches 100% on the final target even when
-				// a server sends no sub-operation counts (Phase 5-2A).
-				setBar(float64(idx) / float64(count))
+				// The target's share of the bar is complete, so the bar reaches
+				// 100% even when a server sends no sub-operation counts (Phase
+				// 5-2A). A re-run resets it as it starts.
+				setFrac(i, 1)
+				return err
 			}
+			sched.run(ctx, retrieveOne)
+
+			cancelled := ctx.Err() != nil
+			var errCount int
+			var failed []retrieveTarget
+			for i, r := range sched.outcome() {
+				if r.state == targetFailed {
+					errCount++
+					failed = append(failed, targets[i])
+				}
+			}
+			var srvFailedTotal int64
+			for i := range srvFailed {
+				srvFailedTotal += srvFailed[i].Load()
+			}
+			parallelClause := describeParallelDegrade(sched.degradedBy())
 
 			// Objects converted after their response may still be in the
 			// converter. They report through the callbacks installed above, so
@@ -1392,7 +1437,8 @@ func main() {
 				case cancelled:
 					statusLabel.SetText("Retrieve cancelled")
 				case errCount > 0:
-					statusLabel.SetText(fmt.Sprintf("Retrieved %d files (%d/%d targets had errors — see log)", n, errCount, count))
+					statusLabel.SetText(fmt.Sprintf("Retrieved %d files (%d/%d targets had errors — see log)%s",
+						n, errCount, count, parallelClause))
 					// Offer to retry only the failed targets (Phase 4-E).
 					dialog.ShowConfirm("Retrieve errors",
 						fmt.Sprintf("%d of %d targets failed.\nRetry failed targets only?", len(failed), count),
@@ -1436,6 +1482,7 @@ func main() {
 					if failedLocalTotal > 0 {
 						msg += describeLocalFailures(failedLocalTotal)
 					}
+					msg += parallelClause
 					statusLabel.SetText(msg)
 				}
 			})
@@ -1591,15 +1638,16 @@ func main() {
 				profileSelect.Options = profileNames()
 				profileSelect.Refresh()
 				// Re-apply the active profile's transfer syntax requirement to
-				// the running SCP so a preference change takes effect on the
-				// next retrieve without reconnecting.
+				// the running SCP, and its retrieve settings to the connection,
+				// so a preference change takes effect on the next retrieve
+				// without reconnecting.
 				if sc := getSCP(); sc != nil {
 					active := getActiveProfile()
 					for i := range cfg.Profiles {
 						if cfg.Profiles[i].Name == active.Name {
 							p := cfg.Profiles[i]
 							sc.SetTransferPolicy(p.requiredTransferSyntax())
-							setActiveProfileTransfer(p.TransferSyntax)
+							setActiveProfileRetrieve(p)
 							break
 						}
 					}

@@ -169,6 +169,12 @@ var actionAe3 = &stateAction{"AE-3", "Issue A-ASSOCIATE confirmation (accept) pr
 
 var actionAe4 = &stateAction{"AE-4", "Issue A-ASSOCIATE confirmation (reject) primitive and close transport connection",
 	func(sm *stateMachine, event stateEvent) stateType {
+		// Hand the reject's result/source/reason up before closing, so the
+		// service user can report why (dicomqr local patch). The channel is
+		// buffered and this is the requestor's last event, so it never blocks.
+		if rj, ok := event.pdu.(*pdu.AAssociateRj); ok {
+			sm.upcallCh <- upcallEvent{eventType: upcallEventRejected, rejection: rj}
+		}
 		sm.closeConnection()
 		return sta01
 	}}
@@ -474,6 +480,10 @@ type upcallEventType int
 const (
 	upcallEventHandshakeCompleted = upcallEventType(100)
 	upcallEventData               = upcallEventType(101)
+	// upcallEventRejected carries the peer's A-ASSOCIATE-RJ to the service
+	// user before the channel closes (dicomqr local patch), so a refused
+	// association can be told apart from any other connection failure.
+	upcallEventRejected = upcallEventType(102)
 	// Note: connection shutdown and any error will result in channel
 	// closure, so they don't have event types.
 )
@@ -485,6 +495,8 @@ func (e *upcallEventType) String() string {
 		description = "Handshake completed"
 	case upcallEventData:
 		description = "P_DATA_TF PDU received"
+	case upcallEventRejected:
+		description = "A_ASSOCIATE_RJ received"
 	default:
 		panic(fmt.Sprintf("dicom.StateMachine: Unknown event type %v", int(*e)))
 	}
@@ -497,6 +509,10 @@ type upcallEvent struct {
 	// The context ID -> <abstract syntax uid, transefr syntax uid> mappings.
 	// Sent for upcallEventHandshakeCompleted and upcallEventData.
 	cm *contextManager
+
+	// rejection is the peer's A-ASSOCIATE-RJ. Set only in
+	// upcallEventRejected.
+	rejection *pdu.AAssociateRj
 
 	// abstractSyntaxUID is extracted from the P_DATA_TF packet.
 	// transferSyntaxUID is the value agreed on for the abstractSyntaxUID

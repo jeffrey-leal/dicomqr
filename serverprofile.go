@@ -28,6 +28,22 @@ type ServerProfile struct {
 	// TransferUncompressed is the deprecated pre-v1.7 flag, migrated to
 	// TransferSyntax by migrateProfile on load.
 	TransferUncompressed bool `json:"transferUncompressed,omitempty"`
+
+	// ParallelTransfers is how many retrieve associations may be open to this
+	// server at once; 0 or 1 means one at a time (see parallelTransfers). Opt-in:
+	// DICOM has no way to ask a server how many associations it allows, so the
+	// user raises it for a server known to accept more.
+	ParallelTransfers int `json:"parallelTransfers,omitempty"`
+}
+
+// maxParallelTransfers caps ParallelTransfers. Most archives allow an AE only a
+// few associations, and every one adds a stream of writes to the download disk.
+const maxParallelTransfers = 4
+
+// parallelTransfers is the number of retrieve associations to run at once:
+// ParallelTransfers clamped to [1, maxParallelTransfers].
+func (p ServerProfile) parallelTransfers() int {
+	return min(max(p.ParallelTransfers, 1), maxParallelTransfers)
 }
 
 // migrateProfile converts the deprecated TransferUncompressed flag to the

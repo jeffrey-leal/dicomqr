@@ -2,7 +2,7 @@
 
 **User Manual  v1.22.0**
 
-September 30, 2026
+October 6, 2026
 
 A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.
 
@@ -96,6 +96,7 @@ A server profile stores the connection details for one PACS destination. Profile
 | Retrieve method | C-MOVE (default) instructs the PACS to push files to the local C-STORE SCP listener. C-GET requests that the PACS return files over the same association — no inbound port or PACS-side destination registration is required. Auto tries C-GET first and falls back to C-MOVE if the PACS rejects it. |
 | Connect timeout | Seconds to wait for the initial C-ECHO before reporting a failure. Default: 10 s. |
 | Transfer syntax | 'As stored (server decides)' accepts whatever the PACS prefers — a JPEG 2000 archive will typically send JPEG 2000. The two uncompressed options guarantee every retrieved file ends up in exactly the selected syntax on disk — Explicit VR Little Endian (`1.2.840.10008.1.2.1`) or Implicit VR Little Endian (`1.2.840.10008.1.2`). Negotiation offers the required syntax first, so a transcoding-capable PACS sends it directly; a PACS that only serves objects in their stored form may instead send any syntax the application can decode (the other uncompressed VR, JPEG Baseline/Extended, JPEG 2000), and each such file is converted to the required syntax on receipt, before it reaches the download folder — in the background, after the server has been told the file arrived, so the transfer is not held up waiting for each conversion. The status bar reports how many files needed local conversion. Objects that cannot be obtained in the required syntax do not stop the retrieve: an object the server cannot deliver in any negotiable syntax (e.g. the archive stores JPEG-LS or RLE and does not transcode), or one that arrives but fails local conversion (e.g. a screenshot with undecodable pixel data), is skipped — reported in the Activity Log and counted in the completion status — while every deliverable object is retrieved and stored in the required syntax. Only when the server can deliver nothing at all in a negotiable syntax does an error dialog appear, naming the required syntax; switch the profile back to 'As stored' to retrieve such data in its stored form. |
+| Parallel transfers | How many studies or series a retrieve fetches at once, each on its own connection (association) to the server: 1 (the default) to 4. A retrieve of several studies or series is then shared across that many connections, which can shorten it considerably when the server answers each request slowly. More than one helps only if the server allows several connections from this application's AE Title at the same time. DICOM gives no way to ask a server its limit, so the setting is yours to raise — use Test (Section 4.4) first. If the server refuses an extra connection, or one of them fails or stops responding, the retrieve carries on one at a time: the affected studies or series are fetched again, nothing is lost, and the completion status says so. Some servers accept several connections but still send C-MOVE deliveries one at a time, in which case a higher setting does no harm but gains nothing. |
 
 The first profile in the list is selected by default when the application starts.
 
@@ -131,6 +132,8 @@ If the SCP port is already in use — most often because a previous copy of dico
 ### 4.4  Testing Connectivity
 
 Click Test (C-ECHO) at any time while connected to send a C-ECHO to the PACS. The status bar reports success or failure.
+
+To find out whether a server accepts several connections at once before raising a profile's Parallel transfers, open the profile in File > Preferences… > SCP & Network, enter the number in Parallel transfers and click the Test button beside it. It opens that many connections together, sends a C-ECHO on each, and closes them only once all have answered, then lists each one: OK, refused (with the server's reason, such as "local limit exceeded"), or failed. Connecting first is not needed. A clean result shows the server accepts that many connections; it cannot show that a retrieve will get faster, since some servers send C-MOVE deliveries one at a time regardless.
 
 
 ### 4.5  Disconnecting
@@ -682,7 +685,7 @@ Everything DICOM-network related: the identity this workstation presents, where 
 
 Changes to AE Title or SCP port take effect the next time a connection is established.
 
-Server Profiles — lists all saved server profiles. Click Edit to modify, Delete to remove, or Add server… to create a new profile. The Up/Down buttons reorder the list; the first profile is the default selection when the application starts.
+Server Profiles — lists all saved server profiles. Click Edit to modify, Delete to remove, or Add server… to create a new profile. The profile opens in its own window, which can be moved and resized; Save keeps the changes and Cancel discards them, and Preferences waits behind it until it closes. The Up/Down buttons reorder the list; the first profile is the default selection when the application starts.
 
 Profile editor fields:
 
@@ -696,6 +699,7 @@ Profile editor fields:
 | Retrieve method | C-MOVE / C-GET / Auto — see Section 4.1. |
 | Connect timeout | Seconds before a connection attempt is considered failed. |
 | Transfer syntax | 'As stored' or one of the two guaranteed uncompressed syntaxes (converted locally on receipt when the server does not send it) — see Section 4.1 for full details and caveats. |
+| Parallel transfers | How many studies or series to retrieve at once, 1–4 (blank = 1). Test beside it opens that many connections together and reports which the server accepted — see Sections 4.1 and 4.4. |
 
 
 ### 14.2  User Interface Tab
@@ -940,6 +944,7 @@ Each entry in the `profiles` array:
 | `infoModel` | `"study"`, `"patient"`, or `"patient-study-only"`. |
 | `retrieveMethod` | `"MOVE"`, `"GET"`, or `"AUTO"`. Omitting defaults to C-MOVE. |
 | `connectTimeout` | Connection timeout in seconds. 0 uses the default (10 s). |
+| `parallelTransfers` | Retrieve associations to open to this server at once, 1–4. Omitted (or 0/1) means one at a time; values above 4 are treated as 4. |
 | `transferSyntax` | `""` (as stored, default), `"explicit-le"`, or `"implicit-le"`. The non-empty values guarantee every retrieved file is stored in that syntax: negotiation offers it first plus the locally decodable syntaxes, files arriving in any other accepted syntax are converted on receipt, and objects that can be neither delivered nor converted are skipped and reported while the retrieve continues. Re-retrieves replace existing on-disk copies whose transfer syntax differs from the required one. |
 | `ensureUncompressed` | Obsolete (v1.7.0 only) and ignored: the local-decompression guarantee was replaced by strict single-syntax negotiation via `transferSyntax`. |
 | `transferUncompressed` | Deprecated (pre-v1.7). When true it is migrated on load to `transferSyntax: "explicit-le"`. |

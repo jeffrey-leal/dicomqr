@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,11 +30,15 @@ import (
 // converted on receipt. A server limited to something outside the list fails
 // its sub-operations, which aborts the retrieve. The unrestricted default,
 // dicomio.StandardTransferSyntaxes, contains no compressed syntax.
+//
+// Always a fresh slice: NewServiceUser canonicalises the list it is given in
+// place, so handing it the package-level default would have every concurrent
+// C-GET of a parallel retrieve writing into one shared slice.
 func proposedTransferSyntaxes(p ServerProfile) []string {
 	if req := p.requiredTransferSyntax(); req != "" {
 		return acceptedSyntaxesFor(req)
 	}
-	return dicomio.StandardTransferSyntaxes
+	return slices.Clone(dicomio.StandardTransferSyntaxes)
 }
 
 // FindResult holds one C-FIND response item. Err is set on error items;
@@ -111,6 +116,83 @@ func (c *DicomClient) Echo(ctx context.Context) error {
 	}
 }
 
+// EchoConcurrent opens n associations to the server at once, sends a C-ECHO
+// on each, and releases them only after every one has answered or failed —
+// so all n are held open together, which is what a parallel retrieve needs
+// the server to allow. errs[i] is association i's outcome; a refusal keeps
+// the library's *netdicom.AssociationRejectedError so the caller can name the
+// reason. It says nothing about whether a C-MOVE would get faster: a server
+// may accept several associations and still send its deliveries one at a time.
+func (c *DicomClient) EchoConcurrent(ctx context.Context, n int) []error {
+	errs := make([]error, n)
+	sus := make([]*netdicom.ServiceUser, n)
+	for i := range n {
+		su, err := netdicom.NewServiceUser(netdicom.ServiceUserParams{
+			CalledAETitle:  c.profile.RemoteAETitle,
+			CallingAETitle: c.localAETitle,
+			SOPClasses:     sopclass.VerificationClasses,
+		})
+		if err != nil {
+			errs[i] = fmt.Errorf("c-echo: create service user: %w", err)
+			continue
+		}
+		sus[i] = su
+	}
+
+	// Results are written under mu: after a cancel the function may return
+	// while a stuck echo is still running, and its late write must not race
+	// the copy handed back.
+	var mu sync.Mutex
+	finished := make([]bool, n)
+	addr := fmt.Sprintf("%s:%d", c.profile.Host, c.profile.Port)
+	var wg sync.WaitGroup
+	for i, su := range sus {
+		if su == nil {
+			finished[i] = true
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			su.Connect(addr)
+			err := su.CEcho()
+			mu.Lock()
+			errs[i], finished[i] = err, true
+			mu.Unlock()
+		}()
+	}
+	all := make(chan struct{})
+	go func() { wg.Wait(); close(all) }()
+
+	select {
+	case <-all:
+		for _, su := range sus {
+			if su != nil {
+				su.Release()
+			}
+		}
+	case <-ctx.Done():
+		for _, su := range sus {
+			if su != nil {
+				su.Abort()
+			}
+		}
+		select {
+		case <-all:
+		case <-time.After(5 * time.Second):
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	out := slices.Clone(errs)
+	for i := range out {
+		if !finished[i] {
+			out[i] = ctx.Err()
+		}
+	}
+	return out
+}
+
 // Find sends a C-FIND (Study Root or Patient Root QR) at the given query level
 // and streams results on the returned channel. The channel is closed when the
 // query completes or ctx is cancelled. A non-nil error is returned only when the
@@ -181,7 +263,9 @@ func (c *DicomClient) Move(ctx context.Context, level, patientID, studyUID, seri
 	done := make(chan result, 1)
 
 	go func() {
-		defer su.Release()
+		var err error
+		defer func() { done <- result{err} }()
+		defer su.ReleaseAndWait(retrieveReleaseWait)
 		su.Connect(fmt.Sprintf("%s:%d", c.profile.Host, c.profile.Port))
 
 		progressFn := func(p netdicom.CMoveProgress) {
@@ -194,7 +278,7 @@ func (c *DicomClient) Move(ctx context.Context, level, patientID, studyUID, seri
 				})
 			}
 		}
-		done <- result{su.CMove(levelToQRLevel(level), destAE, buildMoveFilter(level, patientID, studyUID, seriesUID), progressFn)}
+		err = su.CMove(levelToQRLevel(level), destAE, buildMoveFilter(level, patientID, studyUID, seriesUID), progressFn)
 	}()
 
 	select {
@@ -205,6 +289,14 @@ func (c *DicomClient) Move(ctx context.Context, level, patientID, studyUID, seri
 		return ctx.Err()
 	}
 }
+
+// retrieveReleaseWait bounds how long Move and Get wait, after releasing their
+// association, for the connection to close before they return. Returning only
+// once it has keeps a retrieve's associations within its parallel limit as
+// the server counts them: the next target's association would otherwise open
+// while this one is still releasing, and a server allowing exactly that many
+// could refuse it. A peer that never answers the release costs at most this.
+const retrieveReleaseWait = 3 * time.Second
 
 // abortAndReap force-closes a wedged association with A-ABORT and waits
 // (briefly) for the blocked DIMSE goroutine to finish, so a cancelled or
@@ -245,7 +337,9 @@ func (c *DicomClient) Get(ctx context.Context, level, patientID, studyUID, serie
 	done := make(chan result, 1)
 
 	go func() {
-		defer su.Release()
+		var err error
+		defer func() { done <- result{err} }()
+		defer su.ReleaseAndWait(retrieveReleaseWait)
 		su.Connect(fmt.Sprintf("%s:%d", c.profile.Host, c.profile.Port))
 
 		progressFn := func(p netdicom.CMoveProgress) {
@@ -258,14 +352,14 @@ func (c *DicomClient) Get(ctx context.Context, level, patientID, studyUID, serie
 				})
 			}
 		}
-		done <- result{su.CGetWithProgress(levelToQRLevel(level), buildMoveFilter(level, patientID, studyUID, seriesUID),
+		err = su.CGetWithProgress(levelToQRLevel(level), buildMoveFilter(level, patientID, studyUID, seriesUID),
 			progressFn,
 			func(txUID, scUID, siUID string, data []byte) dimse.Status {
 				if storeErr := onStore(txUID, scUID, siUID, data); storeErr != nil {
 					return dimse.Status{Status: dimse.CStoreOutOfResources, ErrorComment: storeErr.Error()}
 				}
 				return dimse.Success
-			})}
+			})
 	}()
 
 	select {

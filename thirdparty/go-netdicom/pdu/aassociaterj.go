@@ -77,5 +77,42 @@ func (pdu *AAssociateRj) Write() ([]byte, error) {
 }
 
 func (pdu *AAssociateRj) String() string {
-	return fmt.Sprintf("A_ASSOCIATE_RJ{result: %v, source: %v, reason: %v}", pdu.Result, pdu.Source, pdu.Reason)
+	return fmt.Sprintf("A_ASSOCIATE_RJ{result: %v, source: %v, reason: %s}", pdu.Result, pdu.Source, pdu.ReasonText())
+}
+
+// ReasonText names the reject reason (dicomqr local patch). The reason
+// field's meaning depends on the source (PS3.8 Table 9-21): reason 2 is
+// "application context name not supported" from the service user but
+// "local limit exceeded" from the presentation service provider, so the
+// generated RejectReasonType.String — which ignores the source — names the
+// latter wrongly.
+func (pdu *AAssociateRj) ReasonText() string {
+	switch pdu.Source {
+	case SourceULServiceUser:
+		switch pdu.Reason {
+		case 1:
+			return "no reason given"
+		case 2:
+			return "application context name not supported"
+		case 3:
+			return "calling AE title not recognized"
+		case 7:
+			return "called AE title not recognized"
+		}
+	case SourceULServiceProviderACSE:
+		switch pdu.Reason {
+		case 1:
+			return "no reason given"
+		case 2:
+			return "protocol version not supported"
+		}
+	case SourceULServiceProviderPresentation:
+		switch pdu.Reason {
+		case 1:
+			return "temporary congestion"
+		case 2:
+			return "local limit exceeded"
+		}
+	}
+	return fmt.Sprintf("reason %d", pdu.Reason)
 }
