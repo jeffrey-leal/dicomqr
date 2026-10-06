@@ -6,6 +6,10 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/test"
+	"fyne.io/fyne/v2/widget"
 )
 
 type errorWriter struct{}
@@ -138,5 +142,47 @@ func TestLogViewOptionsLadder(t *testing.T) {
 	}
 	if last := logViewOptions[len(logViewOptions)-1].max; last != logLevelProto {
 		t.Errorf("last option max = %v, want everything", last)
+	}
+}
+
+// The Activity Log follows new lines only while the reader is at the bottom;
+// listAtBottom is how it tells, and it must leave the scroll position alone.
+func TestListAtBottom(t *testing.T) {
+	test.NewApp()
+	n := 200
+	list := widget.NewList(
+		func() int { return n },
+		func() fyne.CanvasObject { return widget.NewLabel("row") },
+		func(widget.ListItemID, fyne.CanvasObject) {},
+	)
+	w := test.NewTempWindow(t, list)
+	w.Resize(fyne.NewSize(300, 200))
+
+	if listAtBottom(list) {
+		t.Fatal("a long list scrolled to the top reports being at the bottom")
+	}
+	if got := list.GetScrollOffset(); got != 0 {
+		t.Fatalf("measuring moved the list to offset %v; it must put it back", got)
+	}
+
+	list.ScrollToOffset(500)
+	mid := list.GetScrollOffset()
+	if listAtBottom(list) {
+		t.Fatal("a list scrolled half way reports being at the bottom")
+	}
+	if got := list.GetScrollOffset(); got != mid {
+		t.Fatalf("offset %v after measuring, want %v", got, mid)
+	}
+
+	list.ScrollToBottom()
+	if !listAtBottom(list) {
+		t.Fatal("a list scrolled to its end does not report being at the bottom")
+	}
+
+	n = 3
+	list.Refresh()
+	list.ScrollToTop()
+	if !listAtBottom(list) {
+		t.Fatal("a list shorter than its viewport must count as at the bottom")
 	}
 }

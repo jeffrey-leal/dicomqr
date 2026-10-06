@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"image/color"
 	"io"
@@ -497,26 +498,41 @@ func main() {
 		_, studyUID, _, _ := model.uidsForNode(id)
 		gen := resultsGen
 		go func() {
+			// A failure — no connection, or the query refused or cut off
+			// (Find reports those in-band, as an item carrying Err) — keeps
+			// whatever series did arrive and clears the loaded mark, so
+			// expanding the study again asks once more; it is also said, since
+			// an empty study otherwise reads as one with no series.
+			var series []FindResult
+			var loadErr error
 			cctx := getConnCtx()
 			cl := getClient()
 			if cctx == nil || cl == nil {
-				return
-			}
-			ch, err := cl.Find(cctx, "SERIES", map[string]string{"StudyInstanceUID": studyUID})
-			if err != nil {
-				return
-			}
-			var series []FindResult
-			for r := range ch {
-				if r.Err == nil {
+				loadErr = errors.New("not connected")
+			} else if ch, err := cl.Find(cctx, "SERIES", map[string]string{"StudyInstanceUID": studyUID}); err != nil {
+				loadErr = err
+			} else {
+				for r := range ch {
+					if r.Err != nil {
+						if loadErr == nil {
+							loadErr = r.Err
+						}
+						continue
+					}
 					series = append(series, r)
 				}
 			}
-			for range ch {
+			if loadErr != nil {
+				logWarn("query: could not list the series of study %s: %v", studyUID, loadErr)
 			}
 			fyne.Do(func() {
 				if gen != resultsGen {
 					return // the tree was cleared (or the server changed) meanwhile
+				}
+				if loadErr != nil {
+					model.unmarkSeriesLoaded(id)
+					statusLabel.SetText(fmt.Sprintf(
+						"Could not list this study's series (%v) — collapse and expand it to try again", loadErr))
 				}
 				for _, r := range series {
 					model.addSeries(r.StudyInstanceUID, r.SeriesInstanceUID,

@@ -305,3 +305,19 @@ func TestResultsModel_FilterMatchViaChild(t *testing.T) {
 }
 
 func contains(s, substr string) bool { return strings.Contains(s, substr) }
+
+// A failed series query must not leave the study marked as loaded, or it can
+// never be asked again (expanding it only queries an unloaded study).
+func TestUnmarkSeriesLoaded(t *testing.T) {
+	m := newResultsModel()
+	m.addStudy("DOE^JANE", "P1", "1.2.3", "20260101", "CT HEAD", "A1", "CT")
+	m.markSeriesLoaded("S:1.2.3")
+	if !m.isSeriesLoaded("S:1.2.3") {
+		t.Fatal("study not marked loaded")
+	}
+	m.unmarkSeriesLoaded("S:1.2.3")
+	if m.isSeriesLoaded("S:1.2.3") {
+		t.Fatal("study still marked loaded after a failed query")
+	}
+	m.unmarkSeriesLoaded("S:missing") // a node cleared meanwhile is ignored
+}

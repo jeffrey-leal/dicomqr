@@ -174,6 +174,17 @@ func (m *resultsModel) markSeriesLoaded(id string) {
 	}
 }
 
+// unmarkSeriesLoaded undoes markSeriesLoaded after a series query failed, so
+// the next time the study is expanded its series are asked for again.
+// markSeriesLoaded runs before the query (to stop a second expand firing a
+// duplicate), so without this one failed query left the study empty for
+// good, with nothing on screen to say why.
+func (m *resultsModel) unmarkSeriesLoaded(id string) {
+	if n, ok := m.nodes[id]; ok {
+		n.seriesLoaded = false
+	}
+}
+
 // setFilter stores a filter string and recomputes the visible root list.
 func (m *resultsModel) setFilter(f string) {
 	m.filter = strings.ToLower(f)

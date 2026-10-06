@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **The Activity Log no longer jumps back to the bottom while you read.** It refreshes once a second, and every refresh that brought new lines (all the time during a retrieve) scrolled it to the newest one, so earlier lines could not be read while anything was happening. It now follows new lines only while you are at the bottom. Scrolled up, the view holds still and a note says it is paused; scroll back to the bottom and it catches up. Refresh, Clear, or a change of level or filter still go to the newest line.
+- **A study whose series could not be listed can be expanded again.** Expanding a study in the query results lists its series with a query to the server, and the study was marked as listed before that query ran. If the query failed, because the server refused it or the connection dropped, the failure was ignored and the study stayed empty for the rest of the session, looking as if it had no series. Now the status bar and the Activity Log say the series could not be listed, any series that did arrive are kept, and collapsing and expanding the study tries again.
+
 ## [1.23.0] — 2026-10-06
 
 ### Added

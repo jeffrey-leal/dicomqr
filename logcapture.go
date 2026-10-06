@@ -223,6 +223,23 @@ func (r *logRow) TappedSecondary(e *fyne.PointEvent) {
 // instantly (the dialog reads the in-memory ring, never dicom.log). A
 // 1-second ticker updates the view while the dialog is open; the goroutine
 // exits when the Close button is pressed.
+// listAtBottom reports whether list is scrolled to its last row, leaving the
+// scroll position as it found it. widget.List exposes its offset but not its
+// content height, so the bottom is measured: jump there, read the offset, and
+// put the old one back — one UI-goroutine turn, so nothing is drawn in
+// between. Measuring rather than remembering the last bottom keeps the answer
+// right after the window is resized. A list shorter than its viewport is
+// always at its bottom.
+func listAtBottom(list *widget.List) bool {
+	cur := list.GetScrollOffset()
+	list.ScrollToBottom()
+	if bottom := list.GetScrollOffset(); cur < bottom-1 {
+		list.ScrollToOffset(cur)
+		return false
+	}
+	return true
+}
+
 func showLogDialog(a fyne.App, parent fyne.Window) {
 	if raiseOwnedWindow("activity-log") {
 		return
@@ -273,20 +290,32 @@ func showLogDialog(a fyne.App, parent fyne.Window) {
 	filterEntry.SetPlaceHolder("Filter (substring, e.g. scp: or a UID)…")
 
 	countsLbl := widget.NewLabel("")
+	pausedLbl := widget.NewLabel("Paused while you read earlier lines — scroll to the bottom to follow new ones")
+	pausedLbl.TextStyle = fyne.TextStyle{Italic: true}
+	pausedLbl.Hide()
+
+	atBottom := func() bool { return listAtBottom(list) }
 
 	// The 1-second ticker calls refresh unconditionally, so it must cost
 	// nothing while the log is quiet: skip everything unless the ring's
 	// generation or one of the view controls actually changed. When something
 	// did change, the work is a filter pass over in-memory entries plus a
 	// virtualized List refresh — only the visible rows are ever laid out.
+	//
+	// New lines are followed only from the bottom. Scrolled up, the view is
+	// held exactly as it is — not just the scroll position: the ring drops its
+	// oldest entries as new ones arrive, so even a kept offset would slide
+	// different lines under the reader. It resumes once the reader is back at
+	// the bottom. force (Refresh, Clear) and a change of level or filter are
+	// deliberate, so they always refresh and jump to the newest line.
 	lastGen := ^uint64(0)
 	lastIdx, lastFilter := -1, "\x00"
-	refresh := func() {
+	refresh := func(force bool) {
 		gen := appLog.Generation()
-		if gen == lastGen && viewIdx == lastIdx && filterEntry.Text == lastFilter {
+		viewChanged := viewIdx != lastIdx || filterEntry.Text != lastFilter
+		if gen == lastGen && !viewChanged && !force {
 			return
 		}
-		lastGen, lastIdx, lastFilter = gen, viewIdx, filterEntry.Text
 
 		entries := appLog.Entries()
 		var nE, nW, nI, nP int
@@ -304,6 +333,15 @@ func showLogDialog(a fyne.App, parent fyne.Window) {
 		}
 		countsLbl.SetText(fmt.Sprintf("errors %d · warnings %d · activity %d · protocol detail %d", nE, nW, nI, nP))
 
+		if !force && !viewChanged && !atBottom() {
+			// lastGen is left as it was, so the first tick back at the
+			// bottom catches up on everything that arrived meanwhile.
+			pausedLbl.Show()
+			return
+		}
+		pausedLbl.Hide()
+		lastGen, lastIdx, lastFilter = gen, viewIdx, filterEntry.Text
+
 		max := logViewOptions[viewIdx].max
 		needle := strings.ToLower(strings.TrimSpace(filterEntry.Text))
 		filtered := make([]logEntry, 0, len(entries))
@@ -320,28 +358,28 @@ func showLogDialog(a fyne.App, parent fyne.Window) {
 		list.Refresh()
 		list.ScrollToBottom()
 	}
-	refresh()
+	refresh(true)
 
 	levelSelect.OnChanged = func(string) {
 		if idx := levelSelect.SelectedIndex(); idx >= 0 {
 			viewIdx = idx
 		}
-		refresh()
+		refresh(false)
 	}
-	filterEntry.OnChanged = func(string) { refresh() }
+	filterEntry.OnChanged = func(string) { refresh(false) }
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	closeBtn := widget.NewButton("Close", func() {
 		cancel()
 	})
-	refreshBtn := widget.NewButton("Refresh", func() { fyne.Do(refresh) })
+	refreshBtn := widget.NewButton("Refresh", func() { fyne.Do(func() { refresh(true) }) })
 	copyBtn := widget.NewButton("Copy Shown", func() {
 		w.Clipboard().SetContent(renderLog(appLog.Entries(), logViewOptions[viewIdx].max, filterEntry.Text))
 	})
 	clearBtn := widget.NewButton("Clear", func() {
 		appLog.Clear()
-		fyne.Do(refresh)
+		fyne.Do(func() { refresh(true) })
 	})
 
 	filterBar := container.NewBorder(nil, nil, levelSelect, countsLbl, filterEntry)
@@ -350,7 +388,7 @@ func showLogDialog(a fyne.App, parent fyne.Window) {
 		filterBar,
 		container.NewVBox(
 			widget.NewSeparator(),
-			container.NewHBox(refreshBtn, copyBtn, clearBtn, layout.NewSpacer(), closeBtn),
+			container.NewHBox(refreshBtn, copyBtn, clearBtn, pausedLbl, layout.NewSpacer(), closeBtn),
 		),
 		nil, nil,
 		listBox,
@@ -366,7 +404,7 @@ func showLogDialog(a fyne.App, parent fyne.Window) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				fyne.Do(refresh)
+				fyne.Do(func() { refresh(false) })
 			}
 		}
 	}()
