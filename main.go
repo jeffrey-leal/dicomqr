@@ -30,7 +30,7 @@ import (
 	"github.com/grailbio/go-dicom/dicomlog"
 )
 
-const version = "1.22.0"
+const version = "1.23.0"
 
 // LED colours for connection and SCP state indicators.
 var (

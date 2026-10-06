@@ -1,6 +1,6 @@
 # dicomqr
 
-**User Manual  v1.22.0**
+**User Manual  v1.23.0**
 
 October 6, 2026
 
@@ -873,7 +873,7 @@ The status bar at the bottom of the window provides real-time feedback. A colour
 
 | Situation | Status bar text |
 |---|---|
-| Application started, not connected | `v1.22.0` |
+| Application started, not connected | `v1.23.0` |
 | Connecting to server | `Connecting…` |
 | Connected | `Connected: <AE>@<host>:<port>` |
 | Connection cancelled | `Connection cancelled` |
