@@ -225,9 +225,9 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	dobEntry.OnChanged = func(string) { refreshDOBAdvisory() }
 
 	// Tags removed — read-only list (already keep-filtered by base resolution).
-	removeLines := make([]string, 0, len(resolved.Removes))
-	for _, r := range resolved.Removes {
-		line := strings.TrimSpace(r)
+	// The PHI check's text remedy can append to it for this run.
+	removeLine := func(ref string) string {
+		line := strings.TrimSpace(ref)
 		if t, err := parseTagString(line); err == nil {
 			if name := tagDisplayName(t); name != "" {
 				line = fmt.Sprintf("%04X,%04X — %s", t.Group, t.Element, name)
@@ -235,7 +235,11 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 				line = fmt.Sprintf("%04X,%04X", t.Group, t.Element)
 			}
 		}
-		removeLines = append(removeLines, line)
+		return line
+	}
+	removeLines := make([]string, 0, len(resolved.Removes))
+	for _, r := range resolved.Removes {
+		removeLines = append(removeLines, removeLine(r))
 	}
 	removeList := widget.NewList(
 		func() int { return len(removeLines) },
@@ -245,6 +249,8 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	listHeight := canvas.NewRectangle(color.Transparent)
 	listHeight.SetMinSize(fyne.NewSize(0, 180))
 	removeBox := container.NewStack(listHeight, removeList)
+	// Kept as a value so the PHI check's remedy can update the count in its title.
+	removeSection := prefSection(fmt.Sprintf("Tags removed (%d)", len(removeLines)), removeBox)
 
 	// Sections are built with prefSection, the same header/separator block the
 	// profile editor and Preferences use, so the two Options blocks are framed
@@ -319,7 +325,25 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		phiSkipDocs   bool
 		phiLast       phiFindings
 		phiStop       atomic.Bool
+		// phiExtraRemoves are the text fields the check's remedy added to this
+		// run's removals, canonical GGGG,EEEE; phiParams is the profile plus
+		// those, compiled — the filters the screen applies and the removals and
+		// Set values the text finding is judged against (textRulesFor).
+		phiExtraRemoves []string
+		phiParams       modifyParams
 	)
+	compilePHIParams := func() {
+		p := resolved
+		p.Removes = append(append([]string(nil), resolved.Removes...), phiExtraRemoves...)
+		compiled, err := compileModifyParams(p)
+		if err != nil {
+			// A profile that does not compile fails at Modify… with its own
+			// message; until then the screen checks every file against no rules.
+			compiled = modifyParams{}
+		}
+		phiParams = compiled
+	}
+	compilePHIParams()
 	phiStatus := widget.NewLabel(fmt.Sprintf("Checking %d file(s) for content this profile's rules and masking would not reach…", len(files)))
 	phiStatus.Wrapping = fyne.TextWrapWord
 	phiProg := widget.NewProgressBar()
@@ -340,10 +364,17 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 			return
 		}
 		work := newMaskWorkingSet(runMasks)
-		phiLast = evaluatePHIScreen(phiFiles, func(modality string) []MaskRegion {
+		rulesByModality := map[string]phiRules{}
+		phiLast = evaluatePHIScreen(phiFiles, func(modality string) phiRules {
+			if r, ok := rulesByModality[modality]; ok {
+				return r
+			}
 			regions, _ := work.governing(modality)
-			return regions
-		}, overlaysCheck.Checked)
+			r := phiRules{regions: regions, overlaysRemoved: overlaysCheck.Checked,
+				textHandled: textRulesFor(phiParams, modality)}
+			rulesByModality[modality] = r
+			return r
+		})
 
 		exported := 0
 		for _, f := range phiFiles {
@@ -383,6 +414,33 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 				rows = append(rows, container.NewHBox(widget.NewButton("Remove overlay planes", func() {
 					overlaysCheck.SetChecked(true) // OnChanged re-evaluates
 				})))
+			case phiRiskText:
+				breakdown := wrapped(phiLast.textBreakdown())
+				breakdown.TextStyle = fyne.TextStyle{Italic: true}
+				rows = append(rows, container.New(layout.NewCustomPaddedLayout(0, 0, 24, 0), breakdown))
+				// Removal rather than a Set value: an empty replacement would
+				// still ship the element, and removing a comment or a secondary
+				// identifier costs a de-identified export nothing. For this run
+				// only, like every other control here; the list below shows them.
+				rows = append(rows, container.NewHBox(widget.NewButton("Remove these fields in this run", func() {
+					have := map[string]bool{}
+					for _, r := range phiExtraRemoves {
+						have[r] = true
+					}
+					for _, t := range phiLast.textTags() {
+						if ref := formatTagRef(t); !have[ref] {
+							phiExtraRemoves = append(phiExtraRemoves, ref)
+							removeLines = append(removeLines, removeLine(ref))
+							have[ref] = true
+						}
+					}
+					removeList.Refresh()
+					if title, ok := removeSection.Objects[0].(*widget.Label); ok {
+						title.SetText(fmt.Sprintf("Tags removed (%d)", len(removeLines)))
+					}
+					compilePHIParams()
+					refreshPHI()
+				})))
 			}
 		}
 		if pix := phiLast.pixelFiles(); len(pix) > 0 {
@@ -397,12 +455,9 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	}
 	overlaysCheck.OnChanged = func(bool) { refreshPHI() }
 	// The screen applies the profile's own file filters so it never flags a
-	// file the run skips. A profile that does not compile fails at Modify…
-	// with its own message; until then the screen checks every file.
-	phiFilters, ferr := compileModifyParams(resolved)
-	if ferr != nil {
-		phiFilters = modifyParams{}
-	}
+	// file the run skips; the remedy only ever adds removals, which change no
+	// filter, so the copy taken here stays right.
+	phiFilters := phiParams
 	go func() {
 		screened, unreadable := screenPHIFiles(files, phiFilters, &phiStop, func(done, total int) {
 			fyne.Do(func() { phiProg.SetValue(float64(done) / float64(total)) })
@@ -417,9 +472,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		})
 	}()
 
-	sections = append(sections,
-		prefSection(fmt.Sprintf("Tags removed (%d)", len(removeLines)), removeBox),
-	)
+	sections = append(sections, removeSection)
 
 	// Settings applied as-is without dialog controls.
 	var notes []string
@@ -684,6 +737,10 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		// runMasks carries any regions added in the review window; everything
 		// else still comes from the resolved profile plus the controls above.
 		edited := runMasks
+		// Fields the PHI check's remedy removed for this run.
+		if len(phiExtraRemoves) > 0 {
+			edited.Removes = append(append([]string(nil), edited.Removes...), phiExtraRemoves...)
+		}
 		edited.Sets = make([]string, 0, len(setRows))
 		for _, row := range setRows {
 			if row.parsed {

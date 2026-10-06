@@ -52,10 +52,14 @@ const (
 	// beside the pixels — annotations and text live there too — and only
 	// Remove overlay planes reaches them.
 	phiRiskOverlay
+	// phiRiskText: one of phiTextTags carries a value and the run neither
+	// removes nor replaces it — a comment field, or a demographic identifier
+	// the profile's author did not think to list.
+	phiRiskText
 )
 
 // phiRiskKinds lists the reasons in display order, strongest first.
-var phiRiskKinds = []phiRisk{phiRiskBurnedIn, phiRiskDocument, phiRiskUltrasound, phiRiskCapture, phiRiskOverlay}
+var phiRiskKinds = []phiRisk{phiRiskBurnedIn, phiRiskDocument, phiRiskText, phiRiskUltrasound, phiRiskCapture, phiRiskOverlay}
 
 // phiRiskPixel is the set of reasons pixel masking can clear.
 const phiRiskPixel = phiRiskBurnedIn | phiRiskUltrasound | phiRiskCapture
@@ -79,6 +83,10 @@ func (r phiRisk) finding(n int) string {
 	case phiRiskOverlay:
 		return plural(n, "file carries", "files carry") +
 			" overlay planes, which can hold annotations, and Remove overlay planes is off."
+	case phiRiskText:
+		return plural(n, "file keeps", "files keep") +
+			" values in free-text or identifying fields this profile neither removes nor replaces — " +
+			"free text can hold names, dates and record numbers:"
 	}
 	return ""
 }
@@ -98,8 +106,129 @@ func (r phiRisk) shipped(n int) string {
 			" not masked"
 	case phiRiskOverlay:
 		return plural(n, "exported file keeps", "exported files keep") + " overlay planes"
+	case phiRiskText:
+		return plural(n, "exported file keeps", "exported files keep") + " values in free-text or identifying fields"
 	}
 	return ""
+}
+
+// phiTextTags are the fields the text check looks at: the free-text comment
+// fields and the demographic identifiers beyond name, ID and birth date that
+// the DICOM Basic Application Level Confidentiality Profile (PS3.15 Table
+// E.1-1) removes. Name, ID and birth date themselves are left out — every
+// profile deals with those, and flagging them would only be noise — as are
+// descriptions (Study, Series, Protocol), which carry names rarely enough
+// that flagging every file would teach the user to ignore the check.
+// Retired tags stay in: an old study still carries them. Checked at any depth,
+// since removals and Set values recurse and a comment can sit inside a
+// request sequence.
+var phiTextTags = []tag.Tag{
+	// Demographics a profile may not think to list.
+	tag.OtherPatientIDs,
+	tag.OtherPatientIDsSequence,
+	tag.OtherPatientNames,
+	tag.PatientBirthName,
+	tag.PatientMotherBirthName,
+	tag.PatientAddress,
+	tag.PatientTelephoneNumbers,
+	tag.PatientTelecomInformation,
+	tag.MedicalRecordLocator,
+	tag.AdmissionID,
+	// Free text.
+	tag.PatientComments,
+	tag.AdditionalPatientHistory,
+	tag.ImageComments,
+	tag.StudyComments,
+	tag.IdentifyingComments,
+	tag.VisitComments,
+	tag.CommentsOnThePerformedProcedureStep,
+	tag.RequestedProcedureComments,
+	tag.ImagingServiceRequestComments,
+	tag.TextValue,
+	tag.UnformattedTextValue,
+}
+
+// phiTextTagSet indexes phiTextTags.
+var phiTextTagSet = func() map[tag.Tag]bool {
+	m := make(map[tag.Tag]bool, len(phiTextTags))
+	for _, t := range phiTextTags {
+		m[t] = true
+	}
+	return m
+}()
+
+// textFieldsWithValues returns which phiTextTags carry a value anywhere in
+// elements, sequence items included, in phiTextTags order. An element holding
+// only blanks is empty; a sequence counts once any item holds an element.
+func textFieldsWithValues(elements []*sdicom.Element) []tag.Tag {
+	found := map[tag.Tag]bool{}
+	var walk func([]*sdicom.Element)
+	walk = func(elems []*sdicom.Element) {
+		for _, e := range elems {
+			if e == nil || e.Value == nil {
+				continue
+			}
+			if e.Value.ValueType() == sdicom.Sequences {
+				items, _ := e.Value.GetValue().([]*sdicom.SequenceItemValue)
+				for _, item := range items {
+					if item == nil {
+						continue
+					}
+					sub, ok := item.GetValue().([]*sdicom.Element)
+					if !ok {
+						continue
+					}
+					if len(sub) > 0 && phiTextTagSet[e.Tag] {
+						found[e.Tag] = true
+					}
+					walk(sub)
+				}
+				continue
+			}
+			if !phiTextTagSet[e.Tag] || found[e.Tag] {
+				continue
+			}
+			if strs, ok := e.Value.GetValue().([]string); ok {
+				for _, s := range strs {
+					if strings.TrimSpace(strings.Trim(s, "\x00")) != "" {
+						found[e.Tag] = true
+						break
+					}
+				}
+			} else if b, ok := e.Value.GetValue().([]byte); ok && len(strings.TrimSpace(strings.Trim(string(b), "\x00"))) > 0 {
+				found[e.Tag] = true
+			}
+		}
+	}
+	walk(elements)
+	var out []tag.Tag
+	for _, t := range phiTextTags {
+		if found[t] {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// textRulesFor returns the tags a run removes or replaces in a file of the
+// given modality — the profile's removals and Set values with the matching
+// override layered on exactly as processFile layers them (override edits
+// merged in, override removals added, override keep list cancelling). A
+// field in this set does not ship with its original value.
+func textRulesFor(p modifyParams, modality string) map[tag.Tag]bool {
+	edits, removals := p.edits, p.removals
+	if ov, ok := p.perMod[strings.ToUpper(strings.TrimSpace(modality))]; ok {
+		edits = mergeEdits(edits, ov.edits)
+		removals = filterKeep(append(append([]tag.Tag(nil), removals...), ov.removals...), ov.keep)
+	}
+	handled := make(map[tag.Tag]bool, len(edits)+len(removals))
+	for _, e := range edits {
+		handled[e.tag] = true
+	}
+	for _, t := range removals {
+		handled[t] = true
+	}
+	return handled
 }
 
 // plural renders "1 thing" or "N things".
@@ -155,7 +284,9 @@ type phiHeader struct {
 	cols, rows  int
 	document    bool // carries an encapsulated document
 	overlay     bool // carries overlay-plane elements
-	src         maskSource
+	// text: the phiTextTags carrying a value, in phiTextTags order.
+	text []tag.Tag
+	src  maskSource
 }
 
 // readPHIHeader reads a file's classification facts from a parsed dataset —
@@ -176,6 +307,7 @@ func readPHIHeader(ds *sdicom.Dataset) phiHeader {
 	}
 	h.document = strings.HasPrefix(sop, encapsulatedDocumentPrefix) || hasEncapsulatedDocument(ds)
 	h.overlay = hasOverlayPlanes(ds)
+	h.text = textFieldsWithValues(ds.Elements)
 	return h
 }
 
@@ -231,17 +363,39 @@ func maskHandles(src maskSource, regions []MaskRegion, cols, rows int) bool {
 	return err != nil || len(res.rects) > 0 || res.exempt
 }
 
-// risks classifies the file against the regions that govern it and whether
-// the run removes overlay planes.
-func (h phiHeader) risks(regions []MaskRegion, overlaysRemoved bool) phiRisk {
+// phiRules is what a run does to one file, as far as the classification
+// cares: the mask regions governing it, whether overlay planes are removed,
+// and the tags it removes or replaces (textRulesFor).
+type phiRules struct {
+	regions         []MaskRegion
+	overlaysRemoved bool
+	textHandled     map[tag.Tag]bool
+}
+
+// textLeft is the file's text fields the run leaves with their values.
+func (h phiHeader) textLeft(handled map[tag.Tag]bool) []tag.Tag {
+	var out []tag.Tag
+	for _, t := range h.text {
+		if !handled[t] {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// risks classifies the file against what the run does to it.
+func (h phiHeader) risks(rules phiRules) phiRisk {
 	var r phiRisk
 	if h.document {
 		r |= phiRiskDocument
 	}
-	if h.overlay && !overlaysRemoved {
+	if h.overlay && !rules.overlaysRemoved {
 		r |= phiRiskOverlay
 	}
-	if h.isImage() && !maskHandles(h.src, regions, h.cols, h.rows) {
+	if len(h.textLeft(rules.textHandled)) > 0 {
+		r |= phiRiskText
+	}
+	if h.isImage() && !maskHandles(h.src, rules.regions, h.cols, h.rows) {
 		switch {
 		case h.burnedIn == "YES":
 			r |= phiRiskBurnedIn
@@ -364,28 +518,64 @@ feed:
 // files carrying each reason, in screen order.
 type phiFindings struct {
 	byRisk map[phiRisk][]string
+	// textCounts is how many files leave each text field with its value —
+	// the breakdown under the text finding, and the tags its remedy removes.
+	textCounts map[tag.Tag]int
 }
 
-// evaluatePHIScreen classifies every screened file. govern returns the mask
-// regions governing a modality (the working set's lookup), overlaysRemoved is
-// the dialog's Remove overlay planes box. Pure over the scan results, so the
-// dialog re-runs it on every relevant edit.
-func evaluatePHIScreen(files []phiScreenFile, govern func(modality string) []MaskRegion,
-	overlaysRemoved bool) phiFindings {
-
-	f := phiFindings{byRisk: map[phiRisk][]string{}}
+// evaluatePHIScreen classifies every screened file. rulesFor returns what the
+// run does to a file of a modality (mask regions from the working set, the
+// Remove overlay planes box, the compiled removals and Set values). Pure over
+// the scan results, so the dialog re-runs it on every relevant edit.
+func evaluatePHIScreen(files []phiScreenFile, rulesFor func(modality string) phiRules) phiFindings {
+	f := phiFindings{byRisk: map[phiRisk][]string{}, textCounts: map[tag.Tag]int{}}
 	for _, file := range files {
 		if file.skipped {
 			continue
 		}
-		r := file.risks(govern(file.src.modality), overlaysRemoved)
+		rules := rulesFor(file.src.modality)
+		r := file.risks(rules)
 		for _, k := range phiRiskKinds {
 			if r&k != 0 {
 				f.byRisk[k] = append(f.byRisk[k], file.path)
 			}
 		}
+		for _, t := range file.textLeft(rules.textHandled) {
+			f.textCounts[t]++
+		}
 	}
 	return f
+}
+
+// textTags is the flagged text fields in phiTextTags order.
+func (f phiFindings) textTags() []tag.Tag {
+	var out []tag.Tag
+	for _, t := range phiTextTags {
+		if f.textCounts[t] > 0 {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// textBreakdown names each flagged text field with its file count, e.g.
+// "Image Comments (0020,4000) in 12 files".
+func (f phiFindings) textBreakdown() string {
+	var parts []string
+	for _, t := range f.textTags() {
+		parts = append(parts, phiTagLabel(t)+" in "+plural(f.textCounts[t], "file", "files"))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// phiTagLabel renders a tag as "Name (GGGG,EEEE)", or just the number when
+// the dictionary has no name for it.
+func phiTagLabel(t tag.Tag) string {
+	num := formatTagRef(t)
+	if name := tagDisplayName(t); name != "" {
+		return name + " (" + num + ")"
+	}
+	return num
 }
 
 // reviewSetFor is what the review window opens for a set of flagged files:

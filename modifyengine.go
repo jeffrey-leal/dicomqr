@@ -776,7 +776,8 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 
 	// recordWritten counts a file once it is actually on disk or in the
 	// archive — the only point at which what it carries has shipped.
-	recordWritten := func(path string, ds sdicom.Dataset, rel string, risk phiRisk) {
+	recordWritten := func(path string, ds sdicom.Dataset, rel string, notes fileNotes) {
+		risk := notes.phiRisk
 		mu.Lock()
 		res.Processed++
 		for _, k := range phiRiskKinds {
@@ -791,9 +792,18 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 		if risk != 0 {
 			var why []string
 			for _, k := range phiRiskKinds {
-				if risk&k != 0 {
-					why = append(why, strings.TrimPrefix(k.shipped(1), "1 "))
+				if risk&k == 0 {
+					continue
 				}
+				line := strings.TrimPrefix(k.shipped(1), "1 ")
+				if k == phiRiskText {
+					names := make([]string, 0, len(notes.phiText))
+					for _, t := range notes.phiText {
+						names = append(names, phiTagLabel(t))
+					}
+					line += " (" + strings.Join(names, ", ") + ")"
+				}
+				why = append(why, line)
 			}
 			logWarn("modify: %s — %s", path, strings.Join(why, "; "))
 		}
@@ -938,7 +948,7 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 						if zerr := zsink.write(rel, ds, writeOpts); zerr != nil {
 							recordFailure(path, fmt.Errorf("zip write: %w", zerr))
 						} else {
-							recordWritten(path, ds, rel, notes.phiRisk)
+							recordWritten(path, ds, rel, notes)
 						}
 						return
 					}
@@ -970,7 +980,7 @@ func runModificationImpl(ctx context.Context, files []string, rootDir, outDir st
 					case clerr != nil:
 						recordFailure(path, fmt.Errorf("close: %w", clerr))
 					default:
-						recordWritten(path, ds, rel, notes.phiRisk)
+						recordWritten(path, ds, rel, notes)
 					}
 				}()
 				mu.Lock()
@@ -1290,6 +1300,8 @@ type fileNotes struct {
 	// phiRisk: the PHI screen's reasons this file still carried when written
 	// (see phiscreen.go), counted into modifyResult.PHIRisks once it is.
 	phiRisk phiRisk
+	// phiText: the text fields behind phiRiskText, named in the Activity Log.
+	phiText []tag.Tag
 }
 
 // hasNestedTag reports whether t appears anywhere BELOW the top level of
@@ -1697,7 +1709,16 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 	// actually governed the file, the same resolution the dialog's screen ran.
 	phiIn.document = hasEncapsulatedDocument(&ds)
 	phiIn.overlay = hasOverlayPlanes(&ds)
-	notes.phiRisk = phiIn.risks(maskRegions, false)
+	// Text fields likewise, from the finished dataset — removals have already
+	// taken theirs out — less any the profile's Set values wrote, which now hold
+	// the profile's own literal rather than the original.
+	phiIn.text = textFieldsWithValues(ds.Elements)
+	setTags := make(map[tag.Tag]bool, len(edits))
+	for _, e := range edits {
+		setTags[e.tag] = true
+	}
+	notes.phiText = phiIn.textLeft(setTags)
+	notes.phiRisk = phiIn.risks(phiRules{regions: maskRegions, textHandled: setTags})
 
 	notes.namesAfter = readExportNames(&ds)
 	return false, ds, notes, nil

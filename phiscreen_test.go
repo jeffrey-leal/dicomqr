@@ -125,7 +125,7 @@ func TestPHIRiskClassification(t *testing.T) {
 		{"no dimensions, no pixel reason", phiHeader{sopClass: sopSC, src: maskSource{modality: "CT"}}, nil, false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.h.risks(tc.regions, tc.overlays); got != tc.want {
+			if got := tc.h.risks(phiRules{regions: tc.regions, overlaysRemoved: tc.overlays}); got != tc.want {
 				t.Errorf("risks = %05b, want %05b", got, tc.want)
 			}
 		})
@@ -192,8 +192,8 @@ func TestScreenPHIFiles(t *testing.T) {
 		t.Errorf("header facts not read: %+v / %+v", screened[1].phiHeader, screened[2].phiHeader)
 	}
 
-	none := func(string) []MaskRegion { return nil }
-	f := evaluatePHIScreen(screened, none, false)
+	none := func(string) phiRules { return phiRules{} }
+	f := evaluatePHIScreen(screened, none)
 	if len(f.byRisk[phiRiskBurnedIn]) != 1 || len(f.byRisk[phiRiskDocument]) != 1 || len(f.byRisk[phiRiskCapture]) != 0 {
 		t.Errorf("findings = %v", f.byRisk)
 	}
@@ -201,13 +201,13 @@ func TestScreenPHIFiles(t *testing.T) {
 		t.Errorf("pixelFiles = %v, want just the burned-in capture", pix)
 	}
 	// Masking whatever governs CT clears the pixel finding; the document stays.
-	masked := func(m string) []MaskRegion {
+	masked := func(m string) phiRules {
 		if m == "CT" {
-			return []MaskRegion{{X: 0, Y: 0, W: 0.5, H: 0.25}}
+			return phiRules{regions: []MaskRegion{{X: 0, Y: 0, W: 0.5, H: 0.25}}}
 		}
-		return nil
+		return phiRules{}
 	}
-	f = evaluatePHIScreen(screened, masked, false)
+	f = evaluatePHIScreen(screened, masked)
 	if len(f.pixelFiles()) != 0 || len(f.byRisk[phiRiskDocument]) != 1 {
 		t.Errorf("after masking, findings = %v", f.byRisk)
 	}

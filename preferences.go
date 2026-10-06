@@ -5,6 +5,7 @@ import (
 	"image/color"
 	"io/fs"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -95,7 +96,73 @@ func (t *appTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) co
 	if t.isDark {
 		v = theme.VariantDark
 	}
+	if name == theme.ColorNameButton {
+		return distinctButtonColor(t.base.Color(theme.ColorNameBackground, v),
+			t.base.Color(theme.ColorNameForeground, v), t.base.Color(name, v))
+	}
 	return t.base.Color(name, v)
+}
+
+// Ordinary (medium-importance) buttons have to read as buttons. Fyne gives
+// them no border, only a fill, and the stock theme's fill barely differs from
+// the background — #F5F5F5 on white in the light variant, #28292E on #171718 in
+// the dark — so a button looked like a bold label (field-reported on the
+// Modification window's PHI check and Review masking buttons). The fill is
+// therefore moved a fixed step from the background toward the text colour,
+// which works for every theme pack without knowing its palette, and keeps the
+// button's text readable because the step is small. A pack whose own fill
+// already stands out more keeps it. Only widget.Button reads ColorNameButton
+// in Fyne 2.7.3, so nothing else changes; primary, danger and other
+// importances have their own colours and are untouched.
+const (
+	buttonStepLight = 0.20 // light backgrounds: white → #DDDDDD with stock text
+	buttonStepDark  = 0.16 // dark backgrounds: #171718 → #3A3A3B with stock text
+)
+
+// distinctButtonColor returns the button fill for a theme's background,
+// foreground and own button colour.
+func distinctButtonColor(bg, fg, own color.Color) color.Color {
+	step := buttonStepLight
+	if relativeLuminance(bg) < 0.5 {
+		step = buttonStepDark
+	}
+	derived := mixColor(bg, fg, step)
+	if contrastRatio(own, bg) >= contrastRatio(derived, bg) {
+		return own
+	}
+	return derived
+}
+
+// mixColor moves a toward b by f (0 = a, 1 = b), fully opaque.
+func mixColor(a, b color.Color, f float64) color.Color {
+	ar, ag, ab, _ := a.RGBA()
+	br, bg, bb, _ := b.RGBA()
+	ch := func(x, y uint32) uint8 {
+		return uint8((float64(x)*(1-f)+float64(y)*f)/257 + 0.5)
+	}
+	return color.NRGBA{R: ch(ar, br), G: ch(ag, bg), B: ch(ab, bb), A: 0xff}
+}
+
+// relativeLuminance is the WCAG 2 relative luminance of c, in [0, 1].
+func relativeLuminance(c color.Color) float64 {
+	r, g, b, _ := c.RGBA()
+	lin := func(v uint32) float64 {
+		s := float64(v) / 0xffff
+		if s <= 0.04045 {
+			return s / 12.92
+		}
+		return math.Pow((s+0.055)/1.055, 2.4)
+	}
+	return 0.2126*lin(r) + 0.7152*lin(g) + 0.0722*lin(b)
+}
+
+// contrastRatio is the WCAG 2 contrast ratio between two colours, in [1, 21].
+func contrastRatio(a, b color.Color) float64 {
+	la, lb := relativeLuminance(a), relativeLuminance(b)
+	if la < lb {
+		la, lb = lb, la
+	}
+	return (la + 0.05) / (lb + 0.05)
 }
 
 func (t *appTheme) Font(style fyne.TextStyle) fyne.Resource {

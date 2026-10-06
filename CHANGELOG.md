@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **The PHI check now looks at text fields too.** Beyond images and documents, it lists free-text and identifying fields that carry a value and that the profile neither removes nor replaces: the comment fields (Image, Patient, Study, Visit and Identifying Comments, Additional Patient History, the requested-procedure, imaging-request and performed-procedure-step comments, and report text) and the demographics beyond name, ID and birth date (Other Patient IDs and Names, birth and mother's birth names, address, telephone and telecom details, medical record locator, admission ID). The list follows the fields the DICOM standard's basic confidentiality profile removes; name, ID and birth date are left out because every profile deals with them, and study, series and protocol descriptions because they carry names too rarely to flag every file. Fields are found wherever they sit, including inside request sequences, and per-modality overrides are taken into account exactly as the run applies them. The finding names each field with the number of files carrying it, and **Remove these fields in this run** adds them to the run's removals (shown in the Tags removed list; the profile itself is unchanged). The completion summary counts exported files that still carried such a value, and the Activity Log names the fields for each one. With the shipped base-deident profile, which already removes most of these, the check surfaces the four it does not: the retired Identifying Comments and Study Comments, Requested Procedure Comments, and Comments on the Performed Procedure Step.
+
+### Changed
+
+- **Buttons look like buttons.** Ordinary buttons — Review masking…, Browse…, Change…, the PHI check's remedies, and every other button that is not a window's main action — were filled with a shade barely different from the window background (in the default light theme, a very pale grey on white), so they were hard to tell from bold labels. Their fill is now a clearly visible step darker (or, in dark themes, lighter) than the background, in every window and every colour theme, with the button's text still easily readable on it. Main-action buttons such as Modify… keep their accent colour.
+
 ## [1.22.0] — 2026-09-30
 
 ### Added
