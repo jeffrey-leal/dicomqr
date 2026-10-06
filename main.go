@@ -218,6 +218,13 @@ func main() {
 		activeProfile ServerProfile
 		scp           *StorageSCP
 		cancelQuery   context.CancelFunc // UI-goroutine only
+		// resultsGen numbers the Query Results tree's contents (UI-goroutine
+		// only): every clear bumps it, and a query or series lazy-load posts
+		// what it found only if the number is still the one it started under.
+		// Cancelling is not enough on its own — a query that had already
+		// collected its results kept inserting them, batch by batch, into the
+		// tree cleared out from under it.
+		resultsGen    int
 		cancelConnect context.CancelFunc // UI-goroutine only
 		// cancelRetrieve aborts the retrieve loop (UI-goroutine only). Non-nil
 		// only while a run is active; the run's completion closure nils it.
@@ -488,6 +495,7 @@ func main() {
 		}
 		model.markSeriesLoaded(id) // mark before goroutine to prevent duplicate queries
 		_, studyUID, _, _ := model.uidsForNode(id)
+		gen := resultsGen
 		go func() {
 			cctx := getConnCtx()
 			cl := getClient()
@@ -507,6 +515,9 @@ func main() {
 			for range ch {
 			}
 			fyne.Do(func() {
+				if gen != resultsGen {
+					return // the tree was cleared (or the server changed) meanwhile
+				}
 				for _, r := range series {
 					model.addSeries(r.StudyInstanceUID, r.SeriesInstanceUID,
 						r.Modality, r.SeriesNumber, r.SeriesDescription, r.NumInstances)
@@ -542,6 +553,20 @@ func main() {
 		[]string{"CT", "MR", "PT", "NM", "US", "CR", "DX", "XA", "RF"}, nil)
 	modalityCheck.Horizontal = true
 
+	// clearResults empties the Query Results tree and its selection, stops any
+	// query still running, and bumps resultsGen so nothing already in flight —
+	// query batches, series lazy-loads — can post into the emptied tree.
+	clearResults := func() {
+		if cancelQuery != nil {
+			cancelQuery()
+		}
+		resultsGen++
+		model.clear()
+		sel.Clear()
+		queryProgress.Hide()
+		tree.Refresh()
+	}
+
 	doSearch := func() {
 		if getState() != stateConnected || getClient() == nil {
 			dialog.ShowInformation("Not connected", "Connect to a DICOM server first.", w)
@@ -549,8 +574,8 @@ func main() {
 		}
 
 		runSearch := func() {
-			model.clear()
-			tree.Refresh()
+			clearResults()
+			gen := resultsGen
 			queryProgress.Show()
 			setStatus("Querying…")
 
@@ -593,9 +618,6 @@ func main() {
 				}
 			}
 
-			if cancelQuery != nil {
-				cancelQuery()
-			}
 			ctx, cancel := context.WithCancel(context.Background())
 			cancelQuery = cancel
 
@@ -606,6 +628,9 @@ func main() {
 				prof := getActiveProfile()
 				if cl == nil {
 					fyne.Do(func() {
+						if gen != resultsGen {
+							return
+						}
 						queryProgress.Hide()
 						statusLabel.SetText("Not connected")
 					})
@@ -664,6 +689,9 @@ func main() {
 
 				if firstErr != nil && len(allResults) == 0 {
 					fyne.Do(func() {
+						if gen != resultsGen {
+							return
+						}
 						queryProgress.Hide()
 						statusLabel.SetText("Query error: " + firstErr.Error())
 					})
@@ -682,6 +710,9 @@ func main() {
 					}
 					batch, shown := allResults[start:end], end
 					fyne.Do(func() {
+						if gen != resultsGen {
+							return // cleared, or a newer query owns the tree
+						}
 						for _, r := range batch {
 							model.addStudy(r.PatientName, r.PatientID, r.StudyInstanceUID,
 								r.StudyDate, r.StudyDescription, r.AccessionNumber, r.ModalitiesInStudy)
@@ -692,6 +723,9 @@ func main() {
 					time.Sleep(10 * time.Millisecond) // yield so the UI can paint between batches
 				}
 				fyne.Do(func() {
+					if gen != resultsGen {
+						return
+					}
 					model.applyFilter()
 					tree.Refresh()
 					queryProgress.Hide()
@@ -720,9 +754,6 @@ func main() {
 	}
 
 	doClearQuery := func() {
-		if cancelQuery != nil {
-			cancelQuery()
-		}
 		patientNameEntry.SetText("")
 		patientIDEntry.SetText("")
 		accessionEntry.SetText("")
@@ -731,9 +762,7 @@ func main() {
 		studyDateToEntry.Validator = nil
 		studyDateToEntry.SetDate(nil)
 		modalityCheck.SetSelected(nil)
-		model.clear()
-		sel.Clear()
-		tree.Refresh()
+		clearResults()
 		setStatus("v" + version)
 	}
 
@@ -917,6 +946,59 @@ func main() {
 		scpLED.Refresh()
 		scpStatusLbl.SetText("SCP: not running")
 		setConnState(stateDisconnected, "Disconnected")
+	}
+
+	// Changing the server ends the session with the old one. Queries and
+	// retrieves go to the connected server, not to whatever the dropdown
+	// shows, so a live connection to A beside "B" in the dropdown — or A's
+	// results left in the tree once B is chosen — invites retrieving a study
+	// from a server that may not hold it. The new server is not connected
+	// automatically: the user presses Connect, as for the first server.
+	// Assigned after the initial SetSelected, so startup does not fire it.
+	//
+	// A retrieve in progress is not cancelled on a click alone: the switch
+	// waits for confirmation, and declining puts the dropdown back. An errant
+	// pick in the dropdown would otherwise throw away a long retrieve.
+	shownServer := profileSelect.Selected
+	var switchServer func(name string)
+	profileSelect.OnChanged = func(name string) {
+		if name == shownServer {
+			return // includes the revert below, which re-selects shownServer
+		}
+		if !retrieveInFlight {
+			switchServer(name)
+			return
+		}
+		from := getActiveProfile().Name
+		dialog.ShowConfirm("Cancel retrieve?",
+			fmt.Sprintf("A retrieve from %s is in progress.\n\n"+
+				"Switching to %s will cancel it and disconnect. Files already received are kept.\n\n"+
+				"Cancel the retrieve and switch servers?", from, name),
+			func(ok bool) {
+				if ok {
+					switchServer(name)
+				} else {
+					profileSelect.SetSelected(shownServer)
+				}
+			}, w)
+	}
+	switchServer = func(name string) {
+		shownServer = name
+		wasConnected := getState() != stateDisconnected
+		if wasConnected {
+			disconnectBtn.OnTapped() // cancels any query, connect or retrieve in progress
+		}
+		hadResults := len(model.roots) > 0
+		clearResults()
+		if wasConnected || hadResults {
+			msg := fmt.Sprintf("Server changed to %s — press Connect, then search again", name)
+			if !wasConnected {
+				msg = fmt.Sprintf("Server changed to %s — results cleared", name)
+			}
+			// Queued behind the disconnect's own status update, so it is the
+			// message left showing.
+			fyne.Do(func() { statusLabel.SetText(msg) })
+		}
 	}
 
 	echoBtn.OnTapped = func() {

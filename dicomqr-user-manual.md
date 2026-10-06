@@ -128,6 +128,8 @@ If the C-ECHO fails, the status bar shows a connection error and the application
 
 If the SCP port is already in use — most often because a previous copy of dicomqr was force-closed — a dialog reports "port N is already in use". Close the other instance and click Connect again.
 
+Choosing a different server in the dropdown ends the session with the current one: if connected (or still connecting), dicomqr disconnects — cancelling any query or retrieve in progress — and the Query Results tree is cleared, so studies found on one server are never offered for retrieve from another, where they may not exist. Click Connect to connect to the newly chosen server, then search again. If a retrieve is in progress, nothing happens until you confirm: a dialog asks whether to cancel the retrieve and switch, and answering No puts the dropdown back and lets the retrieve carry on. Files a cancelled retrieve has already received are kept.
+
 
 ### 4.4  Testing Connectivity
 
