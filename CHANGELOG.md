@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.24.0] — 2026-10-07
 
 ### Added
 
@@ -16,7 +16,7 @@
 
 ### Removed
 
-- **The Preview and Open in Viewer buttons at the bottom of Local Browse.** Both ignored the selection and acted on the whole download folder. Preview in particular read every file in it to build one enormous preview, behind a progress box with no way to cancel, so on a large download folder it could only be stopped by closing the application. Use a tree item's right-click menu instead: Preview Images opens a study's overview or a series' viewer, and Open in Viewer opens the item in the external viewer.
+- **The Preview and Open in Viewer buttons at the bottom of Local Browse.** Both ignored the selection and acted on the whole download folder. Preview in particular read every file in it to build one enormous preview, behind a progress box with no way to cancel, so on a large download folder it could only be stopped by closing the application. Use a tree item's right-click menu instead: Preview Images opens a study's overview or a series' viewer, and Open in Viewer opens the item's folder in the external viewer.
 
 ### Fixed
 
