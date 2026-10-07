@@ -421,7 +421,7 @@ The overview window shows one thumbnail per series — the middle slice of each 
 
 A series with nothing to display — SR, KO, PR and other non-image objects, or pixel data the built-in decoders cannot render — appears as a white tile with its modality in large bold black text instead of an image. Double-clicking the tile still opens the appropriate viewer for the series.
 
-While the overview is generated, a progress dialog counts the series as they load — studies with thousands of images can take several seconds. Series previews and the folder Preview button show the same dialog while large image sets are scanned and sorted; the application remains responsive throughout.
+While the overview is generated, a progress dialog counts the series as they load — studies with thousands of images can take several seconds. Series previews show the same dialog while large image sets are scanned and sorted; the application remains responsive throughout.
 
 
 #### 8.3.5  DICOM Annotation Overlay
@@ -490,7 +490,7 @@ The viewer opens at document 1 of the series and loads subsequent documents in t
 
 ### 8.4  Opening in External Viewer
 
-The Open in Viewer button in the bottom bar and the right-click menu item open the node's folder in the configured external DICOM viewer. These controls are disabled when no viewer path is configured in Preferences. Open folder opens the folder in Windows Explorer instead.
+Right-click a node and choose Open in Viewer to open the node's folder in the configured external DICOM viewer. The item is disabled when no viewer path is configured in Preferences. Open folder opens the folder in Windows Explorer instead.
 
 
 ### 8.5  Pushing to a PACS
@@ -731,7 +731,7 @@ Tag Highlights — styling rules applied in the tag review window (Local Browse 
 | Private tags | When Italicize is checked, private (odd-group) tags are rendered in italic. |
 | Malformed tag | The colour applied to tags whose value representation violates the DICOM standard. Default: red. |
 
-Tag Profiles — named tag sets coloured in the View Tags window. Each profile has a name, a colour, an enabled checkbox, and a tag list (one GGGG,EEEE per line in the editor). The first enabled profile containing a tag determines its colour; the malformed-tag highlight always takes precedence. The default PHI profile colours protected-health-information tags orange. The JSON wire format matches the dicomhdr application, so profile blocks can be copied between the two tools' settings files.
+Tag Profiles — named tag sets coloured in the View Tags window. Each profile has a name, a colour, an enabled checkbox, and a tag list (one GGGG,EEEE per line in the editor). Edit and Add profile… open the editor in its own window; a tag line that does not parse is reported without closing it, so nothing typed is lost. The first enabled profile containing a tag determines its colour; the malformed-tag highlight always takes precedence. The default PHI profile colours protected-health-information tags orange. The JSON wire format matches the dicomhdr application, so profile blocks can be copied between the two tools' settings files.
 
 
 ### 14.3  Modification & Export Tab
@@ -812,7 +812,7 @@ Two consequences worth knowing before enabling masking. Because writing pixels r
 
 Masked areas are filled with black as the image's own photometric interpretation defines it, so a redaction reads as a redaction: the maximum stored value on an inverted greyscale image, neutral chroma on a colour-difference image, and the darkest entry of the palette on a palette-colour image. The one format that cannot be masked directly is uncompressed chroma-subsampled ultrasound, whose samples are not stored one set per pixel; setting Output transfer syntax to either uncompressed option rewrites it in a form that masks normally, and the error says so.
 
-Per-modality overrides — the editor lists each override with Edit/Delete buttons and an Add modality override… button. An override varies only what is genuinely modality-specific, so its dialog offers the modality code, the set/remove/keep tag lists, Keep private tags, and Ignore SOP classes; on a file whose Modality matches, these layer on top of the profile. Ignore SOP classes here adds to the profile's SOP class filter for that modality alone — the way to skip Secondary Capture for CT, MR, NM and PT while an ultrasound study's measurement screens, Secondary Capture too, stay for the mask review. Keep private tags cancels the profile's private-tag removal for that modality — it is meaningful only here, which is why the main editor has no such control. Everything else (birth date mask, date shift, remove private tags, remove overlay planes, fix VR, output transfer syntax) is a profile-wide decision and is set once in the main editor.
+Per-modality overrides — the editor lists each override with Edit/Delete buttons and an Add modality override… button. An override varies only what is genuinely modality-specific, so its editor — a window of its own, in front of the profile editor, which waits until it closes — offers the modality code, the set/remove/keep tag lists, Keep private tags, and Ignore SOP classes; on a file whose Modality matches, these layer on top of the profile. Ignore SOP classes here adds to the profile's SOP class filter for that modality alone — the way to skip Secondary Capture for CT, MR, NM and PT while an ultrasound study's measurement screens, Secondary Capture too, stay for the mask review. Keep private tags cancels the profile's private-tag removal for that modality — it is meaningful only here, which is why the main editor has no such control. Everything else (birth date mask, date shift, remove private tags, remove overlay planes, fix VR, output transfer syntax) is a profile-wide decision and is set once in the main editor.
 
 Tag picker — the Choose… button beside Remove tags and Keep tags opens the whole DICOM dictionary in its own window, as a tree of groups, each group opening to its tags with a checkbox. The window can be moved and resized, which is worth doing when working through a long list; the profile editor behind it is dimmed while it is open, because the picker takes a copy of the field's contents as it opens and anything typed into that field behind it would be overwritten on Apply. The search box matches on tag name, keyword or number ("patient", "0010", "InstitutionName" all work) and automatically opens the groups holding matches; Hide retired omits tags the standard has withdrawn. Apply writes the result back.
 
@@ -861,7 +861,9 @@ An image counts as covered when a mask region blanks part of it or it has been m
 
 What the check cannot do. It reads headers, not pixels, so text burned into an ordinary greyscale image — a name on a scanned film, say — is invisible to it. It names the kinds of object where burned-in text and embedded documents are found in practice and whether the run deals with them; finding nothing is not proof an export is clean.
 
-If any file fails during a run, the progress dialog is replaced by a dialog listing what failed and why — a file missing from an export is otherwise easy to miss, and a failed conversion means the export is incomplete. Up to twenty failures are listed by name; the Activity Log holds the full list. Every other file in the run is still exported.
+The run shows its progress in a window of its own, which can be moved out of the way while the main window waits. Cancel stops the run once the files in flight are finished; closing the window during a run asks first, then cancels and keeps the window open to show what was written. When the run ends, the window shows the summary and its button becomes Close.
+
+If any file fails during a run, the progress window is replaced by a list of what failed and why — a file missing from an export is otherwise easy to miss, and a failed conversion means the export is incomplete. Up to twenty failures are listed by name; the Activity Log holds the full list. Every other file in the run is still exported.
 
 Checking Zip export in the dialog (pre-checked when the profile's Zip export option is set) writes the run into a single compressed <output folder>\<export folder name>.zip instead of a folder, with the same PHI-safe layout inside the archive. The archive is assembled as a hidden temporary file and renamed into place when the run finishes, so a cancelled run keeps the files completed before the cancel, while a run that writes nothing — or fails while finalizing the archive — leaves no zip behind. An existing zip of the same name is replaced after confirmation.
 

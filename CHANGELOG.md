@@ -8,6 +8,16 @@
 - **Query results show each study's size.** Searches now ask the PACS for the number of series and images in each study, and a study's row shows them, for example "(3 series, 412 images)", so you can judge a retrieve before starting it. A PACS that does not report these leaves them off.
 - **The Worklist tab has a Cancel button** for a query in progress.
 
+### Changed
+
+- **The last panels that were dialogs are now windows.** The per-modality override editor, the tag profile editor and the Modification progress panel open in windows of their own that can be moved and resized, like the other editors. Each waits in front of the window that opened it.
+  - The tag profile editor no longer closes, losing what you typed, when a tag line does not parse.
+  - The Modification progress window keeps a run's outcome in one place: a run with failures shows its failure list in the same window instead of swapping one dialog for another. Closing the window during a run asks first, then cancels and stays open to show what was written.
+
+### Removed
+
+- **The Preview and Open in Viewer buttons at the bottom of Local Browse.** Both ignored the selection and acted on the whole download folder. Preview in particular read every file in it to build one enormous preview, behind a progress box with no way to cancel, so on a large download folder it could only be stopped by closing the application. Use a tree item's right-click menu instead: Preview Images opens a study's overview or a series' viewer, and Open in Viewer opens the item in the external viewer.
+
 ### Fixed
 
 - **A server that stops answering no longer hangs a query.** Study searches, series listings and worklist queries had no time limit. A server that accepted the connection and then said nothing left the query waiting forever: on the Worklist tab, Query Worklist stayed disabled until the application was restarted, and even Clear could not end the wait. Connecting now gives up after the profile's Connect timeout. Once connected, a query fails if the server sends nothing for 60 seconds, and every response restarts the clock, so a long result that keeps arriving is never cut off. Cancel and Clear now end a query at once. A query cut short part-way keeps what arrived and says the list is incomplete; it used to present a partial list as complete. A cancelled worklist query no longer fills the table afterwards.

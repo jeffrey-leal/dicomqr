@@ -18,6 +18,7 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/suyashkumar/dicom/pkg/tag"
@@ -129,9 +130,16 @@ func formatTags(tags []tag.Tag) string {
 	return strings.Join(lines, "\n")
 }
 
-// showTagProfileEditor opens a dialog for creating or editing a TagProfile.
-// onSave is called with the updated profile when the user confirms.
-func showTagProfileEditor(w fyne.Window, p TagProfile, onSave func(TagProfile)) {
+// showTagProfileEditor opens a window for creating or editing a TagProfile,
+// owned by and blocking parent (the Preferences window): Save writes into
+// Preferences' pending list, which must not change underneath, and closing
+// Preferences takes this window with it. Unkeyed — blocking already makes a
+// second one unreachable. onSave is called with the updated profile once it
+// validates; until then the window stays open, so a bad tag line never throws
+// away what was typed (the confirm dialog this replaced hid first).
+func showTagProfileEditor(a fyne.App, parent fyne.Window, p TagProfile, onSave func(TagProfile)) {
+	var w fyne.Window // this editor's own window, assigned as it opens
+
 	nameEntry := widget.NewEntry()
 	nameEntry.SetText(p.Name)
 
@@ -161,28 +169,55 @@ func showTagProfileEditor(w fyne.Window, p TagProfile, onSave func(TagProfile)) 
 	tagEntry.SetText(formatTags(p.Tags))
 	tagEntry.SetPlaceHolder("One tag per line, e.g.\n0008,0020\n0010,0010")
 
-	form := container.NewVBox(
-		widget.NewForm(
-			widget.NewFormItem("Name", nameEntry),
-			widget.NewFormItem("Color", container.NewHBox(swatch, changeColorBtn)),
-			widget.NewFormItem("Tags", tagEntry),
-		),
+	form := widget.NewForm(
+		widget.NewFormItem("Name", nameEntry),
+		widget.NewFormItem("Color", container.NewHBox(swatch, changeColorBtn)),
+		widget.NewFormItem("Tags", tagEntry),
 	)
 
-	dialog.ShowCustomConfirm("Edit Tag Profile", "Save", "Cancel", form, func(save bool) {
-		if !save {
-			return
-		}
+	cancelBtn := widget.NewButton("Cancel", func() { w.Close() })
+	saveBtn := widget.NewButton("Save", func() {
 		tags, err := parseTags(tagEntry.Text)
 		if err != nil {
 			dialog.ShowError(err, w)
 			return
 		}
-		onSave(TagProfile{
-			Name:    nameEntry.Text,
-			Color:   pendingColor,
-			Tags:    tags,
-			Enabled: p.Enabled,
-		})
-	}, w)
+		// Built from p, so a field this window does not edit survives.
+		updated := p
+		updated.Name = nameEntry.Text
+		updated.Color = pendingColor
+		updated.Tags = tags
+		w.Close()
+		onSave(updated)
+	})
+	saveBtn.Importance = widget.HighImportance
+	buttonRow := container.NewBorder(
+		widget.NewSeparator(), nil, nil, nil,
+		container.New(
+			layout.NewCustomPaddedLayout(modEditorMargin, modEditorMargin, modEditorMargin, modEditorMargin),
+			container.NewHBox(layout.NewSpacer(), cancelBtn, saveBtn)),
+	)
+	// The Tags entry scrolls on its own, so the body keeps the scroll gutter
+	// on its right (scrollgutter.go).
+	body := container.NewVScroll(container.New(
+		layout.NewCustomPaddedLayout(modEditorMargin, modEditorMargin, modEditorMargin,
+			max(modEditorMargin, scrollGutterWidth())),
+		form))
+	body.SetMinSize(fyne.NewSize(0, 200))
+	minWidth := canvas.NewRectangle(color.Transparent)
+	minWidth.SetMinSize(fyne.NewSize(460, 0))
+
+	title := "Edit Tag Profile"
+	if p.Name != "" {
+		title += " — " + p.Name
+	}
+	openOwnedWindow(a, windowSpec{
+		Title:    title,
+		Size:     fyne.NewSize(520, 440),
+		Parent:   parent,
+		Blocking: true,
+	}, func(win fyne.Window) fyne.CanvasObject {
+		w = win
+		return container.NewStack(minWidth, container.NewBorder(nil, buttonRow, nil, nil, body))
+	})
 }

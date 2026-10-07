@@ -8,7 +8,6 @@ import (
 	"image/color"
 	"image/draw"
 	"math"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -78,28 +77,6 @@ func chapterPaths(chapters []chapter) []string {
 		paths[i] = c.path
 	}
 	return paths
-}
-
-// collectDicomFiles walks dir and returns one chapter per .dcm file it holds,
-// ordered by InstanceNumber.
-func collectDicomFiles(dir string) ([]chapter, error) {
-	var paths []string
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil || info.IsDir() {
-			return nil
-		}
-		if strings.EqualFold(filepath.Ext(path), ".dcm") {
-			paths = append(paths, path)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	if len(paths) == 0 {
-		return nil, errors.New("no DICOM files found in: " + dir)
-	}
-	return scanChapters(paths, nil), nil
 }
 
 // imageAnnotations holds the overlay text for a single DICOM image, organised
@@ -1670,17 +1647,6 @@ func showStudyOverviewWindow(a fyne.App, parent fyne.Window, title string, serie
 		win.Resize(fyne.NewSize(float32(cols)*(cellSize.Width+4)+40, 560))
 		win.Show()
 	})
-}
-
-// showDicomViewer opens the DICOM preview window for all images in folder.
-// Collection magic-byte-checks every file in the tree, which can take a while
-// for a large download folder, so a modal busy dialog over parent covers it.
-// Must be called from a non-UI goroutine.
-func showDicomViewer(a fyne.App, parent fyne.Window, folder string) {
-	busy := showBusyDialog(parent, "Generating preview", "Scanning folder for DICOM files…")
-	chapters, collectErr := collectDicomFiles(folder)
-	busy.hide()
-	openViewerWindow(a, "DICOM Preview — "+filepath.Base(folder), chapters, collectErr)
 }
 
 // showDicomViewerPaths opens the DICOM preview window for a specific set of files.

@@ -956,15 +956,49 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 		widget.NewSeparator(),
 		container.NewHBox(layout.NewSpacer(), cancelBtn),
 	)
-	dlg := dialog.NewCustomWithoutButtons("Modification — "+profileName, container.NewPadded(content), w)
-	dlg.Resize(fyne.NewSize(460, 0))
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancelBtn.OnTapped = func() {
+	running := true // UI goroutine only
+	requestCancel := func() {
 		cancel()
 		cancelBtn.Disable()
 		statusLbl.SetText("Cancelling — waiting for files in flight…")
 	}
+	cancelBtn.OnTapped = requestCancel
+
+	// A window rather than a dialog, so a long export can be moved out of the
+	// way; it blocks the main window, as the dialog did, since the run reads
+	// from the download folder that window manages. OnClosed cancels as a
+	// backstop for any route out — closing the main window, say — so a run
+	// never outlives its progress window.
+	win := openOwnedWindow(fyne.CurrentApp(), windowSpec{
+		Title:    "Modification — " + profileName,
+		Size:     fyne.NewSize(520, 220),
+		Parent:   w,
+		Blocking: true,
+		OnClosed: cancel,
+	}, func(fyne.Window) fyne.CanvasObject {
+		return container.New(
+			layout.NewCustomPaddedLayout(modEditorMargin, modEditorMargin, modEditorMargin, modEditorMargin),
+			content)
+	})
+	// The title-bar X during a run asks first, then cancels and keeps the
+	// window open: the summary of what was written before the cancel is worth
+	// seeing, and a window closed mid-run would have nowhere to show it. Once
+	// the run is over, X simply closes.
+	win.SetCloseIntercept(func() {
+		if !running {
+			win.Close()
+			return
+		}
+		dialog.ShowConfirm("Cancel the export?",
+			"The export is still running. Cancel it?\n\nThis window stays open to show what was written before it stopped.",
+			func(ok bool) {
+				if ok && running {
+					requestCancel()
+				}
+			}, win)
+	})
 
 	go func() {
 		logInfo("modify: profile %q, %d file(s) → %s", profileName, total, outDir)
@@ -1078,24 +1112,24 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 			if res.DicomdirError != "" {
 				msg += fmt.Sprintf("; DICOMDIR index could not be written (%s)", res.DicomdirError)
 			}
+			running = false
 			// Failures have to be impossible to walk past: an export missing
 			// files still looks finished, and a transfer-syntax conversion that
 			// could not run is exactly the case where the user must know the
-			// export is incomplete. Replace the progress dialog outright rather
+			// export is incomplete. Replace the progress view outright rather
 			// than leaving the count in a status line nobody rereads.
 			if res.Failed > 0 {
-				dlg.Hide()
-				showModificationFailureDialog(w, profileName, msg, res)
+				win.SetTitle("Modification — " + profileName + " — completed with errors")
+				win.SetContent(modificationFailureContent(msg, res, win.Close))
+				win.Resize(fyne.NewSize(660, 560))
 				return
 			}
 			statusLbl.SetText(msg)
 			cancelBtn.SetText("Close")
-			cancelBtn.OnTapped = func() { dlg.Hide() }
+			cancelBtn.OnTapped = win.Close
 			cancelBtn.Enable()
 		})
 	}()
-
-	dlg.Show()
 }
 
 // modifyFailureListCap bounds how many failures the warning dialog spells out.
@@ -1103,15 +1137,16 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 // every one of them — is the better place to look.
 const modifyFailureListCap = 20
 
-// showModificationFailureDialog reports a run that finished with per-file
-// failures. It replaces the progress dialog, so the run cannot be dismissed
-// without the failures having been on screen.
+// modificationFailureContent reports a run that finished with per-file
+// failures. It replaces the progress view in the run's window, so the run
+// cannot be dismissed without the failures having been on screen; onClose is
+// the Close button's action.
 //
 // Each line names the file and the reason the engine recorded, which for a
 // transfer-syntax conversion is the syntax that has no built-in decoder — the
 // one piece of information that tells the user whether the export can be
 // repeated successfully at all.
-func showModificationFailureDialog(w fyne.Window, profileName, summary string, res modifyResult) {
+func modificationFailureContent(summary string, res modifyResult, onClose func()) fyne.CanvasObject {
 	head := widget.NewLabel(summary)
 	head.Wrapping = fyne.TextWrapWord
 
@@ -1142,7 +1177,17 @@ func showModificationFailureDialog(w fyne.Window, profileName, summary string, r
 	tail.TextStyle = fyne.TextStyle{Italic: true}
 	tail.Wrapping = fyne.TextWrapWord
 
-	content := container.NewVBox(head, widget.NewSeparator(), lead, listBox, tail)
-	dialog.ShowCustom("Modification — "+profileName+" — completed with errors",
-		"Close", container.NewPadded(content), w)
+	closeBtn := widget.NewButton("Close", onClose)
+	buttonRow := container.NewBorder(widget.NewSeparator(), nil, nil, nil,
+		container.New(
+			layout.NewCustomPaddedLayout(modEditorMargin, modEditorMargin, modEditorMargin, modEditorMargin),
+			container.NewHBox(layout.NewSpacer(), closeBtn)))
+	// The failure list fills whatever height the window is given; the summary
+	// above it and the note below stay put.
+	body := container.NewBorder(
+		container.NewVBox(head, widget.NewSeparator(), lead), tail, nil, nil, listBox)
+	return container.NewBorder(nil, buttonRow, nil, nil,
+		container.New(
+			layout.NewCustomPaddedLayout(modEditorMargin, modEditorMargin, modEditorMargin, modEditorMargin),
+			body))
 }

@@ -549,7 +549,7 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 			nameLabel := widget.NewLabel(fmt.Sprintf("%s  (%d tags)",
 				pendingTagProfiles[i].Name, len(pendingTagProfiles[i].Tags)))
 			editBtn := widget.NewButton("Edit", func() {
-				showTagProfileEditor(w, pendingTagProfiles[i], func(updated TagProfile) {
+				showTagProfileEditor(a, w, pendingTagProfiles[i], func(updated TagProfile) {
 					updated.Enabled = pendingTagProfiles[i].Enabled
 					pendingTagProfiles[i] = updated
 					buildTagProfileList()
@@ -575,7 +575,7 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 			Color:   color.RGBA{R: 0x00, G: 0x80, B: 0xFF, A: 0xFF},
 			Enabled: true,
 		}
-		showTagProfileEditor(w, newP, func(added TagProfile) {
+		showTagProfileEditor(a, w, newP, func(added TagProfile) {
 			pendingTagProfiles = append(pendingTagProfiles, added)
 			buildTagProfileList()
 		})

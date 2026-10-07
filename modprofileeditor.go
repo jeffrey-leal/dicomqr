@@ -873,75 +873,90 @@ func perModalityPreservedNote(p ModProfile) fyne.CanvasObject {
 	return container.NewVBox(notes...)
 }
 
-// showPerModalityEditor opens the nested dialog editing one per-modality
-// override on top of the main editor dialog. taken lists the other override
-// codes for the collision check. onSave receives the validated block under
-// its (possibly renamed) uppercase modality code.
-func showPerModalityEditor(a fyne.App, w fyne.Window, code string, p ModProfile, taken []string,
+// showPerModalityEditor opens a window editing one per-modality override,
+// owned by and blocking parent (the profile editor's window): Save writes into
+// that editor's working copy of the overrides, so it must not change
+// underneath, and closing the profile editor takes this window with it.
+// Unkeyed — blocking already makes a second one unreachable. taken lists the
+// other override codes for the collision check. onSave receives the validated
+// block under its (possibly renamed) uppercase modality code.
+func showPerModalityEditor(a fyne.App, parent fyne.Window, code string, p ModProfile, taken []string,
 	imageStartDir string, onSave func(newCode string, updated ModProfile)) {
 
 	ed := newPerModalityEditor(code, p, taken)
-	ed.fields.sets.attach(a, w)
-	ed.fields.masks.attach(a, w, imageStartDir)
-
-	form := widget.NewForm(
-		widget.NewFormItem("Modality", ed.codeEntry),
-		widget.NewFormItem("Set values", ed.fields.sets.canvasObject()),
-		widget.NewFormItem("Remove tags",
-			tagListField(a, w, ed.fields.removes, "Choose tags to remove")),
-		widget.NewFormItem("Keep tags",
-			tagListField(a, w, ed.fields.keep, "Choose tags to keep")),
-		widget.NewFormItem("Keep private tags", ed.keepPrivCheck),
-		// Adds to the profile's SOP class filter for this modality alone: the
-		// way to skip Secondary Capture in CT/MR/NM/PT without touching an
-		// ultrasound study's measurement screens.
-		widget.NewFormItem("Ignore SOP classes", container.NewVBox(ed.ignoreSOPEntry, ed.ignoreSOPNames)),
-		// Regions here replace the profile's rather than adding to them: this
-		// modality's images have their own layout, which is the whole reason
-		// for stating them separately.
-		widget.NewFormItem("Mask regions", ed.fields.masks.canvasObject()),
-	)
-
-	sections := []fyne.CanvasObject{form}
-	if note := perModalityPreservedNote(p); note != nil {
-		sections = append(sections, note)
-	}
-
-	// Same stay-open-on-validation-failure button pattern as the main editor.
-	var dlg dialog.Dialog
-	cancelBtn := widget.NewButton("Cancel", func() { dlg.Hide() })
-	saveBtn := widget.NewButton("Save", nil)
-	saveBtn.Importance = widget.HighImportance
-	buttonRow := container.NewBorder(
-		widget.NewSeparator(), nil, nil, nil,
-		container.NewPadded(container.NewHBox(layout.NewSpacer(), cancelBtn, saveBtn)),
-	)
-
-	// padForScrollbar: the Remove/Keep entries scroll on their own once their
-	// lists outgrow their visible rows, and without the gutter their scrollbar
-	// sits directly under this scroll's.
-	formScroll := container.NewVScroll(padForScrollbar(container.NewVBox(sections...)))
-	formScroll.SetMinSize(fyne.NewSize(0, 340))
-	minWidth := canvas.NewRectangle(color.Transparent)
-	minWidth.SetMinSize(fyne.NewSize(520, 0))
-	content := container.NewStack(minWidth,
-		container.NewBorder(nil, buttonRow, nil, nil, formScroll))
 	title := "Edit Modality Override"
 	if code == "" {
 		title = "New Modality Override"
+	} else {
+		title += " — " + code
 	}
-	dlg = dialog.NewCustomWithoutButtons(title, content, w)
-	dlg.Resize(fyne.NewSize(560, 440))
 
-	saveBtn.OnTapped = func() {
-		newCode, updated, err := ed.validate()
-		if err != nil {
-			dialog.ShowError(err, w)
-			return
+	openOwnedWindow(a, windowSpec{
+		Title:    title,
+		Size:     fyne.NewSize(620, 600),
+		Parent:   parent,
+		Blocking: true,
+	}, func(win fyne.Window) fyne.CanvasObject {
+		// Built here, not before: the Set values list, the mask list and the
+		// tag pickers open windows of their own, which must be parented to
+		// this window rather than the editor behind it.
+		ed.fields.sets.attach(a, win)
+		ed.fields.masks.attach(a, win, imageStartDir)
+
+		form := widget.NewForm(
+			widget.NewFormItem("Modality", ed.codeEntry),
+			widget.NewFormItem("Set values", ed.fields.sets.canvasObject()),
+			widget.NewFormItem("Remove tags",
+				tagListField(a, win, ed.fields.removes, "Choose tags to remove")),
+			widget.NewFormItem("Keep tags",
+				tagListField(a, win, ed.fields.keep, "Choose tags to keep")),
+			widget.NewFormItem("Keep private tags", ed.keepPrivCheck),
+			// Adds to the profile's SOP class filter for this modality alone: the
+			// way to skip Secondary Capture in CT/MR/NM/PT without touching an
+			// ultrasound study's measurement screens.
+			widget.NewFormItem("Ignore SOP classes", container.NewVBox(ed.ignoreSOPEntry, ed.ignoreSOPNames)),
+			// Regions here replace the profile's rather than adding to them: this
+			// modality's images have their own layout, which is the whole reason
+			// for stating them separately.
+			widget.NewFormItem("Mask regions", ed.fields.masks.canvasObject()),
+		)
+
+		sections := []fyne.CanvasObject{form}
+		if note := perModalityPreservedNote(p); note != nil {
+			sections = append(sections, note)
 		}
-		dlg.Hide()
-		onSave(newCode, updated)
-	}
 
-	dlg.Show()
+		// Same stay-open-on-validation-failure button pattern as the main editor.
+		cancelBtn := widget.NewButton("Cancel", func() { win.Close() })
+		saveBtn := widget.NewButton("Save", func() {
+			newCode, updated, err := ed.validate()
+			if err != nil {
+				dialog.ShowError(err, win)
+				return
+			}
+			win.Close()
+			onSave(newCode, updated)
+		})
+		saveBtn.Importance = widget.HighImportance
+		buttonRow := container.NewBorder(
+			widget.NewSeparator(), nil, nil, nil,
+			container.New(
+				layout.NewCustomPaddedLayout(modEditorMargin, modEditorMargin, modEditorMargin, modEditorMargin),
+				container.NewHBox(layout.NewSpacer(), cancelBtn, saveBtn)),
+		)
+
+		// The margin goes inside the scroll so the scrollbar tracks the window
+		// edge, and the right inset is the scroll gutter: the Remove/Keep
+		// entries scroll on their own once their lists outgrow their rows, and
+		// their scrollbar must stay out of this one's grab zone.
+		formScroll := container.NewVScroll(container.New(
+			layout.NewCustomPaddedLayout(modEditorMargin, modEditorMargin, modEditorMargin,
+				max(modEditorMargin, scrollGutterWidth())),
+			container.NewVBox(sections...)))
+		formScroll.SetMinSize(fyne.NewSize(0, 240))
+		minWidth := canvas.NewRectangle(color.Transparent)
+		minWidth.SetMinSize(fyne.NewSize(520, 0))
+		return container.NewStack(minWidth,
+			container.NewBorder(nil, buttonRow, nil, nil, formScroll))
+	})
 }

@@ -1463,21 +1463,15 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 		menu.ShowAtPosition(fyne.NewPos(pos.X, max(0, pos.Y-menu.MinSize().Height)))
 	})
 
-	localOpenInViewerBtn := widget.NewButton("Open in Viewer", func() { openInViewer(scanDir) })
-	if cfg.ViewerPath == "" {
-		localOpenInViewerBtn.Disable()
-	}
-
+	// Previewing and the external viewer are on each tree item's right-click
+	// menu (Preview Images, Open in Viewer), acting on the item clicked. The
+	// bottom bar once had Preview and Open in Viewer buttons too, but they
+	// ignored the selection and acted on the whole download folder — Preview
+	// read every file in it behind a busy dialog with no way to cancel — so
+	// they were removed (user decision 2026-10-07).
 	bottomBar := container.NewVBox(
 		widget.NewSeparator(),
 		container.NewHBox(
-			widget.NewButton("Preview", func() {
-				if scanDir == "" {
-					return
-				}
-				go showDicomViewer(a, w, scanDir)
-			}),
-			localOpenInViewerBtn,
 			pushSelectedBtn,
 			modifySelectedBtn,
 			deleteSelectedBtn,
@@ -1501,11 +1495,6 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 
 	return content, func() {
 		folderLabel.SetText(cfg.DownloadDir)
-		if cfg.ViewerPath == "" {
-			localOpenInViewerBtn.Disable()
-		} else {
-			localOpenInViewerBtn.Enable()
-		}
 		// The download directory changed in Preferences: switch to that
 		// directory's own index file and reload the tree from it.
 		if cat != nil && cfg.DownloadDir != "" && cat.Dir() != cfg.DownloadDir {
