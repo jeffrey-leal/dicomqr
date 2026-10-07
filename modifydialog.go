@@ -187,6 +187,8 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	}
 	tsSelect := widget.NewSelect(modProfileTSLabels, nil)
 	tsSelect.SetSelected(transferSyntaxPrefLabel(resolved.TransferSyntax))
+	auditCheck := widget.NewCheck(auditCheckLabel, nil)
+	auditCheck.SetChecked(resolved.AuditTags)
 
 	// Row order is the profile editor's, deliberately — the two Options blocks
 	// show the same fields and are read against each other, so they must not be
@@ -202,6 +204,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		widget.NewFormItem("Shift dates (days)", shiftEntry),
 		widget.NewFormItem("Fix VR", fixvrSelect),
 		widget.NewFormItem("Output transfer syntax", tsSelect),
+		widget.NewFormItem(auditRowLabel, auditCheck),
 	)
 
 	// Birth-date advisory, under the row it is about. resolved already carries
@@ -762,6 +765,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 			edited.FixVR = sel
 		}
 		edited.TransferSyntax = transferSyntaxPrefFromLabel(tsSelect.Selected)
+		edited.AuditTags = auditCheck.Checked
 		// Unlike Zip and Flat (pure destination-shape choices read directly
 		// into outLayout below, never part of modifyParams), DICOMDIR is an
 		// engine-level option compileModifyParams reads — see modifyengine.go.
@@ -772,6 +776,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 			dialog.ShowError(err, win)
 			return
 		}
+		params.auditProfile = profileName // run state, for the De-identification Method text
 
 		// Flagged documents the user chose to leave out go by path — see the
 		// PHI check above.

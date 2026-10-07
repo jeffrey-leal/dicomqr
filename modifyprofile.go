@@ -13,8 +13,8 @@ package main
 // preserved.
 //
 // The JSON format and merge semantics otherwise follow dicomtool, with these
-// deliberate divergences: `zip`, `flat`, `transfersyntax` and `nooverlays` are
-// dicomqr-only (dicomtool ignores unknown keys); dicomtool's `maskrows` is
+// deliberate divergences: `zip`, `flat`, `transfersyntax`, `nooverlays` and
+// `audittags` are dicomqr-only (dicomtool ignores unknown keys); dicomtool's `maskrows` is
 // unsupported here, dropped on load and stripped on save; the `uid` suffix
 // option is removed — the value is preserved through load and save but a
 // profile carrying it is refused at run time in favour of Remap UIDs; and
@@ -107,6 +107,19 @@ type ModProfile struct {
 	// `nooverlays` and drops it when it saves); profile-wide, like the other
 	// scalar options.
 	NoOverlays bool `json:"nooverlays,omitempty"`
+
+	// AuditTags marks every exported file as de-identified, as PS3.15 expects
+	// of a de-identified object: Patient Identity Removed (0012,0062) = YES, a
+	// De-identification Method (0012,0063) naming this application and profile
+	// — appended to any method an earlier de-identification recorded, never
+	// replacing it — and, when the file's dates were actually shifted,
+	// Longitudinal Temporal Information Modified (0028,0303) = MODIFIED. A tag
+	// the profile's own Set values write keeps the profile's value. The method
+	// text is deliberately not configurable, and no De-identification Method
+	// Code Sequence (0012,0064) is written: its codes assert conformance to
+	// specific options of the standard's confidentiality profiles, which a
+	// user-authored profile may or may not meet. dicomqr-only; profile-wide.
+	AuditTags bool `json:"audittags,omitempty"`
 
 	// TransferSyntax is the syntax every exported file is written in, using the
 	// same tokens as ServerProfile.TransferSyntax: tsPrefAny (empty) writes each
@@ -347,6 +360,7 @@ func mergeModProfiles(base, override ModProfile) ModProfile {
 
 	result.Priv = base.Priv || override.Priv
 	result.NoOverlays = base.NoOverlays || override.NoOverlays
+	result.AuditTags = base.AuditTags || override.AuditTags
 	result.Dicomdir = base.Dicomdir || override.Dicomdir
 	result.Verbose = base.Verbose || override.Verbose
 	result.Zip = base.Zip || override.Zip

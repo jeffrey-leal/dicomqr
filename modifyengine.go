@@ -6,9 +6,11 @@ package main
 //
 //	parse → ignoretype → ignoremodality → ignoresopclass → per-modality overrides → fixvr →
 //	remove + noprivate + nooverlays → date shift → dob mask → uid remap → set →
-//	transfer syntax
+//	audit tags → transfer syntax
 //
-// The transfer-syntax conversion is dicomqr's own step, with no dicomtool
+// The audit tags (Patient Identity Removed, De-identification Method) are
+// dicomqr's own, written after removal so no rule can strip them. The
+// transfer-syntax conversion is dicomqr's own step, with no dicomtool
 // equivalent, and comes last deliberately: decompressing pixel data rewrites
 // the attributes that describe it (Photometric Interpretation, Planar
 // Configuration), so it must have the final say over them.
@@ -34,6 +36,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -94,6 +97,13 @@ type modifyParams struct {
 	// through modifyParams) this is an engine-level option both
 	// runModification and runModificationToZip honor identically.
 	dicomdir bool
+	// auditTags marks each exported file as de-identified (applyDeidentAudit).
+	// Not actionable on its own: a run that changed nothing must not stamp
+	// files YES. auditProfile is run state the caller sets after compiling —
+	// the profile's name, which compileModifyParams never sees — and goes into
+	// the De-identification Method text.
+	auditTags    bool
+	auditProfile string
 }
 
 // compileModifyParams validates p and parses its tag references into a
@@ -202,6 +212,7 @@ func compileModifyParams(p ModProfile) (modifyParams, error) {
 	mp.mayMask = len(p.MaskRegions) > 0
 
 	mp.dicomdir = p.Dicomdir
+	mp.auditTags = p.AuditTags
 
 	if len(p.PerModality) > 0 {
 		normalized := make(map[string]ModProfile, len(p.PerModality))
@@ -1609,10 +1620,26 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 		if err != nil {
 			return false, ds, notes, err
 		}
-		// Replace every occurrence at any nesting depth; append at the top level
-		// only when the tag is absent throughout the dataset.
+		// Replace every occurrence at any nesting depth; add at the top level
+		// only when the tag is absent throughout the dataset — in tag order, not
+		// at the end, where it would follow the pixel data.
 		if !replaceInElements(ds.Elements, newElem) {
-			ds.Elements = append(ds.Elements, newElem)
+			ds.Elements = insertElementSorted(ds.Elements, newElem)
+		}
+	}
+
+	if p.auditTags {
+		setTags := make(map[tag.Tag]bool, len(edits))
+		for _, e := range edits {
+			setTags[e.tag] = true
+		}
+		shifted := false
+		if shiftDaysStr != "" {
+			n, _ := strconv.Atoi(shiftDaysStr) // validated above
+			shifted = n != 0
+		}
+		if err := applyDeidentAudit(&ds, deidentMethodText(p.auditProfile), shifted, setTags); err != nil {
+			return false, ds, notes, fmt.Errorf("de-identification audit tags: %w", err)
 		}
 	}
 
@@ -1747,8 +1774,103 @@ func applyEdit(ds *sdicom.Dataset, e tagEdit) error {
 			return nil
 		}
 	}
-	// Tag not present — append it.
-	ds.Elements = append(ds.Elements, newElem)
+	// Tag not present — add it in tag order.
+	ds.Elements = insertElementSorted(ds.Elements, newElem)
+	return nil
+}
+
+// insertElementSorted adds e to a dataset's top-level elements at its place in
+// ascending tag order. The writer emits elements in slice order, and DICOM
+// requires them ascending: appended, an element the source lacked — a Set
+// value for an absent tag, a birth date added by the mask, the audit tags —
+// was written after the pixel data, where strict validators reject it and a
+// header reader that stops at the pixel data (readDicomHeader, the folder
+// scan) never sees it. Elements already present are left where they are.
+func insertElementSorted(elems []*sdicom.Element, e *sdicom.Element) []*sdicom.Element {
+	i := 0
+	for i < len(elems) && tagLess(elems[i].Tag, e.Tag) {
+		i++
+	}
+	return slices.Insert(elems, i, e)
+}
+
+func tagLess(a, b tag.Tag) bool {
+	if a.Group != b.Group {
+		return a.Group < b.Group
+	}
+	return a.Element < b.Element
+}
+
+// De-identification audit tags (PS3.15 E.1.1, PS3.3 C.7.1.1 / C.7.6.1).
+var (
+	patientIdentityRemovedTag  = tag.Tag{Group: 0x0012, Element: 0x0062}
+	deidentificationMethodTag  = tag.Tag{Group: 0x0012, Element: 0x0063}
+	longitudinalTemporalModTag = tag.Tag{Group: 0x0028, Element: 0x0303}
+	deidentMethodMaxLen        = 64 // LO
+)
+
+// deidentMethodText is the De-identification Method value a run records:
+// the application, its version and the profile. Clipped to LO's 64
+// characters, and with any backslash — the value delimiter — replaced, so
+// one method is always exactly one value.
+func deidentMethodText(profile string) string {
+	text := "dicomqr " + version
+	if p := strings.TrimSpace(profile); p != "" {
+		text += " profile " + p
+	}
+	text = strings.ReplaceAll(text, `\`, "/")
+	if utf8.RuneCountInString(text) > deidentMethodMaxLen {
+		text = string([]rune(text)[:deidentMethodMaxLen])
+	}
+	return text
+}
+
+// applyDeidentAudit writes the de-identification audit tags at the top level
+// of ds: Patient Identity Removed = YES; De-identification Method with method
+// appended to whatever methods an earlier de-identification recorded (the
+// attribute is multi-valued so that each step can be listed; an identical
+// value already present is not repeated); and, when shifted, Longitudinal
+// Temporal Information Modified = MODIFIED. A tag in setTags — one the
+// profile's own Set values wrote — is left with the profile's value.
+func applyDeidentAudit(ds *sdicom.Dataset, method string, shifted bool, setTags map[tag.Tag]bool) error {
+	put := func(t tag.Tag, values []string) error {
+		if setTags[t] {
+			return nil
+		}
+		e, err := sdicom.NewElement(t, values)
+		if err != nil {
+			return err
+		}
+		for i, existing := range ds.Elements {
+			if existing.Tag == t {
+				ds.Elements[i] = e
+				return nil
+			}
+		}
+		ds.Elements = insertElementSorted(ds.Elements, e)
+		return nil
+	}
+
+	if err := put(patientIdentityRemovedTag, []string{"YES"}); err != nil {
+		return err
+	}
+	var methods []string
+	if existing, err := ds.FindElementByTag(deidentificationMethodTag); err == nil {
+		for _, v := range elemStringComponents(existing) {
+			if v = strings.TrimSpace(v); v != "" {
+				methods = append(methods, v)
+			}
+		}
+	}
+	if !slices.Contains(methods, method) {
+		methods = append(methods, method)
+	}
+	if err := put(deidentificationMethodTag, methods); err != nil {
+		return err
+	}
+	if shifted {
+		return put(longitudinalTemporalModTag, []string{"MODIFIED"})
+	}
 	return nil
 }
 

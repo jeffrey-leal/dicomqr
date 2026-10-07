@@ -551,7 +551,10 @@ func replaceElement(ds *sdicom.Dataset, newElem *sdicom.Element) {
 			return
 		}
 	}
-	ds.Elements = append(ds.Elements, newElem)
+	// In tag order, not appended: a colour decode adds Planar Configuration to
+	// a JPEG file that lacked it, and at the end it would follow the pixel data
+	// (see insertElementSorted).
+	ds.Elements = insertElementSorted(ds.Elements, newElem)
 }
 
 // setElementValue replaces (or adds) an element with the given value.

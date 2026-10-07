@@ -2,8 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Exports can be marked as de-identified.** A new profile option, *Mark as de-identified* (in the profile editor and the Modification window's Options, just below Output transfer syntax), records in every exported file what the DICOM standard expects of de-identified data. Patient Identity Removed (0012,0062) is set to YES. De-identification Method (0012,0063) names the application, its version and the profile, for example "dicomqr 1.24.0 profile base-deident". When dates are shifted, Longitudinal Temporal Information Modified (0028,0303) is set to MODIFIED. A file that was de-identified once before keeps the method recorded then, and this run's is added after it. A tag the profile's own Set values write keeps the profile's value. The option labels an export but removes nothing itself, so a profile with no other action is still refused. It is on in the shipped base-deident profile for new installations; existing profiles are unchanged until you tick it.
+
 ### Fixed
 
+- **Tags added to a file are written in their proper place.** A Set value for a tag the file did not have, a birth date added by the birth-date mask, and the Planar Configuration a colour decode adds to some JPEG files were all written at the very end of the file, after the image data. DICOM requires tags in ascending order: strict validators reject such files, and readers that stop at the image data, including dicomqr's own fast header reads, never saw those tags. They now go where they belong.
 - **The Activity Log no longer jumps back to the bottom while you read.** It refreshes once a second, and every refresh that brought new lines (all the time during a retrieve) scrolled it to the newest one, so earlier lines could not be read while anything was happening. It now follows new lines only while you are at the bottom. Scrolled up, the view holds still and a note says it is paused; scroll back to the bottom and it catches up. Refresh, Clear, or a change of level or filter still go to the newest line.
 - **A study whose series could not be listed can be expanded again.** Expanding a study in the query results lists its series with a query to the server, and the study was marked as listed before that query ran. If the query failed, because the server refused it or the connection dropped, the failure was ignored and the study stayed empty for the rest of the session, looking as if it had no series. Now the status bar and the Activity Log say the series could not be listed, any series that did arrive are kept, and collapsing and expanding the study tries again.
 

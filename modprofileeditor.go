@@ -163,6 +163,7 @@ type modProfileEditor struct {
 	overlaysCheck    *widget.Check
 	remapCheck       *widget.Check
 	tsSelect         *widget.Select
+	auditCheck       *widget.Check
 	zipCheck         *widget.Check
 	flatCheck        *widget.Check
 	dicomdirCheck    *widget.Check
@@ -228,6 +229,9 @@ func newModProfileEditor(name string, p ModProfile, cfg ModProfileConfig) *modPr
 
 	e.tsSelect = widget.NewSelect(modProfileTSLabels, nil)
 	e.tsSelect.SetSelected(transferSyntaxPrefLabel(p.TransferSyntax))
+
+	e.auditCheck = widget.NewCheck(auditCheckLabel, nil)
+	e.auditCheck.SetChecked(p.AuditTags)
 
 	e.zipCheck = widget.NewCheck("", nil)
 	e.zipCheck.SetChecked(p.Zip)
@@ -297,6 +301,7 @@ func (e *modProfileEditor) validate() (string, ModProfile, error) {
 	}
 	updated.RemapUIDs = e.remapCheck.Checked
 	updated.TransferSyntax = transferSyntaxPrefFromLabel(e.tsSelect.Selected)
+	updated.AuditTags = e.auditCheck.Checked
 	updated.Zip = e.zipCheck.Checked
 	updated.Flat = e.flatCheck.Checked
 	updated.Dicomdir = e.dicomdirCheck.Checked
@@ -435,6 +440,13 @@ func otherCodes(perMod map[string]ModProfile, exclude string) []string {
 // overwrite the first one's save.
 func modProfileEditorKey(name string) string { return "modprofile:" + name }
 
+// The audit-tags row, named identically in the profile editor and the
+// Modification window: the two Options blocks are read against each other.
+const (
+	auditRowLabel   = "Mark as de-identified"
+	auditCheckLabel = "Patient Identity Removed and De-identification Method"
+)
+
 // modEditorMargin is the inset between this window's controls and its frame.
 // A Fyne dialog is drawn with an inner padding of its own — which is why the
 // Modification dialog's controls sit inside a frame while these, in a plain
@@ -515,6 +527,7 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 		widget.NewFormItem("Shift dates (days)", ed.shiftDays),
 		widget.NewFormItem("Fix VR", ed.fixvr),
 		widget.NewFormItem("Output transfer syntax", ed.tsSelect),
+		widget.NewFormItem(auditRowLabel, ed.auditCheck),
 		widget.NewFormItem("Zip export", ed.zipCheck),
 		widget.NewFormItem("Flat export", ed.flatCheck),
 		widget.NewFormItem("Include DICOMDIR", ed.dicomdirCheck))
@@ -810,6 +823,9 @@ func perModalityPreservedNote(p ModProfile) fyne.CanvasObject {
 	}
 	if p.NoOverlays {
 		ignored = append(ignored, "nooverlays")
+	}
+	if p.AuditTags {
+		ignored = append(ignored, "audittags")
 	}
 	if p.Zip {
 		ignored = append(ignored, "zip")
