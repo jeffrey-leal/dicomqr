@@ -637,6 +637,7 @@ func buildContent(d Formatter) {
 
 	d.H2("5.3  Running a Search")
 	d.P("With the Filters panel open, click Search inside the panel, or click the Search button in the server row, or press Ctrl+Enter. The panel closes, the results tree clears, and the query is sent to the PACS. The status bar shows \"Querying…\" during the search and reports the number of studies returned when complete.")
+	d.P("A search cannot hang. Connecting gives up after the profile's Connect timeout, and once connected the search fails if the server sends nothing for 60 seconds; every match that arrives restarts the clock, so a long list that keeps coming is never cut off. If the server stops part-way, the studies already received are kept and the status bar says the list is incomplete and why, rather than reporting it as complete. The same limits apply when a study's series are listed and to worklist queries.")
 	d.P("Pressing Enter while the cursor is in the Patient Name, Patient ID, or Accession No field also runs the search and closes the panel.")
 
 	d.H2("5.4  Clearing the Search")
@@ -648,7 +649,7 @@ func buildContent(d Formatter) {
 	d.H2("6.1  Tree Structure")
 	d.P("Results are displayed in an expandable tree with three levels:")
 	d.P("Patient — one node per unique patient. The label shows the patient name and, where present, the patient ID in parentheses.")
-	d.P("Study — one or more studies under each patient. The label shows the study date, study description, accession number, and the set of modalities present in the study.")
+	d.P("Study — one or more studies under each patient. The label shows the study date, study description, accession number, the set of modalities present in the study, and — when the PACS reports them — the study's size, e.g. \"(3 series, 412 images)\", so you can judge a retrieve before starting it. The counts are requested with every search (Number of Study Related Series and Instances); a PACS that does not supply them simply leaves them off.")
 	d.P("Series — one or more series under each study. The label shows the series number, modality, series description, and image count.")
 	d.P("Results are sorted automatically: patients alphabetically by name, studies within a patient chronologically by date (oldest first), and series within a study numerically by series number.")
 	d.P("The tree starts fully collapsed after each search. Click the expand arrow next to a patient node to reveal its studies. Click the expand arrow next to a study node to load its series — dicomqr sends a separate C-FIND query to the PACS at this point to retrieve series-level information. The series list is fetched once per study per session; collapsing and re-expanding a study does not repeat the query. If that query fails — the server refuses it or the connection drops — the status bar says so and the study is not marked as loaded: collapse and expand it again to retry.")
@@ -901,11 +902,11 @@ func buildContent(d Formatter) {
 		{"Modality", "Restricts results to one modality. Select (any) to include all modalities."},
 		{"Scheduled date", "Today only (checked by default) — restricts to today's scheduled date. Uncheck to select a specific date using the calendar picker. Leave blank (unchecked, no date selected) to return all scheduled dates."},
 	})
-	d.P("Click Query Worklist or press Enter in any text field to run the query. Click Clear to reset all fields and clear the results.")
+	d.P("Click Query Worklist or press Enter in any text field to run the query. While it runs, Cancel stops it. Click Clear to reset all fields and clear the results. A worklist server that does not answer is given up on after the profile's Connect timeout (to connect) or 60 seconds without a response, and the status label says so — Query Worklist is never left disabled.")
 
 	d.H2("10.3  Results Table")
 	d.P("Results are shown in a table with columns: Patient, MRN, Accession, Date, Time, Modality, Procedure, and Station. Click any row to select it.")
-	d.P("Copy Accession and Copy Patient buttons copy the selected row's values to the clipboard. The status label shows the number of worklist items returned, or any error message.")
+	d.P("Copy Accession and Copy Patient buttons copy the selected row's values to the clipboard. The status label shows the number of worklist items returned, or any error message — and, if the server stopped part-way, the items received with a note that the list is incomplete.")
 
 	d.H2("10.4  Typical Use Cases")
 	d.Bullet("Verify a scheduled procedure — query by patient name or accession to confirm an order reached the worklist server before the patient arrives at the scanner.")
@@ -1118,6 +1119,7 @@ func buildContent(d Formatter) {
 		{"Query in progress", "`Querying…`"},
 		{"Loading results into the tree", "`Loading results… <N>/<total>`"},
 		{"Query complete", "`Query complete — <N> studies`"},
+		{"Query cut short (some studies received)", "`Query incomplete — <N> studies, then: <reason>`"},
 		{"Query error", "`Query error: <reason>`"},
 		{"Retrieve starting", "`Starting retrieve of <N> studies…`"},
 		{"Retrieve in progress", "`Retrieving study <N>/<total>…`"},

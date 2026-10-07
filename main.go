@@ -732,6 +732,7 @@ func main() {
 						for _, r := range batch {
 							model.addStudy(r.PatientName, r.PatientID, r.StudyInstanceUID,
 								r.StudyDate, r.StudyDescription, r.AccessionNumber, r.ModalitiesInStudy)
+							model.setStudyCounts(r.StudyInstanceUID, r.NumStudySeries, r.NumStudyInstances)
 						}
 						statusLabel.SetText(fmt.Sprintf("Loading results… %d/%d", shown, total))
 						tree.Refresh()
@@ -745,7 +746,16 @@ func main() {
 					model.applyFilter()
 					tree.Refresh()
 					queryProgress.Hide()
-					statusLabel.SetText(fmt.Sprintf("Query complete — %d studies", total))
+					if firstErr != nil {
+						// Some matches arrived before a query failed (or the
+						// server stopped responding): say the list is
+						// incomplete rather than present it as everything.
+						statusLabel.SetText(fmt.Sprintf("Query incomplete — %s, then: %v",
+							plural(total, "study", "studies"), firstErr))
+						logWarn("query: incomplete after %d studies: %v", total, firstErr)
+					} else {
+						statusLabel.SetText(fmt.Sprintf("Query complete — %d studies", total))
+					}
 				})
 			}()
 		}

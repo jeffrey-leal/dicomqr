@@ -161,10 +161,30 @@ func buildWorklistContent(w fyne.Window, cfg *Settings) (fyne.CanvasObject, func
 
 	var doQuery func()
 
-	clearBtn := widget.NewButton("Clear", func() {
+	// queryGen numbers the table's contents (UI goroutine only), as resultsGen
+	// does for the Query Results tree: Cancel, Clear and every new query bump
+	// it, and a query posts its results only if the number is unchanged — a
+	// query cancelled after it had collected its matches used to fill the
+	// table anyway.
+	var queryGen int
+	queryBtn := widget.NewButton("Query Worklist", func() { doQuery() })
+	cancelBtn := widget.NewButton("Cancel", nil)
+	cancelBtn.Disable()
+	stopQuery := func() {
 		if cancelQuery != nil {
 			cancelQuery()
 		}
+		queryGen++
+		queryBtn.Enable()
+		cancelBtn.Disable()
+	}
+	cancelBtn.OnTapped = func() {
+		stopQuery()
+		statusLbl.SetText("Worklist query cancelled.")
+	}
+
+	clearBtn := widget.NewButton("Clear", func() {
+		stopQuery()
 		patientNameEntry.SetText("")
 		patientIDEntry.SetText("")
 		accessionEntry.SetText("")
@@ -174,8 +194,6 @@ func buildWorklistContent(w fyne.Window, cfg *Settings) (fyne.CanvasObject, func
 		table.Refresh()
 		statusLbl.SetText("Ready.")
 	})
-
-	queryBtn := widget.NewButton("Query Worklist", func() { doQuery() })
 
 	patientNameEntry.OnSubmitted = func(_ string) { doQuery() }
 	patientIDEntry.OnSubmitted = func(_ string) { doQuery() }
@@ -226,16 +244,16 @@ func buildWorklistContent(w fyne.Window, cfg *Settings) (fyne.CanvasObject, func
 			"Modality":        modality,
 		}
 
-		if cancelQuery != nil {
-			cancelQuery()
-		}
+		stopQuery() // a query still running is superseded
 		ctx, cancel := context.WithCancel(context.Background())
 		cancelQuery = cancel
+		gen := queryGen
 
 		results = nil
 		table.Refresh()
 		statusLbl.SetText("Querying worklist…")
 		queryBtn.Disable()
+		cancelBtn.Enable()
 
 		cl := NewDicomClient(*chosen, cfg.LocalAETitle)
 
@@ -244,8 +262,12 @@ func buildWorklistContent(w fyne.Window, cfg *Settings) (fyne.CanvasObject, func
 			ch, err := cl.FindWorklist(ctx, params)
 			if err != nil {
 				fyne.Do(func() {
+					if gen != queryGen {
+						return
+					}
 					statusLbl.SetText("Worklist query error: " + err.Error())
 					queryBtn.Enable()
+					cancelBtn.Disable()
 				})
 				return
 			}
@@ -263,17 +285,23 @@ func buildWorklistContent(w fyne.Window, cfg *Settings) (fyne.CanvasObject, func
 			}
 
 			fyne.Do(func() {
+				if gen != queryGen {
+					return // cancelled, cleared or superseded meanwhile
+				}
 				results = collected
 				table.Refresh()
 				queryBtn.Enable()
-				if firstErr != nil && len(collected) == 0 {
+				cancelBtn.Disable()
+				switch {
+				case firstErr != nil && len(collected) == 0:
 					statusLbl.SetText("Worklist query error: " + firstErr.Error())
-				} else {
-					noun := "items"
-					if len(collected) == 1 {
-						noun = "item"
-					}
-					statusLbl.SetText(fmt.Sprintf("%d worklist %s", len(collected), noun))
+				case firstErr != nil:
+					// A server that stopped part-way: say the list is incomplete
+					// rather than present it as the whole worklist.
+					statusLbl.SetText(fmt.Sprintf("%s — incomplete: %v",
+						plural(len(collected), "worklist item", "worklist items"), firstErr))
+				default:
+					statusLbl.SetText(plural(len(collected), "worklist item", "worklist items"))
 				}
 			})
 		}()
@@ -315,7 +343,7 @@ func buildWorklistContent(w fyne.Window, cfg *Settings) (fyne.CanvasObject, func
 			widget.NewLabel("Modality"), modalitySelect,
 			widget.NewLabel("Scheduled date"), container.NewBorder(nil, nil, todayCheck, nil, dateEntry),
 		),
-		container.NewHBox(queryBtn, clearBtn),
+		container.NewHBox(queryBtn, cancelBtn, clearBtn),
 	)
 
 	bottomBar := container.NewVBox(

@@ -33,6 +33,7 @@ type resultNode struct {
 	sopInstanceUID    string
 
 	seriesLoaded bool   // true once a series C-FIND has been fired for this study node
+	counted      bool   // study nodes: setStudyCounts has added the size to label
 	parentID     string // empty for patient nodes; patID for study nodes; sID for series nodes
 
 	// Raw DICOM field values retained to derive the local download folder
@@ -114,6 +115,30 @@ func (m *resultsModel) addStudy(patientName, patientID, studyUID, studyDate, stu
 		parent := m.nodes[patID]
 		m.sortedInsert(&parent.children, sID)
 	}
+}
+
+// setStudyCounts adds the study's size, as a STUDY-level query reported it, to
+// its row — "(3 series, 412 images)" — so a retrieve can be judged before it is
+// started. A count the server did not report (0) is left out, and a study
+// whose server reported neither is unchanged. Only the query results call
+// this: Local Browse and Import label studies from files already on disk.
+func (m *resultsModel) setStudyCounts(studyUID string, series, instances int) {
+	n, ok := m.nodes["S:"+studyUID]
+	if !ok || n.counted {
+		return
+	}
+	var parts []string
+	if series > 0 {
+		parts = append(parts, plural(series, "series", "series"))
+	}
+	if instances > 0 {
+		parts = append(parts, plural(instances, "image", "images"))
+	}
+	if len(parts) == 0 {
+		return
+	}
+	n.label += "  (" + strings.Join(parts, ", ") + ")"
+	n.counted = true
 }
 
 // addSeries inserts a series node under an existing study node.

@@ -58,6 +58,10 @@ type FindResult struct {
 	SeriesDescription string
 	Modality          string
 	NumInstances      int
+	// NumStudySeries and NumStudyInstances are the study's size from a
+	// STUDY-level query; 0 when the server did not report them.
+	NumStudySeries    int
+	NumStudyInstances int
 	SOPInstanceUID    string
 	InstanceNumber    int
 }
@@ -195,49 +199,123 @@ func (c *DicomClient) EchoConcurrent(ctx context.Context, n int) []error {
 
 // Find sends a C-FIND (Study Root or Patient Root QR) at the given query level
 // and streams results on the returned channel. The channel is closed when the
-// query completes or ctx is cancelled. A non-nil error is returned only when the
-// ServiceUser cannot be created. Association failures (e.g. the connection
-// dropped mid-session) and query rejections are reported in-band as a
-// FindResult with Err set, so callers can distinguish a genuinely empty result
-// from a failed query.
+// query completes, fails, times out or ctx is cancelled (cFindStream). A
+// non-nil error is returned only for a ctx already cancelled. Every failure —
+// connecting, a refused association, a server that stops responding, a
+// rejected query — is reported in-band as a FindResult with Err set, so callers
+// can distinguish a genuinely empty result from a failed query.
 func (c *DicomClient) Find(ctx context.Context, level string, params map[string]string) (<-chan FindResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
-	}
-
-	su, err := netdicom.NewServiceUser(netdicom.ServiceUserParams{
-		CalledAETitle:  c.profile.RemoteAETitle,
-		CallingAETitle: c.localAETitle,
-		SOPClasses:     sopclass.QRFindClasses,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("c-find: create service user: %w", err)
 	}
 
 	out := make(chan FindResult, 128)
 
 	go func() {
 		defer close(out)
-		defer su.Release()
-		su.Connect(fmt.Sprintf("%s:%d", c.profile.Host, c.profile.Port))
-
-		for r := range su.CFind(levelToQRLevel(level), buildFindFilter(level, params)) {
-			if r.Err != nil {
+		err := c.cFindStream(ctx, "c-find", levelToQRLevel(level), buildFindFilter(level, params),
+			func(elems []*dicom.Element) bool {
 				select {
-				case out <- FindResult{Err: r.Err}:
+				case out <- elementsToFindResult(elems):
+					return true
 				case <-ctx.Done():
+					return false
 				}
-				return
-			}
+			})
+		if err != nil {
 			select {
-			case out <- elementsToFindResult(r.Elements):
+			case out <- FindResult{Err: err}:
 			case <-ctx.Done():
-				return
 			}
 		}
 	}()
 
 	return out, nil
+}
+
+// queryIdleTimeout is how long a query waits for the server's next response —
+// the association's acceptance, the first match, or the one after — before
+// giving up. Any response resets it, so a large result that keeps arriving is
+// never cut off; a server that has stopped answering is.
+var queryIdleTimeout = 60 * time.Second
+
+// errQueryNoResponse reports a query abandoned under queryIdleTimeout.
+type errQueryNoResponse struct{ after time.Duration }
+
+func (e errQueryNoResponse) Error() string {
+	return fmt.Sprintf("the server stopped responding (nothing for %.0f s)", e.after.Seconds())
+}
+
+// connectTimeout is the profile's Connect timeout, or the 10 s default.
+func (c *DicomClient) connectTimeout() time.Duration {
+	if c.profile.ConnectTimeout > 0 {
+		return time.Duration(c.profile.ConnectTimeout) * time.Second
+	}
+	return 10 * time.Second
+}
+
+// cFindStream runs one C-FIND on an association of its own and hands each
+// matching identifier to emit, which returns false to stop early. It cannot
+// hang: the TCP connect is bounded by the profile's Connect timeout, and once
+// connected the association is aborted if the server sends nothing for
+// queryIdleTimeout or when ctx is cancelled. Aborting is what makes either
+// stick — CFind waits for the handshake and for each response with no deadline
+// of its own, so a query merely abandoned used to leave its goroutine and the
+// connection behind, and the worklist's Query button greyed out for good.
+func (c *DicomClient) cFindStream(ctx context.Context, op string, level netdicom.QRLevel,
+	filter []*dicom.Element, emit func([]*dicom.Element) bool) error {
+
+	addr := fmt.Sprintf("%s:%d", c.profile.Host, c.profile.Port)
+	dialer := net.Dialer{Timeout: c.connectTimeout()}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("%s: connect to %s: %w", op, addr, err)
+	}
+	su, err := netdicom.NewServiceUser(netdicom.ServiceUserParams{
+		CalledAETitle:  c.profile.RemoteAETitle,
+		CallingAETitle: c.localAETitle,
+		SOPClasses:     sopclass.QRFindClasses, // includes Modality Worklist
+	})
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("%s: create service user: %w", op, err)
+	}
+	su.SetConn(conn)
+	defer su.Release()
+
+	var timedOut atomic.Bool
+	idle := time.AfterFunc(queryIdleTimeout, func() {
+		timedOut.Store(true)
+		su.Abort()
+	})
+	defer idle.Stop()
+	stop := context.AfterFunc(ctx, su.Abort)
+	defer stop()
+
+	// The reason the association ended early, if it did, outranks the
+	// "connection closed" error the abort itself produces.
+	why := func(err error) error {
+		switch {
+		case timedOut.Load():
+			return fmt.Errorf("%s: %w", op, errQueryNoResponse{queryIdleTimeout})
+		case ctx.Err() != nil:
+			return ctx.Err()
+		}
+		return err
+	}
+	for r := range su.CFind(level, filter) {
+		idle.Reset(queryIdleTimeout)
+		if r.Err != nil {
+			return why(r.Err)
+		}
+		if !emit(r.Elements) {
+			return ctx.Err()
+		}
+	}
+	return why(nil)
 }
 
 // Move sends a C-MOVE-RQ (PS3.4 C.4.2) for the given UIDs, directing the PACS
@@ -412,6 +490,11 @@ func buildFindFilter(level string, params map[string]string) []*dicom.Element {
 		dicom.MustNewElement(dicomtag.StudyInstanceUID, ""),
 		dicom.MustNewElement(dicomtag.StudyDescription, ""),
 		dicom.MustNewElement(dicomtag.ModalitiesInStudy, params["ModalitiesInStudy"]),
+		// Optional return keys (PS3.4 C.6.1.1.3): the study's size, shown on
+		// its row before anything is retrieved. A server that does not
+		// support them returns them empty or leaves them out.
+		dicom.MustNewElement(dicomtag.NumberOfStudyRelatedSeries, ""),
+		dicom.MustNewElement(dicomtag.NumberOfStudyRelatedInstances, ""),
 	}
 }
 
@@ -487,6 +570,14 @@ func elementsToFindResult(elems []*dicom.Element) FindResult {
 		case dicomtag.NumberOfSeriesRelatedInstances:
 			if n, err2 := strconv.Atoi(s); err2 == nil {
 				r.NumInstances = n
+			}
+		case dicomtag.NumberOfStudyRelatedSeries:
+			if n, err2 := strconv.Atoi(strings.TrimSpace(s)); err2 == nil {
+				r.NumStudySeries = n
+			}
+		case dicomtag.NumberOfStudyRelatedInstances:
+			if n, err2 := strconv.Atoi(strings.TrimSpace(s)); err2 == nil {
+				r.NumStudyInstances = n
 			}
 		}
 	}
@@ -720,40 +811,30 @@ type WorklistResult struct {
 
 // FindWorklist sends a C-FIND against the Modality Worklist Information Model
 // (1.2.840.10008.5.1.4.31, PS3.4 K.4). Results are streamed on the returned
-// channel, which is closed when the query completes or ctx is cancelled.
+// channel, which is closed when the query completes, fails, times out or ctx
+// is cancelled; failures arrive in-band, as for Find.
 func (c *DicomClient) FindWorklist(ctx context.Context, params map[string]string) (<-chan WorklistResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
-	}
-
-	su, err := netdicom.NewServiceUser(netdicom.ServiceUserParams{
-		CalledAETitle:  c.profile.RemoteAETitle,
-		CallingAETitle: c.localAETitle,
-		SOPClasses:     sopclass.QRFindClasses, // includes 1.2.840.10008.5.1.4.31
-	})
-	if err != nil {
-		return nil, fmt.Errorf("worklist c-find: create service user: %w", err)
 	}
 
 	out := make(chan WorklistResult, 128)
 
 	go func() {
 		defer close(out)
-		defer su.Release()
-		su.Connect(fmt.Sprintf("%s:%d", c.profile.Host, c.profile.Port))
-
-		for r := range su.CFind(netdicom.QRLevelWorklist, buildWorklistFilter(params)) {
-			if r.Err != nil {
+		err := c.cFindStream(ctx, "worklist c-find", netdicom.QRLevelWorklist, buildWorklistFilter(params),
+			func(elems []*dicom.Element) bool {
 				select {
-				case out <- WorklistResult{Err: r.Err}:
+				case out <- elementsToWorklistResult(elems):
+					return true
 				case <-ctx.Done():
+					return false
 				}
-				return
-			}
+			})
+		if err != nil {
 			select {
-			case out <- elementsToWorklistResult(r.Elements):
+			case out <- WorklistResult{Err: err}:
 			case <-ctx.Done():
-				return
 			}
 		}
 	}()

@@ -169,6 +169,8 @@ At least one field should be populated before searching. Sending a completely un
 
 With the Filters panel open, click Search inside the panel, or click the Search button in the server row, or press Ctrl+Enter. The panel closes, the results tree clears, and the query is sent to the PACS. The status bar shows "Querying…" during the search and reports the number of studies returned when complete.
 
+A search cannot hang. Connecting gives up after the profile's Connect timeout, and once connected the search fails if the server sends nothing for 60 seconds; every match that arrives restarts the clock, so a long list that keeps coming is never cut off. If the server stops part-way, the studies already received are kept and the status bar says the list is incomplete and why, rather than reporting it as complete. The same limits apply when a study's series are listed and to worklist queries.
+
 Pressing Enter while the cursor is in the Patient Name, Patient ID, or Accession No field also runs the search and closes the panel.
 
 
@@ -186,7 +188,7 @@ Results are displayed in an expandable tree with three levels:
 
 Patient — one node per unique patient. The label shows the patient name and, where present, the patient ID in parentheses.
 
-Study — one or more studies under each patient. The label shows the study date, study description, accession number, and the set of modalities present in the study.
+Study — one or more studies under each patient. The label shows the study date, study description, accession number, the set of modalities present in the study, and — when the PACS reports them — the study's size, e.g. "(3 series, 412 images)", so you can judge a retrieve before starting it. The counts are requested with every search (Number of Study Related Series and Instances); a PACS that does not supply them simply leaves them off.
 
 Series — one or more series under each study. The label shows the series number, modality, series description, and image count.
 
@@ -572,14 +574,14 @@ Note: the Modality Worklist SOP class (1.2.840.10008.5.1.4.31) must be enabled o
 | Modality | Restricts results to one modality. Select (any) to include all modalities. |
 | Scheduled date | Today only (checked by default) — restricts to today's scheduled date. Uncheck to select a specific date using the calendar picker. Leave blank (unchecked, no date selected) to return all scheduled dates. |
 
-Click Query Worklist or press Enter in any text field to run the query. Click Clear to reset all fields and clear the results.
+Click Query Worklist or press Enter in any text field to run the query. While it runs, Cancel stops it. Click Clear to reset all fields and clear the results. A worklist server that does not answer is given up on after the profile's Connect timeout (to connect) or 60 seconds without a response, and the status label says so — Query Worklist is never left disabled.
 
 
 ### 10.3  Results Table
 
 Results are shown in a table with columns: Patient, MRN, Accession, Date, Time, Modality, Procedure, and Station. Click any row to select it.
 
-Copy Accession and Copy Patient buttons copy the selected row's values to the clipboard. The status label shows the number of worklist items returned, or any error message.
+Copy Accession and Copy Patient buttons copy the selected row's values to the clipboard. The status label shows the number of worklist items returned, or any error message — and, if the server stopped part-way, the items received with a note that the list is incomplete.
 
 
 ### 10.4  Typical Use Cases
@@ -883,6 +885,7 @@ The status bar at the bottom of the window provides real-time feedback. A colour
 | Query in progress | `Querying…` |
 | Loading results into the tree | `Loading results… <N>/<total>` |
 | Query complete | `Query complete — <N> studies` |
+| Query cut short (some studies received) | `Query incomplete — <N> studies, then: <reason>` |
 | Query error | `Query error: <reason>` |
 | Retrieve starting | `Starting retrieve of <N> studies…` |
 | Retrieve in progress | `Retrieving study <N>/<total>…` |
