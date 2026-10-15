@@ -2,7 +2,7 @@
 
 **User Manual  v1.24.0**
 
-October 7, 2026
+October 15, 2026
 
 A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.
 
@@ -499,7 +499,9 @@ Right-click any node and select Push to PACS…, or select items and click Push 
 
 A dialog appears with a destination selector (any configured server profile), a progress bar and per-file counter, and a Cancel button. The push creates a new association per operation and does not require the PACS tab to be connected.
 
-Files are sent exactly as stored: the association offers each file's own transfer syntax, and when the server accepts it the stored bytes go out verbatim — no re-encoding, byte-perfect, including compressed files when the destination accepts their syntax. If the server negotiates a different syntax instead, the file is converted locally to the negotiated uncompressed syntax (on a temporary copy — the local file is never modified) and sent in that form; a file that cannot be converted is skipped and counted as failed. Every failed file is recorded in the Activity Log with the actual reason.
+Files are sent exactly as stored. The push reads each file's SOP class and transfer syntax first and offers the server exactly those, so any kind of DICOM object can be pushed: images, dose reports, structured reports, a vendor's private objects. When the server accepts a file's own transfer syntax, the stored bytes go out verbatim — no re-encoding, byte-perfect, including compressed files such as JPEG 2000. If the server accepts the file's SOP class only in an uncompressed syntax, the file is converted locally to it (on a temporary copy — the local file is never modified) and sent in that form. Compressed data is never sent under an uncompressed label.
+
+A file is skipped and counted as failed when the server does not accept its SOP class at all, or accepts it only in a compressed syntax other than the file's own (a file can be converted to an uncompressed syntax, never into a different compression), or when its conversion fails. Every failed file is recorded in the Activity Log with the actual reason.
 
 
 ### 8.6  Deleting Local Files

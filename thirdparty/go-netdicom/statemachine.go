@@ -137,9 +137,7 @@ var actionAe2 = &stateAction{"AE-2", "Connection established on the user side. S
 		doassert(event.conn != nil)
 		sm.conn = event.conn
 		go networkReaderThread(sm.netCh, event.conn, DefaultMaxPDUSize, sm.label)
-		items := sm.contextManager.generateAssociateRequest(
-			sm.userParams.SOPClasses,
-			sm.userParams.TransferSyntaxes)
+		items := sm.contextManager.generateAssociateRequest(sm.userParams.contexts())
 		pdu := &pdu.AAssociateRQ{
 			ProtocolVersion: pdu.CurrentProtocolVersion,
 			CalledAETitle:   sm.userParams.CalledAETitle,
@@ -256,13 +254,15 @@ var actionAe8 = &stateAction{"AE-8", "Send A-ASSOCIATE-RJ PDU and start ARTIM ti
 		return sta13
 	}}
 
-// Produce a list of P_DATA_TF PDUs that collective store "data".
-func splitDataIntoPDUs(sm *stateMachine, abstractSyntaxName string, command bool, data []byte) []pdu.PDataTf {
+// Produce a list of P_DATA_TF PDUs that collective store "data", on the
+// payload's presentation context (see contextManager.sendContext).
+func splitDataIntoPDUs(sm *stateMachine, payload *stateEventDIMSEPayload, command bool, data []byte) []pdu.PDataTf {
 	doassert(len(data) > 0)
-	context, err := sm.contextManager.lookupByAbstractSyntaxUID(abstractSyntaxName)
+	context, err := sm.contextManager.sendContext(payload.abstractSyntaxName, payload.contextID)
 	if err != nil {
 		// TODO(saito) Don't crash here.
-		panic(fmt.Sprintf("dicom.stateMachine(%s): Illegal syntax name %s: %s", sm.label, dicomuid.UIDString(abstractSyntaxName), err))
+		panic(fmt.Sprintf("dicom.stateMachine(%s): Illegal syntax name %s (context %d): %s",
+			sm.label, dicomuid.UIDString(payload.abstractSyntaxName), payload.contextID, err))
 	}
 	var pdus []pdu.PDataTf
 	// two byte header overhead.
@@ -305,13 +305,13 @@ var actionDt1 = &stateAction{"DT-1", "Send P-DATA-TF PDU",
 			panic(fmt.Sprintf("Failed to encode DIMSE cmd %v: %v", command, err))
 		}
 		dicomlog.Vprintf(1, "dicom.stateMachine(%s): Send DIMSE msg: %v", sm.label, command)
-		pdus := splitDataIntoPDUs(sm, event.dimsePayload.abstractSyntaxName, true /*command*/, e.Bytes())
+		pdus := splitDataIntoPDUs(sm, event.dimsePayload, true /*command*/, e.Bytes())
 		for _, pdu := range pdus {
 			sendPDU(sm, &pdu)
 		}
 		if command.HasData() {
 			dicomlog.Vprintf(1, "dicom.stateMachine(%s): Send DIMSE data of %db, command: %v", sm.label, len(event.dimsePayload.data), command)
-			pdus := splitDataIntoPDUs(sm, event.dimsePayload.abstractSyntaxName, false /*data*/, event.dimsePayload.data)
+			pdus := splitDataIntoPDUs(sm, event.dimsePayload, false /*data*/, event.dimsePayload.data)
 			for _, pdu := range pdus {
 				sendPDU(sm, &pdu)
 			}
@@ -386,12 +386,12 @@ var actionAr7 = &stateAction{"AR-7", "Issue P-DATA-TF PDU",
 		if err != nil {
 			panic(fmt.Sprintf("dicom.StateMachine %s: Failed to encode DIMSE cmd %v: %v", sm.label, command, err))
 		}
-		pdus := splitDataIntoPDUs(sm, event.dimsePayload.abstractSyntaxName, true /*command*/, e.Bytes())
+		pdus := splitDataIntoPDUs(sm, event.dimsePayload, true /*command*/, e.Bytes())
 		for _, pdu := range pdus {
 			sendPDU(sm, &pdu)
 		}
 		if command.HasData() {
-			pdus := splitDataIntoPDUs(sm, event.dimsePayload.abstractSyntaxName, false /*data*/, event.dimsePayload.data)
+			pdus := splitDataIntoPDUs(sm, event.dimsePayload, false /*data*/, event.dimsePayload.data)
 			for _, pdu := range pdus {
 				sendPDU(sm, &pdu)
 			}
@@ -532,6 +532,11 @@ type upcallEvent struct {
 type stateEventDIMSEPayload struct {
 	// The syntax UID of the data to be sent.
 	abstractSyntaxName string
+
+	// contextID, when non-zero, is the presentation context to send on;
+	// zero sends on the one registered for abstractSyntaxName (dicomqr local
+	// patch: a SOP class may have several contexts, one per transfer syntax).
+	contextID byte
 
 	// Command to send. len(command) may exceed the max PDU size, in which case it
 	// will be split into multiple PresentationDataValueItems.
@@ -952,8 +957,7 @@ func runStateMachineForServiceUser(
 	downcallCh chan stateEvent,
 	label string) {
 	doassert(params.CallingAETitle != "")
-	doassert(len(params.SOPClasses) > 0)
-	doassert(len(params.TransferSyntaxes) > 0)
+	doassert(len(params.contexts()) > 0)
 	sm := &stateMachine{
 		label:          label,
 		isUser:         true,

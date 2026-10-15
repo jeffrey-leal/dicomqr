@@ -76,8 +76,12 @@ func (cs *serviceCommandState) sendMessage(cmd dimse.Message, data []byte) {
 	}
 	payload := &stateEventDIMSEPayload{
 		abstractSyntaxName: cs.context.abstractSyntaxUID,
-		command:            cmd,
-		data:               data,
+		// The command's own context: a response goes out on the context its
+		// request arrived on (PS3.7 9.3), which with several contexts per SOP
+		// class need not be the one registered by name (dicomqr local patch).
+		contextID: cs.context.contextID,
+		command:   cmd,
+		data:      data,
 	}
 	cs.disp.downcallCh <- stateEvent{
 		event:        evt09,

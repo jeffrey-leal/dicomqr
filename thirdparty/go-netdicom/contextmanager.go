@@ -2,6 +2,8 @@ package netdicom
 
 import (
 	"fmt"
+	"slices"
+	"sort"
 
 	"github.com/algm/go-netdicom/pdu/pdu_item"
 	"github.com/grailbio/go-dicom"
@@ -84,18 +86,22 @@ func newContextManager(label string, acceptedTSUIDs []string) *contextManager {
 // A_REQUEST_RQ.Items. The PDU is sent when running as a service user (client).
 // maxPDUSize is the maximum PDU size, in bytes, that the clients is willing to
 // receive. maxPDUSize is encoded in one of the items.
-func (m *contextManager) generateAssociateRequest(
-	sopClassUIDs []string, transferSyntaxUIDs []string) []pdu_item.SubItem {
+//
+// Each spec becomes one presentation context offering exactly its transfer
+// syntaxes, in order; several specs may name the same abstract syntax (dicomqr
+// local patch: the list used to be every SOP class crossed with one transfer
+// syntax list).
+func (m *contextManager) generateAssociateRequest(contexts []PresentationContextSpec) []pdu_item.SubItem {
 	items := []pdu_item.SubItem{
 		&pdu_item.ApplicationContextItem{
 			Name: pdu_item.DICOMApplicationContextItemName,
 		}}
 	var contextID byte = 1
-	for _, sop := range sopClassUIDs {
+	for _, pc := range contexts {
 		syntaxItems := []pdu_item.SubItem{
-			&pdu_item.AbstractSyntaxSubItem{Name: sop},
+			&pdu_item.AbstractSyntaxSubItem{Name: pc.AbstractSyntax},
 		}
-		for _, syntaxUID := range transferSyntaxUIDs {
+		for _, syntaxUID := range pc.TransferSyntaxes {
 			syntaxItems = append(syntaxItems, &pdu_item.TransferSyntaxSubItem{Name: syntaxUID})
 		}
 		item := &pdu_item.PresentationContextItem{
@@ -334,7 +340,65 @@ func addContextMapping(
 		result:            result,
 	}
 	m.contextIDToAbstractSyntaxNameMap[contextID] = e
-	m.abstractSyntaxNameToContextIDMap[abstractSyntaxUID] = e
+	// Several contexts may share an abstract syntax (a push proposes one per
+	// stored transfer syntax; a peer may propose several to us). The by-name
+	// map keeps the first accepted one, so a rejected context never hides an
+	// accepted one for the same SOP class (dicomqr local patch; it used to
+	// keep whichever came last).
+	prev, ok := m.abstractSyntaxNameToContextIDMap[abstractSyntaxUID]
+	if !ok || (prev.result != pdu_item.PresentationContextAccepted && result == pdu_item.PresentationContextAccepted) {
+		m.abstractSyntaxNameToContextIDMap[abstractSyntaxUID] = e
+	}
+}
+
+// lookupAccepted returns the accepted context for exactly this abstract syntax
+// and transfer syntax — compared verbatim, never canonicalised, so a JPEG 2000
+// data set never matches an Explicit VR Little Endian context — taking the
+// lowest context ID if several match (dicomqr local patch).
+func (m *contextManager) lookupAccepted(abstractSyntaxUID, transferSyntaxUID string) (contextManagerEntry, bool) {
+	var best *contextManagerEntry
+	for _, e := range m.contextIDToAbstractSyntaxNameMap {
+		if e.result == pdu_item.PresentationContextAccepted && e.abstractSyntaxUID == abstractSyntaxUID &&
+			e.transferSyntaxUID == transferSyntaxUID && (best == nil || e.contextID < best.contextID) {
+			best = e
+		}
+	}
+	if best == nil {
+		return contextManagerEntry{}, false
+	}
+	return *best, true
+}
+
+// acceptedSyntaxesFor lists the transfer syntaxes the peer accepted for
+// abstractSyntaxUID, in context-ID order without repeats; proposed reports
+// whether any context for it was negotiated at all, accepted or not (dicomqr
+// local patch).
+func (m *contextManager) acceptedSyntaxesFor(abstractSyntaxUID string) (accepted []string, proposed bool) {
+	var entries []*contextManagerEntry
+	for _, e := range m.contextIDToAbstractSyntaxNameMap {
+		if e.abstractSyntaxUID == abstractSyntaxUID {
+			entries = append(entries, e)
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].contextID < entries[j].contextID })
+	for _, e := range entries {
+		if e.result == pdu_item.PresentationContextAccepted && !slices.Contains(accepted, e.transferSyntaxUID) {
+			accepted = append(accepted, e.transferSyntaxUID)
+		}
+	}
+	return accepted, len(entries) > 0
+}
+
+// sendContext is the context a DIMSE message goes out on: contextID when set —
+// the context a request arrived on, or the one CStoreRaw matched by transfer
+// syntax — otherwise the one registered for abstractSyntaxUID (dicomqr local
+// patch; every message used to go out on the by-name context, which with
+// several contexts per SOP class need not be the request's own).
+func (m *contextManager) sendContext(abstractSyntaxUID string, contextID byte) (contextManagerEntry, error) {
+	if contextID != 0 {
+		return m.lookupByContextID(contextID)
+	}
+	return m.lookupByAbstractSyntaxUID(abstractSyntaxUID)
 }
 
 func (m *contextManager) checkContextRejection(e *contextManagerEntry) error {

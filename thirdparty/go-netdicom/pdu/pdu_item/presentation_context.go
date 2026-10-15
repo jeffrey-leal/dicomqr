@@ -90,7 +90,11 @@ func (v *PresentationContextItem) Write(e *dicomio.Writer) error {
 	if err := e.WriteByte(v.ContextID); err != nil {
 		return err
 	}
-	if err := e.WriteZeros(3); err != nil {
+	// Reserved, Result/Reason, reserved (PS3.8 9.3.3.2; in a request the
+	// middle byte is reserved too, and Result is zero there). Writing three
+	// zeros told the requestor every context in an A-ASSOCIATE-AC was
+	// accepted, rejected ones included (dicomqr local patch).
+	if err := e.WriteBytes([]byte{0, byte(v.Result), 0}); err != nil {
 		return err
 	}
 	return e.WriteBytes(itemBytes)

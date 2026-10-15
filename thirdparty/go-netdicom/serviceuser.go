@@ -85,6 +85,41 @@ type ServiceUserParams struct {
 	// spec is particularly moronic here, since we could just have specified
 	// the transfer syntax per data sent.
 	TransferSyntaxes []string
+
+	// PresentationContexts, when non-empty, replaces SOPClasses and
+	// TransferSyntaxes: each entry is proposed as one presentation context
+	// offering exactly its transfer syntaxes, verbatim — never canonicalised,
+	// which TransferSyntaxes are (every compressed syntax becomes Explicit VR
+	// Little Endian there) — and several entries may share a SOP class. For
+	// sending stored data sets as they are with CStoreRaw (dicomqr local
+	// patch).
+	PresentationContexts []PresentationContextSpec
+}
+
+// PresentationContextSpec is one presentation context a ServiceUser proposes:
+// a SOP class and the transfer syntaxes offered for it, most preferred first
+// (dicomqr local patch).
+type PresentationContextSpec struct {
+	AbstractSyntax   string
+	TransferSyntaxes []string
+}
+
+// maxPresentationContexts is the A-ASSOCIATE-RQ limit: context IDs are the odd
+// numbers 1-255 (PS3.8 9.3.2.2).
+const maxPresentationContexts = 128
+
+// contexts is what the association request proposes: PresentationContexts
+// when set, otherwise one context per SOPClasses entry offering every
+// TransferSyntaxes entry.
+func (params *ServiceUserParams) contexts() []PresentationContextSpec {
+	if len(params.PresentationContexts) > 0 {
+		return params.PresentationContexts
+	}
+	contexts := make([]PresentationContextSpec, len(params.SOPClasses))
+	for i, sop := range params.SOPClasses {
+		contexts[i] = PresentationContextSpec{AbstractSyntax: sop, TransferSyntaxes: params.TransferSyntaxes}
+	}
+	return contexts
 }
 
 func validateServiceUserParams(params *ServiceUserParams) error {
@@ -93,6 +128,18 @@ func validateServiceUserParams(params *ServiceUserParams) error {
 	}
 	if params.CallingAETitle == "" {
 		params.CallingAETitle = "unknown-calling-ae"
+	}
+	if len(params.PresentationContexts) > 0 {
+		if len(params.PresentationContexts) > maxPresentationContexts {
+			return fmt.Errorf("ServiceUserParams.PresentationContexts: %d contexts, at most %d allowed",
+				len(params.PresentationContexts), maxPresentationContexts)
+		}
+		for _, pc := range params.PresentationContexts {
+			if pc.AbstractSyntax == "" || len(pc.TransferSyntaxes) == 0 {
+				return fmt.Errorf("ServiceUserParams.PresentationContexts: %+v lacks a SOP class or a transfer syntax", pc)
+			}
+		}
+		return nil
 	}
 	if len(params.SOPClasses) == 0 {
 		return fmt.Errorf("Empty ServiceUserParams.SOPClasses")
@@ -276,11 +323,17 @@ func (su *ServiceUser) CStore(ds *dicom.DataSet) error {
 // CStoreRaw issues a C-STORE request sending an already-encoded dataset
 // verbatim — no parse, no re-encode, so the wire bytes are exactly the stored
 // file's. data must be the dataset portion only (File Meta group stripped),
-// encoded in transferSyntaxUID. When transferSyntaxUID differs from the
-// syntax negotiated for sopClassUID a *TransferSyntaxMismatchError is
-// returned (carrying the negotiated UID) and nothing is sent; the caller may
-// convert the dataset and retry. Local addition (dicomqr Phase 1 of the DICOM
-// library standardization).
+// encoded in transferSyntaxUID. It goes out on the accepted context whose
+// transfer syntax is exactly transferSyntaxUID. When there is none, nothing
+// is sent: a *SOPClassNotAcceptedError if no context for sopClassUID was
+// accepted, otherwise a *TransferSyntaxMismatchError listing the syntaxes
+// that were, so the caller may convert the dataset and retry. Local addition
+// (dicomqr Phase 1 of the DICOM library standardization).
+//
+// The match is exact. It used to canonicalise transferSyntaxUID first, which
+// turns every compressed syntax into Explicit VR Little Endian, so JPEG 2000
+// bytes went out on an Explicit VR LE context and the receiver stored them
+// under that label.
 //
 // REQUIRES: Connect() or SetConn has been called.
 func (su *ServiceUser) CStoreRaw(sopClassUID, sopInstanceUID, transferSyntaxUID string, data []byte) error {
@@ -289,23 +342,24 @@ func (su *ServiceUser) CStoreRaw(sopClassUID, sopInstanceUID, transferSyntaxUID 
 		return err
 	}
 	doassert(su.cm != nil)
-	context, err := su.cm.lookupByAbstractSyntaxUID(sopClassUID)
-	if err != nil {
-		return err
-	}
-	fileTS := transferSyntaxUID
-	if canonical, cerr := dicomio.CanonicalTransferSyntaxUID(fileTS); cerr == nil {
-		fileTS = canonical
-	}
-	if fileTS != context.transferSyntaxUID {
-		return &TransferSyntaxMismatchError{Negotiated: context.transferSyntaxUID, File: transferSyntaxUID}
+	context, ok := su.cm.lookupAccepted(sopClassUID, transferSyntaxUID)
+	if !ok {
+		accepted, proposed := su.cm.acceptedSyntaxesFor(sopClassUID)
+		if len(accepted) == 0 {
+			return &SOPClassNotAcceptedError{SOPClass: sopClassUID, Proposed: proposed}
+		}
+		return &TransferSyntaxMismatchError{
+			Negotiated: preferredConversionTarget(accepted),
+			Accepted:   accepted,
+			File:       transferSyntaxUID,
+		}
 	}
 	cs, err := su.disp.newCommand(su.cm, context)
 	if err != nil {
 		return err
 	}
 	defer su.disp.deleteCommand(cs)
-	return runCStoreRawOnAssociation(cs.upcallCh, su.disp.downcallCh, su.cm, cs.messageID, sopClassUID, sopInstanceUID, data)
+	return runCStoreRawOnAssociation(cs.upcallCh, su.disp.downcallCh, su.cm, cs.messageID, context, sopInstanceUID, data)
 }
 
 // QRLevel is used to specify the element hierarchy assumed during C-FIND,

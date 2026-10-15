@@ -68,38 +68,76 @@ func runCStoreOnAssociation(upcallCh chan upcallEvent, downcallCh chan stateEven
 		dicomlog.Vprintf(0, "dicom.cstore(%s): body encoder failed: %s", cm.label, msg)
 		return err
 	}
-	return runCStoreRawOnAssociation(upcallCh, downcallCh, cm, messageID, sopClassUID, sopInstanceUID, bodyEncoder.Bytes())
+	return runCStoreRawOnAssociation(upcallCh, downcallCh, cm, messageID, context, sopInstanceUID, bodyEncoder.Bytes())
 }
 
-// TransferSyntaxMismatchError is returned by ServiceUser.CStoreRaw when the
-// dataset's transfer syntax differs from the one negotiated for its SOP
-// class: pre-encoded bytes can only be sent verbatim. The caller may convert
+// TransferSyntaxMismatchError is returned by ServiceUser.CStoreRaw when no
+// context accepted for the dataset's SOP class has the dataset's transfer
+// syntax: pre-encoded bytes can only be sent verbatim. The caller may convert
 // the dataset to Negotiated and retry.
 type TransferSyntaxMismatchError struct {
-	Negotiated string // transfer syntax UID the association negotiated
-	File       string // transfer syntax UID the dataset is encoded in
+	// Negotiated is the accepted transfer syntax to convert to: Explicit VR
+	// Little Endian if accepted, else Implicit, else the first accepted.
+	Negotiated string
+	// Accepted lists every transfer syntax accepted for the SOP class
+	// (dicomqr local patch: a push proposes several contexts per class).
+	Accepted []string
+	File     string // transfer syntax UID the dataset is encoded in
 }
 
 func (e *TransferSyntaxMismatchError) Error() string {
-	return fmt.Sprintf("dicom.cstore: dataset transfer syntax %s differs from negotiated %s", e.File, e.Negotiated)
+	return fmt.Sprintf("dicom.cstore: dataset transfer syntax %s was not accepted for its SOP class (accepted: %s)",
+		e.File, strings.Join(e.Accepted, ", "))
+}
+
+// SOPClassNotAcceptedError is returned by ServiceUser.CStoreRaw when no
+// presentation context was accepted for the data set's SOP class: the peer
+// refused every one proposed for it (Proposed), or none was proposed (dicomqr
+// local patch).
+type SOPClassNotAcceptedError struct {
+	SOPClass string
+	Proposed bool
+}
+
+func (e *SOPClassNotAcceptedError) Error() string {
+	if e.Proposed {
+		return fmt.Sprintf("dicom.cstore: the peer did not accept SOP class %s", dicomuid.UIDString(e.SOPClass))
+	}
+	return fmt.Sprintf("dicom.cstore: SOP class %s was not proposed on this association", dicomuid.UIDString(e.SOPClass))
+}
+
+// preferredConversionTarget picks, from the transfer syntaxes accepted for a
+// SOP class, the one to convert a data set into: Explicit VR Little Endian,
+// then Implicit, else the first accepted.
+func preferredConversionTarget(accepted []string) string {
+	for _, want := range []string{dicomuid.ExplicitVRLittleEndian, dicomuid.ImplicitVRLittleEndian} {
+		for _, ts := range accepted {
+			if ts == want {
+				return ts
+			}
+		}
+	}
+	return accepted[0]
 }
 
 // runCStoreRawOnAssociation sends an already-encoded dataset (the file's
-// bytes after the meta group, in the association-negotiated transfer syntax)
-// over an established association and waits for the C-STORE response. Local
-// addition: sending stored bytes verbatim avoids the grailbio re-encode and
-// its stale data dictionary entirely.
+// bytes after the meta group, in context's transfer syntax) over an
+// established association, on that context, and waits for the C-STORE
+// response. Local addition: sending stored bytes verbatim avoids the grailbio
+// re-encode and its stale data dictionary entirely.
 func runCStoreRawOnAssociation(upcallCh chan upcallEvent, downcallCh chan stateEvent,
 	cm *contextManager,
 	messageID dimse.MessageID,
-	sopClassUID, sopInstanceUID string,
+	context contextManagerEntry,
+	sopInstanceUID string,
 	data []byte) error {
 	downcallCh <- stateEvent{
 		event: evt09,
 		dimsePayload: &stateEventDIMSEPayload{
-			abstractSyntaxName: sopClassUID,
+			abstractSyntaxName: context.abstractSyntaxUID,
+			contextID:          context.contextID,
 			command: &dimse.CStoreRq{
-				AffectedSOPClassUID:    sopClassUID,
+				AffectedSOPClassUID:    context.abstractSyntaxUID,
 				MessageID:              messageID,
 				CommandDataSetType:     dimse.CommandDataSetTypeNonNull,
 				AffectedSOPInstanceUID: sopInstanceUID,

@@ -598,59 +598,48 @@ type StoreProgress struct {
 // files have been attempted; ctx.Err() when cancelled.
 //
 // Files are sent as stored bytes, verbatim (DICOM library policy, Phase 1):
-// the association offers each file's own transfer syntax so no re-encode —
-// and no data dictionary — is involved in the common case. A file whose
-// stored syntax the server did not accept is converted locally to the
-// negotiated uncompressed syntax (on a temp copy; sources are never touched)
-// and resent; a file that cannot be converted is reported and skipped.
+// the association proposes exactly the SOP classes and transfer syntaxes the
+// files are stored in (pushPresentationContexts), so a server that accepts a
+// file's syntax receives its bytes unchanged — no re-encode, no data
+// dictionary. A file whose stored syntax the server did not accept is
+// converted locally to an accepted uncompressed syntax (on a temp copy;
+// sources are never touched) and resent; a file that cannot be converted, or
+// whose SOP class the server refused, is reported and skipped.
 func (c *DicomClient) StoreFiles(ctx context.Context, paths []string, onProgress func(StoreProgress)) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	// Offer the union of the files' stored transfer syntaxes, then the two
-	// uncompressed syntaxes as universal fallbacks (Implicit VR LE is
-	// mandatory for every conformant implementation, PS3.5 §10.1).
-	seenTS := map[string]bool{}
-	var offerTS []string
-	addTS := func(ts string) {
-		if ts != "" && !seenTS[ts] {
-			seenTS[ts] = true
-			offerTS = append(offerTS, ts)
-		}
-	}
 	// Each file's identity (SOP UIDs, stored syntax, where its data set
-	// starts) is read once, here, on the scan worker pool, and reused by the
-	// send loop. The pass used to read every file's syntax one at a time
-	// before connecting — about 9 ms a file on a cold spinning disk, so a
-	// minute and a half of silence for 10,000 files — and then each file was
-	// opened again for its identity and a third time for its bytes.
+	// starts) is read once, here, on the scan worker pool, and reused both to
+	// build the proposal and by the send loop. The pass used to read every
+	// file's syntax one at a time before connecting — about 9 ms a file on a
+	// cold spinning disk, so a minute and a half of silence for 10,000 files —
+	// and then each file was opened again for its identity and a third time
+	// for its bytes.
 	idents := readPushIdentities(paths)
-	for _, id := range idents {
-		if id.err == nil {
-			addTS(id.transferSyntaxUID)
+	contexts := pushPresentationContexts(idents)
+	if len(contexts) == 0 {
+		// Not one file's identity could be read: there is nothing to
+		// negotiate, so report each file without connecting.
+		for i, path := range paths {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if onProgress != nil {
+				onProgress(StoreProgress{Done: i + 1, Total: len(paths), Path: path, Err: unreadablePushFile(idents[i])})
+			}
 		}
+		return nil
 	}
-	addTS(tsExplicitVRLE)
-	addTS(tsImplicitVRLE)
 
 	su, err := netdicom.NewServiceUser(netdicom.ServiceUserParams{
-		CalledAETitle:    c.profile.RemoteAETitle,
-		CallingAETitle:   c.localAETitle,
-		SOPClasses:       sopclass.StorageClasses,
-		TransferSyntaxes: offerTS,
+		CalledAETitle:        c.profile.RemoteAETitle,
+		CallingAETitle:       c.localAETitle,
+		PresentationContexts: contexts,
 	})
 	if err != nil {
-		// A stored syntax the negotiation layer does not recognize must not
-		// sink the whole push — retry with the standard uncompressed set.
-		su, err = netdicom.NewServiceUser(netdicom.ServiceUserParams{
-			CalledAETitle:  c.profile.RemoteAETitle,
-			CallingAETitle: c.localAETitle,
-			SOPClasses:     sopclass.StorageClasses,
-		})
-		if err != nil {
-			return fmt.Errorf("c-store: create service user: %w", err)
-		}
+		return fmt.Errorf("c-store: create service user: %w", err)
 	}
 
 	type result struct{ err error }
@@ -676,7 +665,7 @@ func (c *DicomClient) StoreFiles(ctx context.Context, paths []string, onProgress
 			for i, path := range paths {
 				l := loaded{i: i}
 				if idents[i].err != nil {
-					l.err = fmt.Errorf("read file meta: %w", idents[i].err)
+					l.err = unreadablePushFile(idents[i])
 				} else {
 					l.raw, l.err = os.ReadFile(path)
 				}
@@ -747,11 +736,95 @@ func readPushIdentities(paths []string) []pushIdentity {
 	return out
 }
 
+// unreadablePushFile is the failure reported for a file whose identity could
+// not be read before connecting.
+func unreadablePushFile(id pushIdentity) error {
+	return fmt.Errorf("read file meta: %w", id.err)
+}
+
+// maxPresentationContexts is the A-ASSOCIATE-RQ limit: context IDs are the
+// odd numbers 1-255 (PS3.8 9.3.2.2).
+const maxPresentationContexts = 128
+
+// pushPresentationContexts is what a push proposes, built from the files
+// actually being sent: for each SOP class, one presentation context per
+// stored transfer syntax. A compressed syntax is offered alone, so a server
+// that takes it receives the file exactly as stored (a server picks one
+// syntax per context, and offered several it typically takes the first). An
+// uncompressed one is offered first, then the two uncompressed little-endian
+// syntaxes. A class whose files are all compressed also gets an
+// uncompressed-only context, the fallback storeFileRaw converts into when a
+// server refuses the compressed syntax.
+//
+// The syntaxes are proposed exactly as stored. The push used to offer one
+// list per class through the netdicom layer's canonicalisation, which turns
+// every compressed syntax into Explicit VR Little Endian, so a server
+// accepted "Explicit VR LE" and received JPEG 2000 bytes under that label.
+// Proposing only the classes present also lets any SOP class be pushed, not
+// just those on the library's storage list.
+//
+// If the per-syntax contexts exceed the association's 128, each class gets
+// just the uncompressed context instead (everything still sendable, at the
+// cost of a conversion); classes beyond 128 are left out, and their files
+// fail as not proposed.
+func pushPresentationContexts(idents []pushIdentity) []netdicom.PresentationContextSpec {
+	var classes []string
+	syntaxesByClass := map[string][]string{}
+	for _, id := range idents {
+		if id.err != nil {
+			continue
+		}
+		syntaxes, seen := syntaxesByClass[id.sopClassUID]
+		if !seen {
+			classes = append(classes, id.sopClassUID)
+		}
+		if !slices.Contains(syntaxes, id.transferSyntaxUID) {
+			syntaxesByClass[id.sopClassUID] = append(syntaxes, id.transferSyntaxUID)
+		}
+	}
+	contexts := buildPushContexts(classes, syntaxesByClass, false)
+	if len(contexts) > maxPresentationContexts {
+		contexts = buildPushContexts(classes, syntaxesByClass, true)
+	}
+	if len(contexts) > maxPresentationContexts {
+		contexts = contexts[:maxPresentationContexts]
+	}
+	return contexts
+}
+
+func buildPushContexts(classes []string, syntaxesByClass map[string][]string,
+	uncompressedOnly bool) []netdicom.PresentationContextSpec {
+	uncompressed := []string{tsExplicitVRLE, tsImplicitVRLE}
+	var contexts []netdicom.PresentationContextSpec
+	for _, class := range classes {
+		hasUncompressed := false
+		if !uncompressedOnly {
+			for _, ts := range syntaxesByClass[class] {
+				offered := []string{ts}
+				if isUncompressedOnDisk(ts) {
+					for _, u := range uncompressed {
+						if u != ts {
+							offered = append(offered, u)
+						}
+					}
+					hasUncompressed = true
+				}
+				contexts = append(contexts, netdicom.PresentationContextSpec{AbstractSyntax: class, TransferSyntaxes: offered})
+			}
+		}
+		if !hasUncompressed {
+			contexts = append(contexts, netdicom.PresentationContextSpec{AbstractSyntax: class, TransferSyntaxes: uncompressed})
+		}
+	}
+	return contexts
+}
+
 // storeFileRaw sends one stored file verbatim over an established push
 // association, given its identity and bytes (both already read by StoreFiles).
-// On a transfer-syntax mismatch it converts a temp copy to the negotiated
-// uncompressed syntax and resends; any other error — including an
-// unconvertible mismatch — is returned for per-file reporting.
+// When the server accepted its SOP class but not its stored syntax, it
+// converts a temp copy to an accepted uncompressed syntax and resends; any
+// other error — a refused SOP class, an unconvertible syntax — is returned
+// for per-file reporting.
 func storeFileRaw(su *netdicom.ServiceUser, path string, ident dicomFileIdentity, raw []byte) error {
 	send := func(raw []byte, offset int64, ts string) error {
 		if int64(len(raw)) <= offset {
@@ -761,13 +834,25 @@ func storeFileRaw(su *netdicom.ServiceUser, path string, ident dicomFileIdentity
 	}
 
 	err := send(raw, ident.datasetOffset, ident.transferSyntaxUID)
+	var notAccepted *netdicom.SOPClassNotAcceptedError
+	if errors.As(err, &notAccepted) {
+		if notAccepted.Proposed {
+			return fmt.Errorf("the server does not accept SOP class %s", describeSOPClass(ident.sopClassUID))
+		}
+		return fmt.Errorf("SOP class %s was not offered to the server (more than %d SOP classes in one push)",
+			describeSOPClass(ident.sopClassUID), maxPresentationContexts)
+	}
 	var mismatch *netdicom.TransferSyntaxMismatchError
 	if !errors.As(err, &mismatch) {
 		return err
 	}
 	if !isUncompressedOnDisk(mismatch.Negotiated) {
-		return fmt.Errorf("stored as %s but the server negotiated %s — no local conversion available",
-			transferSyntaxLabel(ident.transferSyntaxUID), transferSyntaxLabel(mismatch.Negotiated))
+		accepted := make([]string, len(mismatch.Accepted))
+		for i, ts := range mismatch.Accepted {
+			accepted[i] = transferSyntaxLabel(ts)
+		}
+		return fmt.Errorf("stored as %s, which the server does not accept for %s; it accepts only %s, and a file can only be converted to an uncompressed syntax",
+			transferSyntaxLabel(ident.transferSyntaxUID), describeSOPClass(ident.sopClassUID), strings.Join(accepted, ", "))
 	}
 	tmpPath, changed, terr := transcodeDICOMFileToTemp(path, mismatch.Negotiated, os.TempDir())
 	if terr != nil {
