@@ -621,7 +621,8 @@ func buildContent(d Formatter) {
 	d.H1("5  Searching for Studies")
 
 	d.H2("5.1  Opening the Filters Panel")
-	d.P("Click Filters ▾ in the server row to open the search criteria panel. The panel floats over the results tree and contains the search fields along with Search, Clear, and Close buttons. Click Filters ▾ again, or click Close inside the panel, to dismiss it. Values typed in the fields are preserved between open and close cycles.")
+	d.P("Click Filters ▾ in the server row to open the search criteria panel. The panel floats over the results tree and contains the search fields along with Connect, Search, Clear, and Close buttons. Click Filters ▾ again, or click Close inside the panel, to dismiss it. Values typed in the fields are preserved between open and close cycles.")
+	d.P("Search is available only once you are connected. If you opened the panel before connecting, click Connect inside the panel: it connects to the server selected in the server row, exactly as the Connect button there does, and the panel stays open so you can carry on and search. Like the server row's Connect, it is unavailable while a connection is in progress or already established.")
 
 	d.H2("5.2  Search Fields")
 	d.Table([]Row{

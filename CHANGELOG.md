@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **The Filters panel has a Connect button.** It is easy to open Filters and fill in a search before connecting, and the panel blocks the server row while it is open, so reaching Connect meant closing the panel first. The panel's Connect does exactly what the server row's does, for the server selected there, and the panel stays open so you can search as soon as the connection is made.
+
 ### Fixed
 
 - **Pushed JPEG 2000 and other compressed files are no longer stored under the wrong label.** A push offered the PACS each SOP class with the files' own transfer syntaxes, but the networking layer silently replaced every compressed syntax in that offer with Explicit VR Little Endian, so JPEG 2000 was never really offered. When the PACS accepted Explicit VR Little Endian, the push also failed to notice that a JPEG 2000 file did not match it, and sent the compressed bytes as they were. The PACS then stored compressed data labelled as uncompressed, which no viewer can display. The push now offers each file's transfer syntax exactly as stored. A PACS that accepts it receives the file byte for byte, as it should have all along. A PACS that takes only uncompressed data receives a decompressed copy, as the manual described. **Files pushed with an earlier version to a PACS that accepted uncompressed data may be stored mislabelled there.** Delete them on the PACS and push them again; a PACS keeps its existing copy of an instance it already holds.

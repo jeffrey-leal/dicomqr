@@ -839,6 +839,11 @@ func main() {
 	}
 
 	connectBtn := widget.NewButton("Connect", nil)
+	// The Filters panel's own Connect: users often open Filters before
+	// connecting, and the panel is modal, so the top row cannot be reached
+	// while it is open. It is the top-row button in every respect but
+	// position — same handler, same enabled state.
+	filtersConnectBtn := widget.NewButton("Connect", func() { connectBtn.OnTapped() })
 	disconnectBtn := widget.NewButton("Disconnect", nil)
 	echoBtn := widget.NewButton("Test (C-ECHO)", nil)
 	disconnectBtn.Disable()
@@ -851,6 +856,7 @@ func main() {
 			case stateDisconnected:
 				connLED.FillColor = ledGray
 				connectBtn.Enable()
+				filtersConnectBtn.Enable()
 				disconnectBtn.SetText("Disconnect")
 				disconnectBtn.Disable()
 				echoBtn.Disable()
@@ -859,6 +865,7 @@ func main() {
 			case stateConnected:
 				connLED.FillColor = ledGreen
 				connectBtn.Disable()
+				filtersConnectBtn.Disable()
 				disconnectBtn.SetText("Disconnect")
 				disconnectBtn.Enable()
 				echoBtn.Enable()
@@ -867,6 +874,7 @@ func main() {
 			case stateBusy:
 				connLED.FillColor = ledAmber
 				connectBtn.Disable()
+				filtersConnectBtn.Disable()
 				disconnectBtn.SetText("Cancel")
 				disconnectBtn.Enable()
 				echoBtn.Disable()
@@ -1068,7 +1076,7 @@ func main() {
 					widget.NewLabel("Study Date To"), studyDateToEntry,
 					widget.NewLabel("Modality"), modalityCheck,
 				),
-				container.NewHBox(layout.NewSpacer(), searchBtn, clearBtn, closeBtn),
+				container.NewHBox(layout.NewSpacer(), filtersConnectBtn, searchBtn, clearBtn, closeBtn),
 			)
 			searchPopup = widget.NewModalPopUp(container.NewPadded(popupContent), w.Canvas())
 		}
