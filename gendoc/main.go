@@ -509,7 +509,7 @@ const stylesXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 
 func buildContent(d Formatter) {
 
-	d.Cover("dicomqr", "User Manual  v1.24.0",
+	d.Cover("dicomqr", "User Manual  v1.25.0",
 		time.Now().Format("January 2, 2006"),
 		"A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.")
 
@@ -1038,7 +1038,7 @@ func buildContent(d Formatter) {
 		{"Shift dates (days)", "Shift every DA (Date) and DT (DateTime) field by this many days — negative, zero, or positive, at any nesting depth. DT time/fraction/timezone suffixes are preserved, and Patient Birth Date is never shifted (the birth date mask is that field's dedicated control)."},
 		{"Fix VR", "Handling of value-representation violations: (off), correct, skip, or passthrough."},
 		{"Output transfer syntax", "The transfer syntax exported files are written in. As stored (the default) copies each file's own encoding through untouched; Explicit VR Little Endian and Implicit VR Little Endian convert it, decompressing compressed pixel data on the way out. Only these two uncompressed targets are offered — the application can decompress but never compress. A file whose compression it cannot decode is reported as a failure rather than exported in the wrong syntax."},
-		{"Mark as de-identified", "Record in every exported file that it has been de-identified, as the DICOM standard (PS3.15) expects: Patient Identity Removed (0012,0062) is set to YES, and De-identification Method (0012,0063) names the application, its version and the profile (for example \"dicomqr 1.24.0 profile base-deident\"). A file already de-identified once before keeps the method recorded then, with this run's added after it. When the run shifts dates by a non-zero number of days, Longitudinal Temporal Information Modified (0028,0303) is also set to MODIFIED, so a downstream system knows the dates are not the originals. If the profile's own Set values write any of these tags, the profile's value is kept. The option only labels the export: it removes nothing by itself, and a profile with nothing else to do is still refused. On in the shipped base-deident profile."},
+		{"Mark as de-identified", "Record in every exported file that it has been de-identified, as the DICOM standard (PS3.15) expects: Patient Identity Removed (0012,0062) is set to YES, and De-identification Method (0012,0063) names the application, its version and the profile (for example \"dicomqr 1.25.0 profile base-deident\"). A file already de-identified once before keeps the method recorded then, with this run's added after it. When the run shifts dates by a non-zero number of days, Longitudinal Temporal Information Modified (0028,0303) is also set to MODIFIED, so a downstream system knows the dates are not the originals. If the profile's own Set values write any of these tags, the profile's value is kept. The option only labels the export: it removes nothing by itself, and a profile with nothing else to do is still refused. On in the shipped base-deident profile."},
 		{"Zip export", "Pre-check the Modification dialog's Zip export option for runs with this profile — the run is written as a single <export folder name>.zip. The dialog checkbox still decides per run."},
 		{"Flat export", "Pre-check the Modification dialog's Flat export option for runs with this profile — every file is written directly into the export root (or the archive root, with Zip export also set), with no patient/study/series folders, and named after its SOP Instance UID rather than kept under its source name. The dialog checkbox still decides per run."},
 		{"Ignore image types", "Comma-separated values; a file whose ImageType (0008,0008) contains any of them is skipped entirely."},
@@ -1113,7 +1113,7 @@ func buildContent(d Formatter) {
 	d.P("The status bar at the bottom of the window provides real-time feedback. A coloured LED indicator (gray / amber / green) precedes the status text.")
 	d.Table([]Row{
 		{"Situation", "Status bar text"},
-		{"Application started, not connected", "`v1.24.0`"},
+		{"Application started, not connected", "`v1.25.0`"},
 		{"Connecting to server", "`Connecting…`"},
 		{"Connected", "`Connected: <AE>@<host>:<port>`"},
 		{"Connection cancelled", "`Connection cancelled`"},

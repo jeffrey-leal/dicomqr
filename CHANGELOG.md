@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.25.0] — 2026-10-15
 
 ### Added
 
@@ -8,7 +8,7 @@
 
 ### Fixed
 
-- **Pushed JPEG 2000 and other compressed files are no longer stored under the wrong label.** A push offered the PACS each SOP class with the files' own transfer syntaxes, but the networking layer silently replaced every compressed syntax in that offer with Explicit VR Little Endian, so JPEG 2000 was never really offered. When the PACS accepted Explicit VR Little Endian, the push also failed to notice that a JPEG 2000 file did not match it, and sent the compressed bytes as they were. The PACS then stored compressed data labelled as uncompressed, which no viewer can display. The push now offers each file's transfer syntax exactly as stored. A PACS that accepts it receives the file byte for byte, as it should have all along. A PACS that takes only uncompressed data receives a decompressed copy, as the manual described. **Files pushed with an earlier version to a PACS that accepted uncompressed data may be stored mislabelled there.** Delete them on the PACS and push them again; a PACS keeps its existing copy of an instance it already holds.
+- **Pushed JPEG 2000 and other compressed files are no longer stored under the wrong label.** A push offered the PACS the files' own transfer syntaxes, but the networking layer silently replaced every compressed syntax in that offer with Explicit VR Little Endian, so JPEG 2000 was never really offered. When the PACS accepted Explicit VR Little Endian, the push also failed to notice that a JPEG 2000 file did not match it, and sent the compressed bytes as they were. The PACS then stored compressed data labelled as uncompressed, which viewers cannot display correctly. The push now offers each file's transfer syntax exactly as stored. A PACS that accepts it receives the file byte for byte, as it should have all along. A PACS that takes only uncompressed data receives a decompressed copy, as the manual described. **Files pushed with an earlier version to a PACS that accepted uncompressed data may be stored mislabelled there.** Delete them on the PACS before pushing them again: many PACS keep the copy they already hold of an instance and ignore a new one.
 - **Any kind of DICOM object can be pushed.** The push used to offer a fixed list of storage SOP classes, so an object of a class not on the list could not be sent. It now offers exactly the classes of the files being pushed, vendors' private classes included.
 - **A failed push says what the PACS refused**: the SOP class itself, or the file's transfer syntax, naming the syntaxes the PACS accepts instead.
 - **dicomqr's receiver now tells the PACS which offers it turns down.** When a retrieve requires a transfer syntax, dicomqr declines any presentation context offering only syntaxes it cannot convert, such as JPEG Lossless or JPEG-LS. Its reply reported every context as accepted, declined ones included, so a PACS could send files in a syntax dicomqr then refused, ending the transfer. The reply now carries each refusal, so the PACS can use another offer.
