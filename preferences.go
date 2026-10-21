@@ -280,6 +280,10 @@ func prefSection(title string, content ...fyne.CanvasObject) *fyne.Container {
 	return container.NewVBox(objs...)
 }
 
+// prefListMinHeight is the least a Preferences profile list can be dragged to:
+// about two rows, so a list shrunk out of the way still shows that it is one.
+const prefListMinHeight = 80
+
 // showPreferencesDialog opens the tabbed preferences dialog: SCP & Network
 // (local SCP identity, download folder, stall timeout, server profiles), User
 // Interface (appearance, external viewer, tag highlights and profiles), and
@@ -367,6 +371,25 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 		),
 	)
 
+	// Each profile list sits above a grip that drags it taller (resizegrip.go).
+	// The height a drag leaves is window geometry, like the main window's
+	// size, so it goes straight into cfg rather than waiting for Apply: it is
+	// kept whichever way Preferences closes, and saved with the settings.
+	listHeight := func(key string, def float32) float32 {
+		if h := cfg.PrefListHeights[key]; h > 0 {
+			return h
+		}
+		return def
+	}
+	resizableList := func(key string, scroll *container.Scroll, def float32) fyne.CanvasObject {
+		return resizableHeight(scroll, listHeight(key, def), prefListMinHeight, func(h float32) {
+			if cfg.PrefListHeights == nil {
+				cfg.PrefListHeights = map[string]float32{}
+			}
+			cfg.PrefListHeights[key] = h
+		})
+	}
+
 	// Server profiles list
 	pendingProfiles := append([]ServerProfile(nil), cfg.Profiles...)
 	profileList := container.NewVBox()
@@ -425,10 +448,8 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 		})
 	})
 
-	profileScroll := container.NewVScroll(profileList)
-	profileScroll.SetMinSize(fyne.NewSize(0, 160))
-
-	serverSection := prefSection("Server Profiles", profileScroll, addProfileBtn)
+	serverSection := prefSection("Server Profiles",
+		resizableList("servers", container.NewVScroll(profileList), 160), addProfileBtn)
 
 	// Network — local SCP identity, download folder, stall watchdog
 	localAEEntry := widget.NewEntry()
@@ -585,10 +606,19 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 		})
 	})
 
-	tagProfileScroll := container.NewVScroll(tagProfileList)
-	tagProfileScroll.SetMinSize(fyne.NewSize(0, 120))
+	// The shipped Tag Profiles reach an install only on its first run; this
+	// brings a later version's back (shippedprofiles.go), into the working copy.
+	restoreTagProfilesBtn := widget.NewButton("Restore shipped profiles…", func() {
+		showRestoreShippedFromPreferences(a, w, shippedTag, nil, pendingTagProfiles, func(chosen []shippedOffer) {
+			pendingTagProfiles = restoreShippedTagProfiles(pendingTagProfiles,
+				shippedOfferNames(chosen, shippedTag), shippedTagProfiles())
+			buildTagProfileList()
+		})
+	})
 
-	tpSection := prefSection("Tag Profiles", tagProfileScroll, addTagProfileBtn)
+	tpSection := prefSection("Tag Profiles",
+		resizableList("tagProfiles", container.NewVScroll(tagProfileList), 120),
+		container.NewGridWithColumns(2, addTagProfileBtn, restoreTagProfilesBtn))
 
 	// Modification profiles — the de-identification recipes in
 	// ~/.dicomqr/profiles.json. Edited as a working copy like the other lists
@@ -706,6 +736,15 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 				buildModProfileList()
 			})
 	})
+	// As for Tag Profiles: a later version's shipped profiles, restored into
+	// the working copy; one replaced is kept, renamed, below its replacement.
+	restoreModProfilesBtn := widget.NewButton("Restore shipped profiles…", func() {
+		showRestoreShippedFromPreferences(a, w, shippedModification, pendingModProfiles, nil, func(chosen []shippedOffer) {
+			pendingModOrder, _ = restoreShippedModProfiles(pendingModProfiles, pendingModOrder,
+				shippedOfferNames(chosen, shippedModification), shippedModProfiles())
+			buildModProfileList()
+		})
+	})
 
 	var modProfileSection fyne.CanvasObject
 	if modProfilesLoadErr != nil {
@@ -716,9 +755,9 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 		modProfileSection = prefSection("Modification Profiles", errLbl)
 	} else {
 		buildModProfileList()
-		modProfileScroll := container.NewVScroll(modProfileList)
-		modProfileScroll.SetMinSize(fyne.NewSize(0, 140))
-		modProfileSection = prefSection("Modification Profiles", modProfileScroll, addModProfileBtn)
+		modProfileSection = prefSection("Modification Profiles",
+			resizableList("modProfiles", container.NewVScroll(modProfileList), 140),
+			container.NewGridWithColumns(2, addModProfileBtn, restoreModProfilesBtn))
 	}
 
 	// Modification/export defaults
@@ -882,6 +921,7 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 		Key:      "preferences",
 		Title:    "Preferences",
 		Size:     fyne.NewSize(720, 640),
+		Place:    "preferences",
 		Parent:   parent,
 		Blocking: true,
 	}, func(win fyne.Window) fyne.CanvasObject {
@@ -1131,6 +1171,7 @@ func showServerProfileEditor(a fyne.App, parent fyne.Window, p ServerProfile, lo
 	openOwnedWindow(a, windowSpec{
 		Title:    title,
 		Size:     fyne.NewSize(660, 620),
+		Place:    "server-editor",
 		Parent:   parent,
 		Blocking: true,
 	}, func(w fyne.Window) fyne.CanvasObject {

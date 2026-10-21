@@ -100,6 +100,29 @@ type Settings struct {
 	// in the store is ignored (orderedModProfileNames).
 	ModProfileOrder []string `json:"modProfileOrder,omitempty"`
 
+	// ShippedProfilesSeen records, per shipped profile ("modification:<name>"
+	// or "tag:<name>"), the digest of the version the user was last shown at
+	// startup (shippedprofiles.go). A new release offers a shipped profile
+	// again only when its digest has changed since — so a profile deliberately
+	// deleted or edited is not offered back at every start, only when the
+	// release actually changes it.
+	ShippedProfilesSeen map[string]string `json:"shippedProfilesSeen,omitempty"`
+
+	// PrefListHeights remembers how tall the user dragged each Preferences
+	// list ("servers", "tagProfiles", "modProfiles"), in Fyne's scaled units
+	// like WindowWidth/WindowHeight. Window geometry, not a preference: kept
+	// whether Preferences closes by Apply or Cancel. Absent = the default.
+	PrefListHeights map[string]float32 `json:"prefListHeights,omitempty"`
+
+	// WindowPlacements remembers where every window other than the main one
+	// was and how big, by window type ("preferences", "viewer", …; never a
+	// title, which can carry patient data), in physical pixels like WindowX/Y.
+	// windowmemory.go holds the live copy; it is written back here only as the
+	// application closes (snapshotWindowPlacements), so a save mid-session
+	// writes the placements as they were at startup — the closing save
+	// supersedes it.
+	WindowPlacements map[string]windowPlacement `json:"windowPlacements,omitempty"`
+
 	// ExportFormat ("csv" or "json") is the file type listed first in the
 	// tag viewer's Export Tags… save dialog, and the format applied when the
 	// typed filename has no extension.

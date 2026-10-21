@@ -499,6 +499,7 @@ func openModProfileEditor(a fyne.App, parent fyne.Window, key, title string, ed 
 		Key:      key,
 		Title:    title,
 		Size:     fyne.NewSize(640, 760),
+		Place:    "profile-editor",
 		Parent:   parent,
 		Blocking: true,
 	}, func(win fyne.Window) fyne.CanvasObject {
@@ -940,6 +941,7 @@ func showPerModalityEditor(a fyne.App, parent fyne.Window, code string, p ModPro
 	openOwnedWindow(a, windowSpec{
 		Title:    title,
 		Size:     fyne.NewSize(620, 600),
+		Place:    "modality-override-editor",
 		Parent:   parent,
 		Blocking: true,
 	}, func(win fyne.Window) fyne.CanvasObject {

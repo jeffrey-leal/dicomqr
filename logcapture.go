@@ -417,6 +417,7 @@ func showLogDialog(a fyne.App, parent fyne.Window) {
 		Key:      "activity-log",
 		Title:    "Activity Log",
 		Size:     fyne.NewSize(880, 580),
+		Place:    "activity-log",
 		Parent:   parent,
 		OnClosed: cancel,
 	}, func(fyne.Window) fyne.CanvasObject {

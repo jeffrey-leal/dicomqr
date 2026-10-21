@@ -312,6 +312,7 @@ func showTagProfileEditor(a fyne.App, parent fyne.Window, p TagProfile, onSave f
 	openOwnedWindow(a, windowSpec{
 		Title:    title,
 		Size:     fyne.NewSize(520, 440),
+		Place:    "tag-profile-editor",
 		Parent:   parent,
 		Blocking: true,
 	}, func(win fyne.Window) fyne.CanvasObject {

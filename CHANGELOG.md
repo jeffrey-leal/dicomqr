@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.26.1] — 2026-10-21
+
+### Added
+
+- **Bring back the profiles a new version supplies.** The modification profiles and Tag Profiles that come with dicomqr are installed only on its first run, so improvements a later version made to them never reached an existing installation. The Modification Profiles and Tag Profiles lists in Preferences now each have a *Restore shipped profiles…* button. It lists the supplied profiles, says for each whether you have it, whether yours is the same, or whether yours differs, and installs the ones you tick. Nothing of yours is lost. A modification profile you have under the same name is kept, renamed "*name* (before restore)", directly below the restored one, and a Tag Profile keeps your colour and enabled setting while taking the supplied tags and modalities. Nothing is saved until Apply.
+- **A new version says when it brings changed profiles.** When a supplied profile is new, or has changed since you were last shown it, and you do not have it or yours differs, dicomqr opens a window at startup listing those profiles, ready to install with *Update selected*. *Not now* keeps your profiles as they are. Either way you are not asked again about those profiles until a later version changes them, so a profile you deleted or edited on purpose is not offered back at every start.
+- **Make the Preferences lists taller.** The Server Profiles, Tag Profiles and Modification Profiles lists each have a grab bar beneath them. Drag it down to show more entries at once, as far as the point where every entry shows, or up to make the list shorter. Each list remembers its height.
+- **Every window reopens where you left it.** Preferences, the profile editors, the tag picker, View Tags, the image viewer, the study overview, the document viewer, the Activity Log, the Modification window, the mask review and the rest now open at the position and size they had when last closed, as the main window already did, and on the same monitor. Windows of one kind share a place: a new viewer opens where the last one closed, and one opening onto a viewer already there is set slightly down and to the right so it does not hide behind it. The image viewer remembers single images and clips separately, since a clip viewer is taller to fit its controls. A window last left on a monitor that is no longer connected opens on the nearest one. Message boxes and confirmations are part of the window that shows them, so they appear over that window as before.
+
 ## [1.26.0] — 2026-10-21
 
 ### Added

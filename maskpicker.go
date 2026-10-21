@@ -107,6 +107,7 @@ func buildMaskRegionPicker(a fyne.App, parent fyne.Window, path string, img imag
 	openOwnedWindow(a, windowSpec{
 		Title:    "Mark masked areas — " + filepath.Base(path),
 		Size:     fyne.NewSize(900, 760),
+		Place:    "mask-picker",
 		Parent:   parent,
 		Blocking: true,
 	}, func(win fyne.Window) fyne.CanvasObject {
@@ -713,6 +714,7 @@ func buildMaskPreview(a fyne.App, parent fyne.Window, profileName string,
 	openOwnedWindow(a, windowSpec{
 		Title:    "Review masking — " + profileName,
 		Size:     fyne.NewSize(940, 880),
+		Place:    "mask-review",
 		Parent:   parent,
 		Blocking: true,
 		OnClosed: func() {

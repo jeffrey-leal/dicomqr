@@ -443,6 +443,7 @@ func showTagPicker(a fyne.App, parent fyne.Window, title, current string,
 	win = openOwnedWindow(a, windowSpec{
 		Title:    title,
 		Size:     fyne.NewSize(700, 660),
+		Place:    "tag-picker",
 		Parent:   parent,
 		Blocking: true,
 	}, func(fyne.Window) fyne.CanvasObject { return content })

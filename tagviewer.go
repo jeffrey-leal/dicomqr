@@ -931,12 +931,14 @@ func showTagViewerWindow(a fyne.App, cfg *Settings, title string, paths []string
 		openTagTrees[win] = tree
 		openTagTreesMu.Unlock()
 		win.SetOnClosed(func() {
+			recordWindowPlacement(win)
 			openTagTreesMu.Lock()
 			delete(openTagTrees, win)
 			openTagTreesMu.Unlock()
 		})
 
 		win.Show()
+		placeWindow(win, "tag-viewer")
 	})
 
 	// Parse the files concurrently across a worker pool — parsing is the

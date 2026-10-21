@@ -316,9 +316,20 @@ func readModProfileConfig(path string) (ModProfileConfig, modProfileConversion, 
 	if err != nil {
 		return nil, modProfileConversion{}, nil, err
 	}
+	cfg, conv, err := parseModProfileConfig(data)
+	if err != nil {
+		return nil, modProfileConversion{}, nil, err
+	}
+	return cfg, conv, data, nil
+}
+
+// parseModProfileConfig is readModProfileConfig's parse, for bytes already in
+// hand — the store's, or the shipped defaults' (shippedprofiles.go), which must
+// come out exactly as a seeded store would read back for the two to compare.
+func parseModProfileConfig(data []byte) (ModProfileConfig, modProfileConversion, error) {
 	var cfg ModProfileConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, modProfileConversion{}, nil, err
+		return nil, modProfileConversion{}, err
 	}
 	// Canonicalise on the way in, so every consumer — editor, engine,
 	// conversion — sees one spelling per tag and the file the editor writes
@@ -328,7 +339,7 @@ func readModProfileConfig(path string) (ModProfileConfig, modProfileConversion, 
 		cfg[name] = normalizeModProfile(p)
 	}
 	flat, conv := flattenModProfiles(cfg)
-	return flat, conv, data, nil
+	return flat, conv, nil
 }
 
 // saveModProfileConfig writes cfg to the profile store at path as indented

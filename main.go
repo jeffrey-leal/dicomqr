@@ -31,7 +31,7 @@ import (
 	"github.com/grailbio/go-dicom/dicomlog"
 )
 
-const version = "1.26.0"
+const version = "1.26.1"
 
 // LED colours for connection and SCP state indicators.
 var (
@@ -162,6 +162,7 @@ func main() {
 	// self-contained, once, with the original kept beside them.
 	convertModProfileStoreAtStartup()
 	cfg := loadSettings()
+	initWindowPlacements(cfg.WindowPlacements) // where the other windows were (windowmemory.go)
 	// Record the session's starting configuration so a log file alone can
 	// answer "what was the app actually configured to do" after the fact.
 	logInfo("settings: %d profile(s), download dir %s, local AE %s, SCP port %d",
@@ -202,6 +203,9 @@ func main() {
 	}
 	a.Lifecycle().SetOnStarted(func() {
 		placeMainWindow("dicomqr", savedPos, 0.60, 0.80, !haveSavedSize)
+		// Offer shipped profiles this version changed (shippedprofiles.go),
+		// once the main window is there to own the window that asks.
+		fyne.Do(func() { checkShippedProfilesAtStartup(a, w, &cfg, refreshOpenTagViewers) })
 	})
 
 	currentTheme := newAppTheme(cfg.DarkTheme, cfg.UITheme)
@@ -1776,6 +1780,7 @@ func main() {
 		}),
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("Quit", func() {
+			cfg.WindowPlacements = snapshotWindowPlacements()
 			saveSettings(cfg)
 			stopClock()
 			shutdownSCP()
@@ -1930,6 +1935,9 @@ func main() {
 			cfg.WindowX, cfg.WindowY = r.Left, r.Top
 			cfg.WindowPosSaved = true
 		}
+		// The other windows still open close after this save, so their
+		// placements are read now rather than from their own OnClosed.
+		cfg.WindowPlacements = snapshotWindowPlacements()
 		saveSettings(cfg)
 		stopClock()
 		shutdownSCP()

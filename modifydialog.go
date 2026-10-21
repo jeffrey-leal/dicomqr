@@ -956,6 +956,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	openOwnedWindow(fyne.CurrentApp(), windowSpec{
 		Title:    "Modification — " + profileName,
 		Size:     fyne.NewSize(700, 700),
+		Place:    "modification",
 		Parent:   w,
 		Blocking: true,
 		OnClosed: func() { phiStop.Store(true) },
@@ -1022,6 +1023,7 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 	win := openOwnedWindow(fyne.CurrentApp(), windowSpec{
 		Title:    "Modification — " + profileName,
 		Size:     fyne.NewSize(520, 220),
+		Place:    "modification-run",
 		Parent:   w,
 		Blocking: true,
 		OnClosed: cancel,

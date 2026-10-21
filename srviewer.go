@@ -466,7 +466,7 @@ func openSRWindow(a fyne.App, title string, paths []string) {
 
 		win.SetContent(container.NewBorder(header, footer, nil, nil, scroll))
 		win.Resize(fyne.NewSize(700, 700))
-		win.Show()
+		showPlacedWindow(win, "document-viewer")
 
 		loadDoc(0)
 	})

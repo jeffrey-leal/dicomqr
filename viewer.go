@@ -1594,7 +1594,7 @@ func showStudyOverviewWindow(a fyne.App, parent fyne.Window, title string, serie
 			win := a.NewWindow(title)
 			win.SetContent(container.NewCenter(widget.NewLabel("No series found.")))
 			win.Resize(fyne.NewSize(420, 160))
-			win.Show()
+			showPlacedWindow(win, "viewer-message")
 		})
 		return
 	}
@@ -1683,7 +1683,7 @@ func showStudyOverviewWindow(a fyne.App, parent fyne.Window, title string, serie
 		}
 		win.SetContent(container.NewBorder(hint, nil, nil, nil, container.NewVScroll(grid)))
 		win.Resize(fyne.NewSize(float32(cols)*(cellSize.Width+4)+40, 560))
-		win.Show()
+		showPlacedWindow(win, "study-overview")
 	})
 }
 
@@ -1697,7 +1697,7 @@ func showDicomViewerPaths(a fyne.App, parent fyne.Window, title string, rawPaths
 			win := a.NewWindow(title)
 			win.SetContent(container.NewCenter(widget.NewLabel("No images in this selection.")))
 			win.Resize(fyne.NewSize(420, 160))
-			win.Show()
+			showPlacedWindow(win, "viewer-message")
 		})
 		return
 	}
@@ -2217,7 +2217,7 @@ func openViewerWindow(a fyne.App, title string, chapters []chapter, collectErr e
 			}
 			win.SetContent(container.NewCenter(widget.NewLabel(msg)))
 			win.Resize(fyne.NewSize(420, 160))
-			win.Show()
+			showPlacedWindow(win, "viewer-message")
 			return
 		}
 
@@ -2923,6 +2923,7 @@ func openViewerWindow(a fyne.App, title string, chapters []chapter, collectErr e
 		// viewer that keeps a ticker and a decode pool running would hold the
 		// process busy for the rest of the session.
 		win.SetOnClosed(func() {
+			recordWindowPlacement(win)
 			if loader != nil {
 				// On its own goroutine: stop waits for a decode in flight, and
 				// this runs on the UI goroutine.
@@ -2943,6 +2944,14 @@ func openViewerWindow(a fyne.App, title string, chapters []chapter, collectErr e
 			win.Resize(fyne.NewSize(760, 880)) // room for the transport and filmstrip
 		}
 		win.Show()
+		// The two modes keep separate placements: a clip viewer's default is
+		// taller, for the transport and filmstrip, and a size chosen for one
+		// would not suit the other.
+		if chapterMode {
+			placeWindow(win, "viewer-clips")
+		} else {
+			placeWindow(win, "viewer")
+		}
 
 		if chapterMode {
 			// selectChapter does the full switch, so aim it at a chapter index that

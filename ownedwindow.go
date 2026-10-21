@@ -37,7 +37,14 @@ type windowSpec struct {
 	// window anonymous, and it may then be opened any number of times.
 	Key   string
 	Title string
-	Size  fyne.Size
+	// Size is the size the window opens at until the user has given windows
+	// of its Place one of their own.
+	Size fyne.Size
+	// Place names the window's type for remembering where it was and how big
+	// (windowmemory.go): every window of one Place reopens where the last one
+	// closed. A fixed word, never the title, which may carry patient data.
+	// Empty leaves the window wherever Windows puts it.
+	Place string
 	// Parent owns this window. Nil makes it top level, owned by nothing.
 	Parent fyne.Window
 	// Blocking dims the parent and swallows its input while this window is
@@ -130,6 +137,7 @@ func openOwnedWindow(a fyne.App, spec windowSpec, build func(win fyne.Window) fy
 		win.Resize(spec.Size)
 	}
 	win.Show()
+	placeWindow(win, spec.Place)
 	return win
 }
 
@@ -138,6 +146,7 @@ func openOwnedWindow(a fyne.App, spec windowSpec, build func(win fyne.Window) fy
 // runs the caller's OnClosed. Deregistering before closing children keeps a
 // child's own cleanup from finding a half-removed parent.
 func releaseOwnedWindow(win fyne.Window) {
+	recordWindowPlacement(win) // first, while the native window is certainly still there
 	ownedMu.Lock()
 	state, ok := ownedWindows[win]
 	if !ok {
