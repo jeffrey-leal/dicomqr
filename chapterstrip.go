@@ -129,15 +129,17 @@ type chapterStrip struct {
 	scroll   *container.Scroll
 	cells    []*chapterCell
 	selected int
+	chapters []chapter
 
-	mu      sync.Mutex
-	stopped bool
+	startOnce sync.Once
+	mu        sync.Mutex
+	stopped   bool
 }
 
-// newChapterStrip builds a cell per chapter and starts decoding thumbnails.
-// Must be called on the UI goroutine; onSelect is invoked there too.
+// newChapterStrip builds a cell per chapter; start begins decoding their
+// thumbnails. Must be called on the UI goroutine; onSelect is invoked there too.
 func newChapterStrip(chapters []chapter, onSelect func(index int)) *chapterStrip {
-	s := &chapterStrip{selected: -1}
+	s := &chapterStrip{selected: -1, chapters: chapters}
 	cells := make([]fyne.CanvasObject, len(chapters))
 	s.cells = make([]*chapterCell, len(chapters))
 	for i, c := range chapters {
@@ -151,8 +153,19 @@ func newChapterStrip(chapters []chapter, onSelect func(index int)) *chapterStrip
 		cells[i] = cell
 	}
 	s.scroll = container.NewHScroll(container.NewHBox(cells...))
-	go s.loadThumbnails(chapters)
 	return s
+}
+
+// start begins decoding the thumbnails, once; later calls, and a call after
+// stop, do nothing. Separate from construction so the viewer can hold the
+// thumbnails back until the image the user opened is on screen: they decode on
+// every core, and starting them with the window had them compete with it.
+func (s *chapterStrip) start() {
+	s.startOnce.Do(func() {
+		if !s.isStopped() {
+			go s.loadThumbnails(s.chapters)
+		}
+	})
 }
 
 func (s *chapterStrip) object() fyne.CanvasObject { return s.scroll }

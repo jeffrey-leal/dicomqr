@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -546,8 +547,11 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 				pendingTagProfiles[i].Enabled = enabled
 			})
 			check.SetChecked(pendingTagProfiles[i].Enabled)
-			nameLabel := widget.NewLabel(fmt.Sprintf("%s  (%d tags)",
-				pendingTagProfiles[i].Name, len(pendingTagProfiles[i].Tags)))
+			desc := fmt.Sprintf("%s  (%d tags", pendingTagProfiles[i].Name, len(pendingTagProfiles[i].Tags))
+			if m := pendingTagProfiles[i].Modalities; len(m) > 0 {
+				desc += ", " + strings.Join(m, ", ") + " files only"
+			}
+			nameLabel := widget.NewLabel(desc + ")")
 			editBtn := widget.NewButton("Edit", func() {
 				showTagProfileEditor(a, w, pendingTagProfiles[i], func(updated TagProfile) {
 					updated.Enabled = pendingTagProfiles[i].Enabled
@@ -605,24 +609,31 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 		pendingModProfiles = ModProfileConfig{}
 	}
 
+	// The list's order, which the Modification menus follow too. It is kept
+	// holding exactly the pending profiles: syncModOrder drops a deleted name
+	// and appends a new one, while a rename keeps its place and a copy is
+	// placed right after its source.
+	pendingModOrder := orderedModProfileNames(pendingModProfiles, cfg.ModProfileOrder)
+	syncModOrder := func() {
+		pendingModOrder = orderedModProfileNames(pendingModProfiles, pendingModOrder)
+	}
+
 	modProfileList := container.NewVBox()
 	var buildModProfileList func()
 	buildModProfileList = func() {
-		names := make([]string, 0, len(pendingModProfiles))
-		for n := range pendingModProfiles {
-			names = append(names, n)
-		}
-		sort.Strings(names)
+		names := pendingModOrder
 		rows := make([]fyne.CanvasObject, len(names))
 		for i, n := range names {
-			n := n
+			i, n := i, n
 			p := pendingModProfiles[n]
 			desc := fmt.Sprintf("%s  (%d set, %d remove", n, len(p.Sets), len(p.Removes))
-			if p.Base != "" {
-				desc += ", base: " + p.Base
-			}
 			if len(p.PerModality) > 0 {
 				desc += fmt.Sprintf(", %d per-modality", len(p.PerModality))
+			}
+			// Only a base conversion could not resolve survives loading; such a
+			// profile will not run until it has been reviewed in the editor.
+			if p.Base != "" {
+				desc += ", needs review: base " + p.Base + " unresolved"
 			}
 			desc += ")"
 			nameLabel := widget.NewLabel(desc)
@@ -631,45 +642,57 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 					func(newName string, updated ModProfile) {
 						if newName != n {
 							delete(pendingModProfiles, n)
-							// Keep base chains intact across a rename.
-							for on, op := range pendingModProfiles {
-								if op.Base == n {
-									op.Base = newName
-									pendingModProfiles[on] = op
-								}
+							if j := slices.Index(pendingModOrder, n); j >= 0 {
+								pendingModOrder[j] = newName // a rename keeps its place
 							}
 						}
 						pendingModProfiles[newName] = updated
+						syncModOrder()
 						buildModProfileList()
 					})
 			})
+			// Profiles are self-contained, so a new one built from an existing
+			// one starts as a full, independent copy rather than a reference to it.
+			copyBtn := widget.NewButton("Copy", func() {
+				showModProfileCopyEditor(a, w, n, pendingModProfiles[n], pendingModProfiles, cfg.DownloadDir,
+					func(newName string, added ModProfile) {
+						pendingModProfiles[newName] = added
+						if j := slices.Index(pendingModOrder, n); j >= 0 {
+							pendingModOrder = slices.Insert(pendingModOrder, j+1, newName)
+						}
+						syncModOrder()
+						buildModProfileList()
+					})
+			})
+			// Nothing refers to a profile by name any more, so deleting one can
+			// break no other — and Cancel still undoes it until Apply.
 			deleteBtn := widget.NewButton("Delete", func() {
-				var dependents []string
-				for on, op := range pendingModProfiles {
-					if on != n && op.Base == n {
-						dependents = append(dependents, on)
-					}
-				}
-				doDelete := func() {
-					delete(pendingModProfiles, n)
+				delete(pendingModProfiles, n)
+				syncModOrder()
+				buildModProfileList()
+			})
+			// Up/Down set the order the Modification menus list profiles in, as
+			// the server list's set the Server dropdown's.
+			upBtn := widget.NewButtonWithIcon("", theme.MoveUpIcon(), func() {
+				if i > 0 {
+					pendingModOrder[i-1], pendingModOrder[i] = pendingModOrder[i], pendingModOrder[i-1]
 					buildModProfileList()
 				}
-				if len(dependents) > 0 {
-					sort.Strings(dependents)
-					dialog.ShowConfirm("Delete profile",
-						fmt.Sprintf("%q is the base of: %s.\nDeleting it will break those profiles. Delete anyway?",
-							n, strings.Join(dependents, ", ")),
-						func(ok bool) {
-							if ok {
-								doDelete()
-							}
-						}, w)
-					return
-				}
-				doDelete()
 			})
+			downBtn := widget.NewButtonWithIcon("", theme.MoveDownIcon(), func() {
+				if i < len(pendingModOrder)-1 {
+					pendingModOrder[i], pendingModOrder[i+1] = pendingModOrder[i+1], pendingModOrder[i]
+					buildModProfileList()
+				}
+			})
+			if i == 0 {
+				upBtn.Disable()
+			}
+			if i == len(names)-1 {
+				downBtn.Disable()
+			}
 			rows[i] = container.NewBorder(nil, nil, nil,
-				container.NewHBox(editBtn, deleteBtn), nameLabel)
+				container.NewHBox(upBtn, downBtn, editBtn, copyBtn, deleteBtn), nameLabel)
 		}
 		modProfileList.Objects = rows
 		modProfileList.Refresh()
@@ -679,6 +702,7 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 		showModProfileEditor(a, w, "", ModProfile{}, pendingModProfiles, cfg.DownloadDir,
 			func(newName string, added ModProfile) {
 				pendingModProfiles[newName] = added
+				syncModOrder() // a new profile joins the end
 				buildModProfileList()
 			})
 	})
@@ -779,6 +803,11 @@ func showPreferencesDialog(a fyne.App, parent fyne.Window, current *appTheme, cf
 		updated.TagProfiles = pendingTagProfiles
 		updated.RetrieveStallTimeoutSec = stall
 		updated.ModifyOutputDir = strings.TrimSpace(modOutDirEntry.Text)
+		// Only from a store that loaded: with profiles.json unreadable the list
+		// is empty, and saving that would throw the user's order away.
+		if modProfilesLoadErr == nil {
+			updated.ModProfileOrder = storedModProfileOrder(pendingModOrder)
+		}
 		if exportFormatSelect.Selected == "JSON" {
 			updated.ExportFormat = "json"
 		} else {
@@ -1045,6 +1074,8 @@ func showServerProfileEditor(a fyne.App, parent fyne.Window, p ServerProfile, lo
 	parallelNote.Wrapping = fyne.TextWrapWord
 	parallelNote.TextStyle = fyne.TextStyle{Italic: true}
 
+	parallelItem := widget.NewFormItem("Parallel transfers", container.NewBorder(nil, nil, nil, testBtn, parallelEntry))
+	parallelItem.HintText = "Connections opened at once — for retrieves and pushes alike"
 	form := widget.NewForm(
 		widget.NewFormItem("Profile name", nameEntry),
 		widget.NewFormItem("Remote AE Title", aeEntry),
@@ -1054,7 +1085,7 @@ func showServerProfileEditor(a fyne.App, parent fyne.Window, p ServerProfile, lo
 		widget.NewFormItem("Info model", modelSelect),
 		widget.NewFormItem("Retrieve method", retrieveMethodSelect),
 		widget.NewFormItem("Transfer syntax", tsSelect),
-		widget.NewFormItem("Parallel transfers", container.NewBorder(nil, nil, nil, testBtn, parallelEntry)),
+		parallelItem,
 	)
 
 	// The window stays open until the profile validates, so a validation

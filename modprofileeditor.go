@@ -1,13 +1,17 @@
 package main
 
 // Modification-profile editor — opened from Preferences > Modification &
-// Export. Edits one named ModProfile from ~/.dicomqr/profiles.json. The
-// top-level editor owns every de-identification option the engine honors: the
-// tag lists, the scalar options (birth-date mask, date shift, fixvr,
-// private-tag removal, overlay-plane removal, UID remapping), the zip output
-// default and the ignoretype/ignoremodality file filters. A per-modality override, edited in a
+// Export, by Edit, Copy or Add profile…. Edits one named ModProfile from
+// ~/.dicomqr/profiles.json. Profiles are self-contained (modifyprofile.go), so
+// every control shows the setting a run actually uses — nothing is inherited
+// from anywhere this window does not show. The top-level editor owns every
+// de-identification option the engine honors: the Set and Remove lists, the
+// scalar options (birth-date mask, date shift, fixvr, private-tag removal,
+// overlay-plane removal, UID remapping), the zip output default and the
+// ignoretype/ignoremodality file filters. A per-modality override, edited in a
 // nested sub-editor, may only vary what is genuinely modality-specific — the
-// tag lists plus keepprivate — since the scalar options are profile-wide
+// tag lists (Keep among them: it exempts that modality from the profile's
+// removals) plus keepprivate — since the scalar options are profile-wide
 // decisions; the engine would honor a hand-authored per-modality scalar, so
 // the sub-editor discloses rather than hides one.
 //
@@ -31,9 +35,6 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/widget"
 )
-
-// modProfileNoBaseLabel is the Base select option meaning "no base profile".
-const modProfileNoBaseLabel = "(none)"
 
 // splitProfileLines converts a multi-line entry into a slice with one trimmed,
 // non-empty element per line.
@@ -64,8 +65,8 @@ func splitCommaList(s string) []string {
 //
 // The editor displays each entry as a zero-padded GGGG,EEEE reference with the
 // tag's name appended; the name is display only and stripped here. What is
-// stored is always the canonical form, whatever the user typed — mergeModProfiles
-// compares parsed tags, so no spelling needs preserving.
+// stored is always the canonical form, whatever the user typed — tags are
+// compared parsed (tagMatchKey), so no spelling needs preserving.
 func checkTagLines(field, text string) ([]string, error) {
 	var out []string
 	for _, line := range strippedTagLines(text) {
@@ -78,25 +79,30 @@ func checkTagLines(field, text string) ([]string, error) {
 	return out, nil
 }
 
-// modProfileFieldSet groups the three tag-list controls — the only ModProfile
+// modProfileFieldSet groups the tag-list and mask controls — the ModProfile
 // fields both the top-level editor and the per-modality sub-editor expose. The
 // scalar de-identification options (birth-date mask, UID suffix, date shift,
 // fixvr, private-tag removal) are profile-wide and belong to the top-level
 // editor alone. Layout is left to the caller; the set owns construction,
 // seeding, validation and write-back.
 type modProfileFieldSet struct {
-	sets          *setValueList
-	removes, keep *widget.Entry // multiline
+	sets    *setValueList
+	removes *widget.Entry // multiline
+	// keep exists only in the per-modality sub-editor (nil at the top level):
+	// there it exempts one modality from the profile's removals, where at the
+	// top level a profile would simply not list the tag.
+	keep *widget.Entry // multiline
 	// masks is here rather than on the top-level editor because where an image
 	// prints its banner is a property of the modality and the vendor — the
 	// definition of what a per-modality override may vary.
 	masks *maskRegionList
 }
 
-// newModProfileFieldSet builds the tag-list controls. The Remove and Keep
-// lists are seeded with each tag's name appended for readability; the names
-// are display only and stripped again on save.
-func newModProfileFieldSet(p ModProfile) *modProfileFieldSet {
+// newModProfileFieldSet builds the tag-list controls, with a Keep list when
+// withKeep is set (the per-modality sub-editor). The Remove and Keep lists are
+// seeded with each tag's name appended for readability; the names are display
+// only and stripped again on save.
+func newModProfileFieldSet(p ModProfile, withKeep bool) *modProfileFieldSet {
 	f := &modProfileFieldSet{
 		sets:  newSetValueList(p.Sets),
 		masks: newMaskRegionList(p.MaskRegions),
@@ -107,10 +113,12 @@ func newModProfileFieldSet(p ModProfile) *modProfileFieldSet {
 	f.removes.SetText(decorateTagList(p.Removes))
 	f.removes.SetPlaceHolder("One GGGG,EEEE tag per line, e.g.\n0010,1000")
 
-	f.keep = widget.NewMultiLineEntry()
-	f.keep.SetMinRowsVisible(3)
-	f.keep.SetText(decorateTagList(p.Keep))
-	f.keep.SetPlaceHolder("Tags to keep even when the base profile removes them")
+	if withKeep {
+		f.keep = widget.NewMultiLineEntry()
+		f.keep.SetMinRowsVisible(3)
+		f.keep.SetText(decorateTagList(p.Keep))
+		f.keep.SetPlaceHolder("Tags to keep even when the profile removes them")
+	}
 
 	return f
 }
@@ -118,15 +126,18 @@ func newModProfileFieldSet(p ModProfile) *modProfileFieldSet {
 // applyValidated validates the tag lists and, only on success, overwrites the
 // corresponding fields of dst; on error dst is untouched and the message is
 // user-ready. The engine silently drops unparsable per-modality tag lines, so
-// rejecting them here is the user's only feedback.
+// rejecting them here is the user's only feedback. Without a Keep control the
+// Keep list is cleared: at the top level it has no meaning to preserve.
 func (f *modProfileFieldSet) applyValidated(dst *ModProfile) error {
 	removes, err := checkTagLines("Remove tags", f.removes.Text)
 	if err != nil {
 		return err
 	}
-	keeps, err := checkTagLines("Keep tags", f.keep.Text)
-	if err != nil {
-		return err
+	var keeps []string
+	if f.keep != nil {
+		if keeps, err = checkTagLines("Keep tags", f.keep.Text); err != nil {
+			return err
+		}
 	}
 	sets, err := f.sets.entries()
 	if err != nil {
@@ -152,15 +163,15 @@ type modProfileEditor struct {
 	orig     ModProfile
 	cfg      ModProfileConfig
 
-	nameEntry  *widget.Entry
-	baseSelect *widget.Select
-	fields     *modProfileFieldSet
+	nameEntry *widget.Entry
+	fields    *modProfileFieldSet
 	// The scalar de-identification options are profile-wide: they have no
 	// per-modality controls, so they live here rather than in the shared set.
 	dob, shiftDays   *widget.Entry
 	fixvr            *widget.Select
 	privCheck        *widget.Check
 	overlaysCheck    *widget.Check
+	annotationsSel   *widget.Select
 	remapCheck       *widget.Check
 	tsSelect         *widget.Select
 	auditCheck       *widget.Check
@@ -178,30 +189,15 @@ type modProfileEditor struct {
 	perMod map[string]ModProfile
 }
 
+// newModProfileEditor builds an editor session for the profile named name
+// ("" for a new one, which is what a copy is too — see newModProfileCopyEditor).
 func newModProfileEditor(name string, p ModProfile, cfg ModProfileConfig) *modProfileEditor {
 	e := &modProfileEditor{origName: name, orig: p, cfg: cfg}
 
 	e.nameEntry = widget.NewEntry()
 	e.nameEntry.SetText(name)
 
-	others := make([]string, 0, len(cfg))
-	for n := range cfg {
-		if n != name {
-			others = append(others, n)
-		}
-	}
-	if p.Base != "" && p.Base != name && !slices.Contains(others, p.Base) {
-		others = append(others, p.Base) // dangling reference — keep it visible
-	}
-	sort.Strings(others)
-	e.baseSelect = widget.NewSelect(append([]string{modProfileNoBaseLabel}, others...), nil)
-	if p.Base != "" {
-		e.baseSelect.SetSelected(p.Base)
-	} else {
-		e.baseSelect.SetSelected(modProfileNoBaseLabel)
-	}
-
-	e.fields = newModProfileFieldSet(p)
+	e.fields = newModProfileFieldSet(p, false)
 
 	e.dob = widget.NewEntry()
 	e.dob.SetText(p.DOB)
@@ -223,6 +219,9 @@ func newModProfileEditor(name string, p ModProfile, cfg ModProfileConfig) *modPr
 
 	e.overlaysCheck = widget.NewCheck("", nil)
 	e.overlaysCheck.SetChecked(p.NoOverlays)
+
+	e.annotationsSel = widget.NewSelect(annotationsLabels, nil)
+	e.annotationsSel.SetSelected(annotationsLabelFor(p.Annotations))
 
 	e.remapCheck = widget.NewCheck("", nil)
 	e.remapCheck.SetChecked(p.RemapUIDs)
@@ -259,9 +258,22 @@ func newModProfileEditor(name string, p ModProfile, cfg ModProfileConfig) *modPr
 	return e
 }
 
+// newModProfileCopyEditor builds the session Copy opens: a new profile (so
+// validate refuses every existing name, the source's included) seeded with a
+// deep copy of src and a proposed name no profile uses. Nothing links the
+// copy to its source afterwards.
+func newModProfileCopyEditor(srcName string, src ModProfile, cfg ModProfileConfig) *modProfileEditor {
+	e := newModProfileEditor("", cloneModProfile(src), cfg)
+	e.nameEntry.SetText(copyProfileName(srcName, cfg))
+	return e
+}
+
 // validate checks every control and returns the (possibly renamed) profile to
 // save. updated starts as the original, so fields without controls (verbose,
-// top-level keepprivate) carry through untouched.
+// top-level keepprivate) carry through untouched. A retired base reference
+// does not: saving is the review its warning asks for (see
+// buildModProfileEditorContent), and the profile is self-contained from then
+// on.
 func (e *modProfileEditor) validate() (string, ModProfile, error) {
 	newName := strings.TrimSpace(e.nameEntry.Text)
 	if newName == "" {
@@ -289,16 +301,13 @@ func (e *modProfileEditor) validate() (string, ModProfile, error) {
 	updated.ShiftDays = shift
 	updated.Priv = e.privCheck.Checked
 	updated.NoOverlays = e.overlaysCheck.Checked
+	updated.Annotations = annotationsFromLabel(e.annotationsSel.Selected)
 	if sel := e.fixvr.Selected; sel == "" || sel == fixvrOffLabel {
 		updated.FixVR = ""
 	} else {
 		updated.FixVR = sel
 	}
-	if sel := e.baseSelect.Selected; sel == "" || sel == modProfileNoBaseLabel {
-		updated.Base = ""
-	} else {
-		updated.Base = sel
-	}
+	updated.Base = ""
 	updated.RemapUIDs = e.remapCheck.Checked
 	updated.TransferSyntax = transferSyntaxPrefFromLabel(e.tsSelect.Selected)
 	updated.AuditTags = e.auditCheck.Checked
@@ -319,18 +328,6 @@ func (e *modProfileEditor) validate() (string, ModProfile, error) {
 	if len(updated.PerModality) == 0 {
 		updated.PerModality = nil // keep omitempty round-trips byte-identical
 	}
-
-	// The base chain must still resolve with this edit applied — catches
-	// cycles and references to profiles that no longer exist.
-	temp := maps.Clone(e.cfg)
-	if temp == nil {
-		temp = ModProfileConfig{}
-	}
-	delete(temp, e.origName)
-	temp[newName] = updated
-	if _, err := resolveModProfile(newName, temp); err != nil {
-		return "", ModProfile{}, err
-	}
 	return newName, updated, nil
 }
 
@@ -339,47 +336,42 @@ func (e *modProfileEditor) validate() (string, ModProfile, error) {
 // modProfileDOBAdvisory.
 //
 // It reads the live controls rather than the profile as loaded so the note
-// clears the moment the user adds the missing removal, and it resolves through
-// the base chain — a derived profile inherits its base's Removes, so judging
-// this editor's own list alone would warn about every profile built on
-// base-deident.
+// clears the moment the user adds the missing removal. The Remove list on
+// screen is the profile's whole list — nothing is inherited — so it is the
+// whole answer.
 //
 // Unparsable Remove lines are skipped rather than failing: an advisory must not
 // depend on the field being valid yet, and a broken tag is validate()'s to
-// report. A base chain that will not resolve likewise yields no advisory.
+// report.
 func (e *modProfileEditor) dobAdvisory() string {
 	dob, err := validateDOBMask(e.dob.Text)
 	if err != nil || dob == "" {
 		return ""
 	}
-	candidate := e.orig
-	candidate.DOB = dob
-	candidate.Removes = nil
+	candidate := ModProfile{DOB: dob}
 	for _, line := range strippedTagLines(e.fields.removes.Text) {
 		if ref, ok := canonicalTagRef(line); ok {
 			candidate.Removes = append(candidate.Removes, ref)
 		}
 	}
-	if sel := e.baseSelect.Selected; sel == "" || sel == modProfileNoBaseLabel {
-		candidate.Base = ""
-	} else {
-		candidate.Base = sel
-	}
+	return modProfileDOBAdvisory(candidate)
+}
 
-	// Resolve under a name that cannot collide with a base reference, so a
-	// profile whose own name appears in the chain cannot read as circular.
-	const probe = "\x00probe"
-	temp := maps.Clone(e.cfg)
-	if temp == nil {
-		temp = ModProfileConfig{}
+// annotationAdvisory returns the Graphic annotations note for the profile as
+// the controls currently stand, or "" when there is nothing to say. See
+// modProfileAnnotationAdvisory. Live controls for the same reason as
+// dobAdvisory, and unparsable Remove lines are skipped the same way.
+func (e *modProfileEditor) annotationAdvisory() string {
+	candidate := ModProfile{
+		Annotations:      annotationsFromLabel(e.annotationsSel.Selected),
+		IgnoreModalities: splitCommaList(e.ignoreModsEntry.Text),
 	}
-	delete(temp, e.origName)
-	temp[probe] = candidate
-	resolved, rerr := resolveModProfile(probe, temp)
-	if rerr != nil {
-		return ""
+	for _, line := range strippedTagLines(e.fields.removes.Text) {
+		if ref, ok := canonicalTagRef(line); ok {
+			candidate.Removes = append(candidate.Removes, ref)
+		}
 	}
-	return modProfileDOBAdvisory(resolved)
+	return modProfileAnnotationAdvisory(candidate)
 }
 
 // perModalitySummary renders the one-line list entry for a per-modality
@@ -456,12 +448,11 @@ const modEditorMargin = 12
 
 // showModProfileEditor opens an editor window for the modification profile
 // named name (empty for a new profile). cfg supplies the other profiles for
-// the Base select and the rename-collision and base-cycle checks; it is not
-// modified. onSave receives the (possibly renamed) profile after validation
-// passes. parent owns the window — the Preferences window, which the editor
-// blocks while open and which takes the editor with it when it closes: an
-// editor outliving Preferences would save into a pending-profile map that is
-// no longer going anywhere.
+// the rename-collision check; it is not modified. onSave receives the
+// (possibly renamed) profile after validation passes. parent owns the window —
+// the Preferences window, which the editor blocks while open and which takes
+// the editor with it when it closes: an editor outliving Preferences would
+// save into a pending-profile map that is no longer going anywhere.
 // imageStartDir is where the mask picker's file chooser opens — the download
 // folder, since the images a profile is written against are the ones already
 // retrieved. Empty is fine: the chooser then starts wherever Windows last left
@@ -469,7 +460,34 @@ const modEditorMargin = 12
 func showModProfileEditor(a fyne.App, parent fyne.Window, name string, p ModProfile, cfg ModProfileConfig,
 	imageStartDir string, onSave func(newName string, updated ModProfile)) {
 
-	if raiseOwnedWindow(modProfileEditorKey(name)) {
+	title := "New Modification Profile"
+	if name != "" {
+		title = "Edit Modification Profile — " + name
+	}
+	openModProfileEditor(a, parent, modProfileEditorKey(name), title, newModProfileEditor(name, p, cfg),
+		p, imageStartDir, onSave)
+}
+
+// showModProfileCopyEditor opens the editor on a copy of the profile named
+// srcName: every setting of the source, editable, under a proposed new name.
+// onSave receives the new profile; the source is untouched. This is how a
+// profile is built from another one now that profiles are self-contained.
+func showModProfileCopyEditor(a fyne.App, parent fyne.Window, srcName string, src ModProfile, cfg ModProfileConfig,
+	imageStartDir string, onSave func(newName string, added ModProfile)) {
+
+	ed := newModProfileCopyEditor(srcName, src, cfg)
+	// Keyed as a new profile: the copy is one, and the editor blocks
+	// Preferences, so no second Copy or Add can be asked for while it is open.
+	openModProfileEditor(a, parent, modProfileEditorKey(""), "New Modification Profile — copy of "+srcName,
+		ed, ed.orig, imageStartDir, onSave)
+}
+
+// openModProfileEditor is the window both entry points open. p is the profile
+// the session started from, for the notes that describe what it carries.
+func openModProfileEditor(a fyne.App, parent fyne.Window, key, title string, ed *modProfileEditor, p ModProfile,
+	imageStartDir string, onSave func(newName string, updated ModProfile)) {
+
+	if raiseOwnedWindow(key) {
 		return
 	}
 
@@ -477,15 +495,8 @@ func showModProfileEditor(a fyne.App, parent fyne.Window, name string, p ModProf
 	// opens instantly; sync.Once makes a concurrent picker open harmless.
 	go dictionaryTags()
 
-	title := "New Modification Profile"
-	if name != "" {
-		title = "Edit Modification Profile — " + name
-	}
-
-	ed := newModProfileEditor(name, p, cfg)
-
 	openOwnedWindow(a, windowSpec{
-		Key:      modProfileEditorKey(name),
+		Key:      key,
 		Title:    title,
 		Size:     fyne.NewSize(640, 760),
 		Parent:   parent,
@@ -508,22 +519,19 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 	ed.fields.sets.attach(a, win)
 	ed.fields.masks.attach(a, win, imageStartDir)
 
-	topRow := widget.NewForm(
-		widget.NewFormItem("Profile name", ed.nameEntry),
-		widget.NewFormItem("Base profile", ed.baseSelect))
+	topRow := widget.NewForm(widget.NewFormItem("Profile name", ed.nameEntry))
 
 	tagSection := prefSection("Tag rules", widget.NewForm(
 		widget.NewFormItem("Set values", ed.fields.sets.canvasObject()),
 		widget.NewFormItem("Remove tags",
-			tagListField(a, win, ed.fields.removes, "Choose tags to remove")),
-		widget.NewFormItem("Keep tags",
-			tagListField(a, win, ed.fields.keep, "Choose tags to keep"))))
+			tagListField(a, win, ed.fields.removes, "Choose tags to remove"))))
 
 	optionsForm := widget.NewForm(
 		widget.NewFormItem("Birth date mask", ed.dob),
 		widget.NewFormItem("Remap UIDs", ed.remapCheck),
 		widget.NewFormItem("Remove private tags", ed.privCheck),
 		widget.NewFormItem("Remove overlay planes", ed.overlaysCheck),
+		widget.NewFormItem(annotationsRowLabel, ed.annotationsSel),
 		widget.NewFormItem("Shift dates (days)", ed.shiftDays),
 		widget.NewFormItem("Fix VR", ed.fixvr),
 		widget.NewFormItem("Output transfer syntax", ed.tsSelect),
@@ -550,8 +558,29 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 		dobAdvisoryLabel.Hide()
 	}
 	refreshDOBAdvisory()
+
+	// The annotations note likewise, from the three controls that decide it: the
+	// choice, Remove tags and Ignore modalities.
+	annotationAdvisoryLabel := widget.NewLabel("")
+	annotationAdvisoryLabel.TextStyle = fyne.TextStyle{Italic: true}
+	annotationAdvisoryLabel.Wrapping = fyne.TextWrapWord
+	refreshAnnotationAdvisory := func() {
+		if text := ed.annotationAdvisory(); text != "" {
+			annotationAdvisoryLabel.SetText(text)
+			annotationAdvisoryLabel.Show()
+			return
+		}
+		annotationAdvisoryLabel.Hide()
+	}
+	refreshAnnotationAdvisory()
+	ed.annotationsSel.OnChanged = func(string) { refreshAnnotationAdvisory() }
+	ed.ignoreModsEntry.OnChanged = func(string) { refreshAnnotationAdvisory() }
+
 	ed.dob.OnChanged = func(string) { refreshDOBAdvisory() }
-	ed.fields.removes.OnChanged = func(string) { refreshDOBAdvisory() }
+	ed.fields.removes.OnChanged = func(string) {
+		refreshDOBAdvisory()
+		refreshAnnotationAdvisory()
+	}
 
 	filterCaption := widget.NewLabel("Files matching any of the comma-separated filters are skipped entirely. " +
 		"SOP classes are UIDs: Secondary Capture (1.2.840.10008.5.1.4.1.1.7) is how scanned documents, " +
@@ -563,7 +592,7 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 		widget.NewFormItem("Ignore modalities", ed.ignoreModsEntry),
 		widget.NewFormItem("Ignore SOP classes", container.NewVBox(ed.ignoreSOPEntry, ed.ignoreSOPNames)))
 
-	optionsSection := prefSection("Options", optionsForm, dobAdvisoryLabel)
+	optionsSection := prefSection("Options", optionsForm, dobAdvisoryLabel, annotationAdvisoryLabel)
 	filtersSection := prefSection("File filters", filterCaption, filtersForm)
 
 	// Pixel masking gets its own section rather than a row in Options: it is
@@ -631,7 +660,22 @@ func buildModProfileEditorContent(a fyne.App, win fyne.Window, ed *modProfileEdi
 	perModCaption.Wrapping = fyne.TextWrapWord
 	perModSection := prefSection("Per-modality overrides", perModCaption, perModList, addOverrideBtn)
 
-	sections := []fyne.CanvasObject{topRow, tagSection, optionsSection, maskSection, filtersSection, perModSection}
+	sections := []fyne.CanvasObject{topRow}
+	// A base reference that survives conversion is one that did not resolve,
+	// so this profile holds only its own settings: whatever it inherited — very
+	// possibly the de-identifying part — is gone, and runs refuse it. Said
+	// first, above everything it makes incomplete. Save clears the reference
+	// (validate), which is the review this asks for.
+	if p.Base != "" {
+		warn := widget.NewLabel(fmt.Sprintf("This profile was based on %q, which could not be resolved (it is missing, "+
+			"or its chain loops back), so the settings it inherited are missing and it will not run. Check every "+
+			"setting below — Remove tags and the options especially — then Save; saving makes the profile "+
+			"self-contained.", p.Base))
+		warn.TextStyle = fyne.TextStyle{Bold: true}
+		warn.Wrapping = fyne.TextWrapWord
+		sections = append(sections, warn)
+	}
+	sections = append(sections, tagSection, optionsSection, maskSection, filtersSection, perModSection)
 	// A profile still carrying the removed uid-suffix option cannot run, and
 	// this editor deliberately has no control for it — the entry is preserved,
 	// disclosed here, and refused by compileModifyParams with the same advice.
@@ -730,8 +774,7 @@ func newPerModalityEditor(code string, p ModProfile, taken []string) *perModalit
 	e.codeEntry.SetText(code)
 	e.codeEntry.SetPlaceHolder("e.g. CT, US, MR")
 
-	e.fields = newModProfileFieldSet(p)
-	e.fields.keep.SetPlaceHolder("Tags to keep even when the profile removes them")
+	e.fields = newModProfileFieldSet(p, true)
 
 	e.keepPrivCheck = widget.NewCheck("", nil)
 	e.keepPrivCheck.SetChecked(p.KeepPrivate)
@@ -823,6 +866,9 @@ func perModalityPreservedNote(p ModProfile) fyne.CanvasObject {
 	}
 	if p.NoOverlays {
 		ignored = append(ignored, "nooverlays")
+	}
+	if p.Annotations != "" {
+		ignored = append(ignored, "annotations")
 	}
 	if p.AuditTags {
 		ignored = append(ignored, "audittags")

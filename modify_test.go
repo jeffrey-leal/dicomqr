@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -27,10 +28,21 @@ func embeddedModConfigs(t *testing.T) ModProfileConfig {
 	return profiles
 }
 
-func TestResolveModProfileEmbeddedDefaults(t *testing.T) {
+func TestEmbeddedDefaultProfiles(t *testing.T) {
 	profiles := embeddedModConfigs(t)
 
-	base, err := resolveModProfile("base-deident", profiles)
+	// The shipped store is written self-contained: no base reference (a seeded
+	// file must not need converting) and no top-level Keep list (inert there).
+	for name, p := range profiles {
+		if p.Base != "" || len(p.Keep) > 0 {
+			t.Errorf("shipped profile %q carries base %q / keep %v — profiles are self-contained", name, p.Base, p.Keep)
+		}
+	}
+	if _, conv := flattenModProfiles(profiles); conv.changed() || len(conv.unresolved) > 0 {
+		t.Errorf("shipped profiles would be converted on load: %+v", conv)
+	}
+
+	base, err := lookupModProfile("base-deident", profiles)
 	if err != nil {
 		t.Fatalf("resolve base-deident: %v", err)
 	}
@@ -47,18 +59,24 @@ func TestResolveModProfileEmbeddedDefaults(t *testing.T) {
 		t.Errorf("base-deident ignoremodality = %v, want %v", base.IgnoreModalities, want)
 	}
 
-	// deident-US layers the calibrated-ultrasound mask rule on the base
-	// profile; everything else is inherited unchanged.
-	us, err := resolveModProfile("deident-US", profiles)
+	// deident-US is base-deident plus the calibrated-ultrasound mask rule. It
+	// used to say so with a base reference; the shipped file now holds it
+	// written out in full, which must be exactly what that reference resolved
+	// to — the conversion may not have changed what the profile does.
+	us, err := lookupModProfile("deident-US", profiles)
 	if err != nil {
-		t.Fatalf("resolve deident-US: %v", err)
+		t.Fatalf("look up deident-US: %v", err)
 	}
 	if len(us.MaskRegions) != 1 || maskRegionMode(us.MaskRegions[0]) != maskModeOutsideUS {
 		t.Errorf("deident-US mask regions = %+v, want one %s rule", us.MaskRegions, maskModeOutsideUS)
 	}
-	if us.DOB != "YYYY0101" || !us.RemapUIDs || !us.NoOverlays || len(us.Removes) != len(base.Removes) {
-		t.Errorf("deident-US inherited options = dob %q remap %v nooverlays %v removes %d (base %d)",
-			us.DOB, us.RemapUIDs, us.NoOverlays, len(us.Removes), len(base.Removes))
+	wasDerived := ModProfileConfig{
+		"base-deident": base,
+		"deident-US":   {Base: "base-deident", MaskRegions: us.MaskRegions},
+	}
+	flat, _ := flattenModProfiles(wasDerived)
+	if !reflect.DeepEqual(flat["deident-US"], us) {
+		t.Errorf("shipped deident-US differs from base-deident + mask rule:\n got  %+v\n want %+v", us, flat["deident-US"])
 	}
 }
 
@@ -76,6 +94,9 @@ func TestCompileModifyParamsValidation(t *testing.T) {
 		{"uid suffix removed", ModProfile{UIDSuffix: "7"}, "has been removed"},
 		{"per-modality uid suffix removed",
 			ModProfile{PerModality: map[string]ModProfile{"CT": {UIDSuffix: "7"}}}, "has been removed"},
+		// A base reference left after conversion did not resolve: running only
+		// the profile's own settings could drop the de-identifying ones.
+		{"unresolved base refused", ModProfile{Base: "gone", Sets: []string{"0010,0010=X"}}, "could not be resolved"},
 		{"bad fixvr", ModProfile{FixVR: "maybe"}, "must be correct"},
 		{"bad shiftdays", ModProfile{ShiftDays: "abc"}, "must be an integer"},
 		{"bad transfersyntax", ModProfile{TransferSyntax: "jpeg2000"}, "must be explicit-le"},
@@ -112,29 +133,25 @@ func TestCompileModifyParamsValidation(t *testing.T) {
 	}
 }
 
-// The transfer syntax inherits down a base chain like the other scalars: a
-// child that names none keeps its base's, and one that names its own wins.
-// This is how the shipped profiles are structured, so a syntax set once on a
-// base has to reach every profile built on it.
-func TestModProfileTransferSyntaxInheritance(t *testing.T) {
+// Converting a store written for base inheritance carries the transfer syntax
+// the way runs used to resolve it: a child that named none gets its base's,
+// one that named its own keeps it.
+func TestFlattenCarriesTransferSyntax(t *testing.T) {
 	cfg := ModProfileConfig{
 		"base":     {TransferSyntax: tsPrefImplicitLE, Sets: []string{"0010,0010=ANON"}},
 		"child":    {Base: "base"},
 		"override": {Base: "base", TransferSyntax: tsPrefExplicitLE},
 		"plain":    {Sets: []string{"0010,0010=ANON"}},
 	}
+	flat, _ := flattenModProfiles(cfg)
 	for name, want := range map[string]string{
 		"base":     tsPrefImplicitLE,
 		"child":    tsPrefImplicitLE,
 		"override": tsPrefExplicitLE,
 		"plain":    "",
 	} {
-		resolved, err := resolveModProfile(name, cfg)
-		if err != nil {
-			t.Fatalf("resolve %s: %v", name, err)
-		}
-		if resolved.TransferSyntax != want {
-			t.Errorf("%s resolved TransferSyntax = %q, want %q", name, resolved.TransferSyntax, want)
+		if got := flat[name].TransferSyntax; got != want {
+			t.Errorf("%s converted TransferSyntax = %q, want %q", name, got, want)
 		}
 	}
 }
@@ -345,7 +362,7 @@ func TestRunModificationNoOverlays(t *testing.T) {
 
 func TestRunModificationBaseDeident(t *testing.T) {
 	profiles := embeddedModConfigs(t)
-	resolved, err := resolveModProfile("base-deident", profiles)
+	resolved, err := lookupModProfile("base-deident", profiles)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -449,7 +466,7 @@ func TestRunModificationBaseDeident(t *testing.T) {
 // rather than exporting them — a skip, never a failure.
 func TestRunModificationBaseDeidentSkipsOT(t *testing.T) {
 	profiles := embeddedModConfigs(t)
-	resolved, err := resolveModProfile("base-deident", profiles)
+	resolved, err := lookupModProfile("base-deident", profiles)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -469,7 +486,7 @@ func TestRunModificationBaseDeidentSkipsOT(t *testing.T) {
 
 func TestRunModificationToZip(t *testing.T) {
 	profiles := embeddedModConfigs(t)
-	resolved, err := resolveModProfile("base-deident", profiles)
+	resolved, err := lookupModProfile("base-deident", profiles)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -589,7 +606,7 @@ func TestRunModificationDicomdir(t *testing.T) {
 // index, since its mere presence would claim the export succeeded.
 func TestRunModificationDicomdirNoFiles(t *testing.T) {
 	profiles := embeddedModConfigs(t)
-	resolved, err := resolveModProfile("base-deident", profiles) // ignores OT
+	resolved, err := lookupModProfile("base-deident", profiles) // ignores OT
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -1466,7 +1483,7 @@ func writeExportLayoutFixture(t *testing.T, path, studyUID, seriesUID, sopUID,
 // every file is renamed after its remapped SOP Instance UID.
 func TestRunModificationExportLayout(t *testing.T) {
 	profiles := embeddedModConfigs(t)
-	resolved, err := resolveModProfile("base-deident", profiles)
+	resolved, err := lookupModProfile("base-deident", profiles)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}

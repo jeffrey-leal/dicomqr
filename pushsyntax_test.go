@@ -121,7 +121,7 @@ func pushAll(t *testing.T, port int, paths []string) []StoreProgress {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	var progress []StoreProgress
-	if err := client.StoreFiles(ctx, paths, func(p StoreProgress) { progress = append(progress, p) }); err != nil {
+	if _, err := client.StoreFiles(ctx, paths, 0, func(p StoreProgress) { progress = append(progress, p) }); err != nil {
 		t.Fatalf("StoreFiles: %v", err)
 	}
 	return progress
@@ -214,9 +214,11 @@ func TestStoreFilesConvertsARefusedSyntaxToAnAcceptedOne(t *testing.T) {
 
 // TestSamplePushStudy pushes every file under a real study folder to a running
 // server. Field hook: DICOMQR_PUSH_SAMPLE=<folder>
-// DICOMQR_PUSH_SAMPLE_SERVER=<host>:<port>:<AE title>. It asserts only that
-// every file was sent; what arrived, and in which syntax, is checked on the
-// receiving side.
+// DICOMQR_PUSH_SAMPLE_SERVER=<host>:<port>:<AE title>, optionally
+// DICOMQR_PUSH_SAMPLE_PARALLEL=<1-4> for the server's Parallel transfers —
+// run it at 1 and then at 3 to measure what parallel associations buy on that
+// server. It asserts only that every file was sent; what arrived, and in which
+// syntax, is checked on the receiving side.
 func TestSamplePushStudy(t *testing.T) {
 	folder, server := os.Getenv("DICOMQR_PUSH_SAMPLE"), os.Getenv("DICOMQR_PUSH_SAMPLE_SERVER")
 	if folder == "" || server == "" {
@@ -240,21 +242,27 @@ func TestSamplePushStudy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := NewDicomClient(ServerProfile{Host: parts[0], Port: port, RemoteAETitle: parts[2]}, "DICOMQR")
+	parallel, _ := strconv.Atoi(os.Getenv("DICOMQR_PUSH_SAMPLE_PARALLEL"))
+	client := NewDicomClient(ServerProfile{Host: parts[0], Port: port, RemoteAETitle: parts[2],
+		ParallelTransfers: parallel}, "DICOMQR")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	start := time.Now()
+	var mu sync.Mutex
 	failed := 0
-	err = client.StoreFiles(ctx, paths, func(p StoreProgress) {
+	rep, err := client.StoreFiles(ctx, paths, defaultStallTimeout, func(p StoreProgress) {
 		if p.Err != nil {
+			mu.Lock()
 			failed++
+			mu.Unlock()
 			t.Errorf("%s: %v", p.Path, p.Err)
 		}
 	})
 	if err != nil {
 		t.Fatalf("StoreFiles: %v", err)
 	}
-	t.Logf("pushed %d files in %v, %d failed", len(paths), time.Since(start).Round(time.Millisecond), failed)
+	t.Logf("pushed %d files in %v at up to %d association(s), %d failed%s", len(paths),
+		time.Since(start).Round(time.Millisecond), rep.limit, failed, describeParallelDegrade(rep.degradedBy))
 }
 
 func TestPushPresentationContexts(t *testing.T) {

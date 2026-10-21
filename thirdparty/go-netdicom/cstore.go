@@ -157,8 +157,23 @@ func runCStoreRawOnAssociation(upcallCh chan upcallEvent, downcallCh chan stateE
 		resp, ok := event.command.(*dimse.CStoreRsp)
 		doassert(ok) // TODO(saito)
 		if resp.Status.Status != 0 {
-			return fmt.Errorf("dicom.cstore(%s): failed: %v", cm.label, resp.String())
+			return &CStoreStatusError{Label: cm.label, Status: resp.Status, Response: resp.String()}
 		}
 		return nil
 	}
+}
+
+// CStoreStatusError is a C-STORE the peer answered with a non-success status
+// (dicomqr local patch). The association is intact — only this object was not
+// stored — so a caller sending several can carry on with the next, where an
+// error from the association itself (refused, closed, aborted) ends them all.
+// Upstream returned an untyped error, indistinguishable from the latter.
+type CStoreStatusError struct {
+	Label    string
+	Status   dimse.Status
+	Response string // the response as dimse renders it
+}
+
+func (e *CStoreStatusError) Error() string {
+	return fmt.Sprintf("dicom.cstore(%s): failed: %v", e.Label, e.Response)
 }

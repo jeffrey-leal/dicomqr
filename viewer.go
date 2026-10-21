@@ -929,7 +929,11 @@ func decodeRawPixelFallback(data []byte, rows, cols, samplesPerPixel, bitsAlloc 
 // SPECT store 40-240 frames in a single file — is read from disk once and then
 // decoded frame by frame as the user scrolls.
 type parsedDicom struct {
-	frames         []*frame.Frame
+	frames []*frame.Frame
+	// native, when set, stands in for frames: uncompressed pixel data read one
+	// frame at a time from the file (nativeframes.go), so parsing the file
+	// reads its header and nothing of the pixels.
+	native         *nativeFrameSource
 	transferSyntax string
 
 	hasWindow bool
@@ -949,7 +953,26 @@ type parsedDicom struct {
 
 // frameCount is the number of decodable frames in the file (at least 1 for any
 // successfully parsed file).
-func (p *parsedDicom) frameCount() int { return len(p.frames) }
+func (p *parsedDicom) frameCount() int {
+	if p.native != nil {
+		return p.native.frames
+	}
+	return len(p.frames)
+}
+
+// frameAt returns frame idx, clamped into range — read from the file now when
+// the pixel data is native.
+func (p *parsedDicom) frameAt(idx int) (*frame.Frame, error) {
+	n := p.frameCount()
+	if n == 0 {
+		return nil, errors.New("no pixel data in file")
+	}
+	idx = clampInt(idx, 0, n-1)
+	if p.native != nil {
+		return p.native.frame(idx)
+	}
+	return p.frames[idx], nil
+}
 
 // frameState decodes one frame and renders it at its default window, ready for
 // display. idx is clamped, so a file whose declared NumberOfFrames overstates
@@ -1000,10 +1023,10 @@ func viewerDecodeOpts(interactive bool) frameDecodeOpts {
 
 // frameStateOpts is frameState with decode options (see frameDecodeOpts).
 func (p *parsedDicom) frameStateOpts(idx int, opts frameDecodeOpts) (viewerState, error) {
-	if len(p.frames) == 0 {
-		return viewerState{}, errors.New("no pixel data in file")
+	f, err := p.frameAt(idx)
+	if err != nil {
+		return viewerState{}, err
 	}
-	f := p.frames[clampInt(idx, 0, len(p.frames)-1)]
 
 	df, err := decodeFrame(f, opts, p.transferSyntax, p.hasWindow, p.wc, p.ww,
 		p.slope, p.intercept, p.isSigned, p.bitsAlloc, p.photometric)
@@ -1144,8 +1167,22 @@ func loadDicomThumbnail(path string, frameIdx, maxSide int) (viewerState, error)
 }
 
 // parseDicomFile reads a DICOM file's frames and the parameters needed to
-// decode them. It does not decode any pixels.
+// decode them. It does not decode any pixels. Uncompressed pixel data is not
+// read here at all — only its location, each frame being read when it is
+// decoded (nativeframes.go); everything else is parsed in full.
 func parseDicomFile(path string) (*parsedDicom, error) {
+	if ds, src, ok := openNativeFrameSource(path); ok {
+		p := newParsedDicom(ds)
+		p.native = src
+		return p, nil
+	}
+	return parseDicomFileFull(path)
+}
+
+// parseDicomFileFull is parseDicomFile through the library's parse of the whole
+// file, pixel data included — the path for compressed data, and for anything
+// openNativeFrameSource declines.
+func parseDicomFileFull(path string) (*parsedDicom, error) {
 	// The parser pushes each frame into frameCh with a blocking send DURING
 	// ParseFile, so the channel must be drained concurrently: draining only
 	// after ParseFile returns deadlocks on any file with more frames than the
@@ -1197,20 +1234,6 @@ func parseDicomFile(path string) (*parsedDicom, error) {
 		}
 	}
 
-	wc, ww, hasWindow := dicomWindowParams(ds)
-	slope, intercept := dicomRescaleParams(ds)
-	isSigned := dicomPixelRepresentation(ds) == 1
-	bitsAlloc := dicomBitsAllocated(ds)
-	photometric := dicomPhotometricInterp(ds)
-
-	// Dimensions are needed for the raw-pixel fallback path below.
-	rows := dicomIntParam(ds, tag.Rows)
-	cols := dicomIntParam(ds, tag.Columns)
-	samplesPerPixel := dicomIntParam(ds, tag.SamplesPerPixel)
-	if samplesPerPixel <= 0 {
-		samplesPerPixel = 1
-	}
-
 	// A single-frame encapsulated image may legally arrive split across several
 	// fragments (PS3.5 §A.4); the parser emits one frame per fragment, so
 	// frames[0] alone would be a truncated codestream. Reassemble the full
@@ -1232,23 +1255,38 @@ func parseDicomFile(path string) (*parsedDicom, error) {
 			filepath.Base(path), nFrames, len(frames), len(frames))
 	}
 
+	p := newParsedDicom(ds)
+	p.frames = frames
+	return p, nil
+}
+
+// newParsedDicom reads every decode and presentation parameter from ds, the
+// file's dataset — the header alone is enough, since none of them follows the
+// pixel data. The caller supplies the frames.
+func newParsedDicom(ds sdicom.Dataset) *parsedDicom {
+	wc, ww, hasWindow := dicomWindowParams(ds)
+	slope, intercept := dicomRescaleParams(ds)
+	// Dimensions are needed for the raw-pixel fallback path in frameStateOpts.
+	samplesPerPixel := dicomIntParam(ds, tag.SamplesPerPixel)
+	if samplesPerPixel <= 0 {
+		samplesPerPixel = 1
+	}
 	return &parsedDicom{
-		frames:          frames,
-		transferSyntax:  transferSyntax,
+		transferSyntax:  datasetString(&ds, tag.TransferSyntaxUID),
 		hasWindow:       hasWindow,
 		wc:              wc,
 		ww:              ww,
 		slope:           slope,
 		intercept:       intercept,
-		isSigned:        isSigned,
-		bitsAlloc:       bitsAlloc,
-		rows:            rows,
-		cols:            cols,
+		isSigned:        dicomPixelRepresentation(ds) == 1,
+		bitsAlloc:       dicomBitsAllocated(ds),
+		rows:            dicomIntParam(ds, tag.Rows),
+		cols:            dicomIntParam(ds, tag.Columns),
 		samplesPerPixel: samplesPerPixel,
-		photometric:     photometric,
+		photometric:     dicomPhotometricInterp(ds),
 		ann:             extractAnnotationsFromDataset(ds),
 		overlays:        extractOverlays(ds),
-	}, nil
+	}
 }
 
 // The readers below all use checked assertions, never sdicom.MustGet* — see
@@ -2452,6 +2490,16 @@ func openViewerWindow(a fyne.App, title string, chapters []chapter, collectErr e
 
 		// ── Chapter mode display ──────────────────────────────────────────────
 
+		// frameLanded starts the filmstrip's thumbnails once a frame is on screen
+		// — the one the window opened on, in practice — rather than with the
+		// window, where they decoded on every core alongside the image being
+		// waited for. strip.start runs once however often it is called.
+		frameLanded := func() {
+			if strip != nil {
+				strip.start()
+			}
+		}
+
 		// showChapterFrame shows a frame of the active chapter. A buffered frame
 		// is applied synchronously — that is the playback path, and it must not
 		// queue a goroutine per frame; anything else (a frame the buffer has not
@@ -2467,6 +2515,7 @@ func openViewerWindow(a fyne.App, title string, chapters []chapter, collectErr e
 				}
 				applyState(viewerState{frame: df, ann: ann}, frame, c.frames, keepView)
 				updateCounter()
+				frameLanded()
 				return
 			}
 			counterLbl.SetText(fmt.Sprintf("Frame %d / %d  (loading…)", frame+1, c.frames))
@@ -2477,6 +2526,7 @@ func openViewerWindow(a fyne.App, title string, chapters []chapter, collectErr e
 					if path != chapters[curChapter].path {
 						return // the user moved on while this was loading
 					}
+					defer frameLanded()
 					if err != nil {
 						infoLabel.SetText("Error: " + err.Error())
 						updateCounter()

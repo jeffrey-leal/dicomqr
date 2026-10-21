@@ -66,10 +66,12 @@ func TestNormalizeModProfile(t *testing.T) {
 	}
 }
 
-// This is the bug the canonicalisation exists to kill. A Keep list cancels its
-// base profile's Removes list; when that comparison was textual, two files
+// This is the bug the canonicalisation exists to kill. A Keep list cancelled
+// its base profile's Removes list; when that comparison was textual, two files
 // spelling one tag differently silently stopped the cancellation, and a tag the
 // user asked to preserve was deleted from every exported file instead.
+// Inheritance is retired, but converting a store written for it must still
+// cancel across spellings, or conversion would reintroduce exactly that.
 func TestMergeCancelsKeepAcrossSpellings(t *testing.T) {
 	for _, tc := range []struct{ remove, keep string }{
 		{"40,275", "0040,0275"},    // base short, child padded
@@ -81,7 +83,7 @@ func TestMergeCancelsKeepAcrossSpellings(t *testing.T) {
 			"base":  {Removes: []string{tc.remove, "0010,1000"}},
 			"child": {Base: "base", Keep: []string{tc.keep}},
 		}
-		resolved, err := resolveModProfile("child", cfg)
+		resolved, err := resolveBaseChain("child", cfg)
 		if err != nil {
 			t.Fatalf("resolve (%s / %s): %v", tc.remove, tc.keep, err)
 		}
@@ -102,9 +104,9 @@ func TestMergeCancelsKeepAcrossSpellings(t *testing.T) {
 
 // TestModProfileDOBAdvisory covers the safeguard for the one thing the
 // birth-date mask cannot reach: a copy nested inside Original Attributes
-// Sequence. Every case here is driven through resolveModProfile, because the
-// advisory is only correct against a resolved profile — the base supplies the
-// removal for most real profiles, and a Keep list can take it away again.
+// Sequence. Profiles are self-contained, so each case is judged on the
+// profile's own list; the last two run through conversion, which must leave a
+// formerly derived profile answering exactly as its resolved form did.
 func TestModProfileDOBAdvisory(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -120,25 +122,25 @@ func TestModProfileDOBAdvisory(t *testing.T) {
 		// Spelling must not matter: the profile code compares parsed tags.
 		{"dob mask with the removal, short form",
 			ModProfileConfig{"p": {DOB: "YYYY0101", Removes: []string{"400,561"}}}, false},
-		{"removal inherited from the base",
+		{"converted: removal came from the base",
 			ModProfileConfig{
 				"base": {Removes: []string{"0400,0561"}},
 				"p":    {Base: "base", DOB: "YYYY0101"},
 			}, false},
-		// The case that makes resolving mandatory: the child cancels the base's
-		// removal, so the sequence survives and the advisory must come back.
-		{"keep cancels the base's removal",
+		// The child cancelled the base's removal, so after conversion the
+		// sequence survives and the advisory must come back.
+		{"converted: keep cancelled the base's removal",
 			ModProfileConfig{
 				"base": {Removes: []string{"0400,0561"}},
 				"p":    {Base: "base", DOB: "YYYY0101", Keep: []string{"400,561"}},
 			}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			resolved, err := resolveModProfile("p", tc.cfg)
-			if err != nil {
-				t.Fatalf("resolve: %v", err)
+			flat, conv := flattenModProfiles(tc.cfg)
+			if len(conv.unresolved) > 0 {
+				t.Fatalf("conversion: %v", conv.unresolved)
 			}
-			got := modProfileDOBAdvisory(resolved)
+			got := modProfileDOBAdvisory(flat["p"])
 			if (got != "") != tc.want {
 				t.Errorf("advisory = %q, want present=%v", got, tc.want)
 			}
@@ -153,26 +155,22 @@ func TestModProfileDOBAdvisory(t *testing.T) {
 // raise the advisory — if that removal is ever dropped from defaults this test
 // is what says so.
 func TestEmbeddedDefaultsRaiseNoDOBAdvisory(t *testing.T) {
-	profiles := embeddedModConfigs(t)
-	for name := range profiles {
-		resolved, err := resolveModProfile(name, profiles)
-		if err != nil {
-			t.Fatalf("resolve %s: %v", name, err)
-		}
-		if adv := modProfileDOBAdvisory(resolved); adv != "" {
+	for name, p := range embeddedModConfigs(t) {
+		if adv := modProfileDOBAdvisory(p); adv != "" {
 			t.Errorf("shipped profile %q raises the birth-date advisory: %s", name, adv)
 		}
 	}
 }
 
-// The same applies to Set values, which are matched on the tag half alone so an
-// override replaces the base's value rather than appending a second Set.
+// The same applies to Set values, which conversion matches on the tag half
+// alone so a child's value replaces the base's rather than appending a second
+// Set.
 func TestMergeSetOverrideAcrossSpellings(t *testing.T) {
 	cfg := ModProfileConfig{
 		"base":  {Sets: []string{"10,10=BASE"}},
 		"child": {Base: "base", Sets: []string{"0010,0010=CHILD"}},
 	}
-	resolved, err := resolveModProfile("child", cfg)
+	resolved, err := resolveBaseChain("child", cfg)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -342,7 +340,7 @@ func TestCompileModifyParamsResolvesReferences(t *testing.T) {
 // Modification dialog on an error.
 func TestEmbeddedDefaultsReferencesResolve(t *testing.T) {
 	profiles := embeddedModConfigs(t)
-	base, err := resolveModProfile("base-deident", profiles)
+	base, err := lookupModProfile("base-deident", profiles)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -520,7 +518,9 @@ func TestDefaultSettingsExportFormat(t *testing.T) {
 }
 
 // ignoresopclass merges like its sibling filters — union with the base,
-// deduplicated — and survives inside a per-modality override.
+// deduplicated — and survives inside a per-modality override. (Merging is
+// conversion's now: a store written for base inheritance must convert to what
+// its runs did.)
 func TestMergeUnionsIgnoreSOPClasses(t *testing.T) {
 	base := ModProfile{IgnoreSOPClasses: []string{"1.2.840.10008.5.1.4.1.1.7"}}
 	override := ModProfile{

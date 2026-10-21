@@ -11,8 +11,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"image/color"
+	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -30,6 +32,15 @@ type TagProfile struct {
 	Color   color.RGBA `json:"color"`
 	Tags    []tag.Tag  `json:"tags"`
 	Enabled bool       `json:"enabled"`
+	// Modalities limits the profile to files whose Modality (0008,0060) is one
+	// of these codes — "PT", not "PET" — so a modality's profile colours its
+	// own files only. Empty applies it to every file, which is what a profile
+	// such as PHI means. Without it, matching was by tag alone: a tag two
+	// modalities share took the earlier profile's colour in both, so a CT
+	// file's Convolution Kernel and Table Height showed in NM's colour.
+	// dicomqr-only: dicomhdr ignores the field, so a block copied there applies
+	// to every file.
+	Modalities []string `json:"modalities,omitempty"`
 }
 
 // tagProfileWire is the JSON representation of TagProfile.
@@ -37,18 +48,66 @@ type TagProfile struct {
 // in the Preferences dialog — so manually edited settings.json files are
 // consistent with what the application displays and accepts.
 type tagProfileWire struct {
-	Name    string     `json:"name"`
-	Color   color.RGBA `json:"color"`
-	Tags    []string   `json:"tags"`
-	Enabled bool       `json:"enabled"`
+	Name       string     `json:"name"`
+	Color      color.RGBA `json:"color"`
+	Tags       []string   `json:"tags"`
+	Enabled    bool       `json:"enabled"`
+	Modalities []string   `json:"modalities,omitempty"`
+}
+
+// appliesTo reports whether the profile colours a file of the given Modality.
+func (p TagProfile) appliesTo(modality string) bool {
+	if len(p.Modalities) == 0 {
+		return true
+	}
+	modality = strings.ToUpper(strings.TrimSpace(modality))
+	for _, m := range p.Modalities {
+		if m == modality {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeModalities upper-cases and trims modality codes, dropping empty and
+// repeated ones; nil when none remain, so an unrestricted profile marshals
+// without the key.
+func normalizeModalities(in []string) []string {
+	var out []string
+	for _, m := range in {
+		m = strings.ToUpper(strings.TrimSpace(m))
+		if m != "" && !slices.Contains(out, m) {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// parseModalityList reads the editor's Modalities field: codes separated by
+// commas or spaces. A code is what Modality (0008,0060) holds — a DICOM Code
+// String of capitals, digits and underscores, at most 16 long — so "pet" is
+// accepted as typed but a stray word is reported rather than stored as a code
+// no file can carry.
+func parseModalityList(text string) ([]string, error) {
+	fields := strings.FieldsFunc(text, func(r rune) bool { return r == ',' || unicode.IsSpace(r) })
+	for _, f := range fields {
+		u := strings.ToUpper(f)
+		if len(u) > 16 || strings.IndexFunc(u, func(r rune) bool {
+			return !(r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_')
+		}) >= 0 {
+			return nil, fmt.Errorf("%q is not a modality code (letters, digits and _ only, as in CT, MR, NM, PT, US)", f)
+		}
+	}
+	return normalizeModalities(fields), nil
 }
 
 func (p TagProfile) MarshalJSON() ([]byte, error) {
 	w := tagProfileWire{
-		Name:    p.Name,
-		Color:   p.Color,
-		Enabled: p.Enabled,
-		Tags:    make([]string, len(p.Tags)),
+		Name:       p.Name,
+		Color:      p.Color,
+		Enabled:    p.Enabled,
+		Tags:       make([]string, len(p.Tags)),
+		Modalities: normalizeModalities(p.Modalities),
 	}
 	for i, t := range p.Tags {
 		w.Tags[i] = fmt.Sprintf("%04X,%04X", t.Group, t.Element)
@@ -64,6 +123,7 @@ func (p *TagProfile) UnmarshalJSON(b []byte) error {
 	p.Name = w.Name
 	p.Color = w.Color
 	p.Enabled = w.Enabled
+	p.Modalities = normalizeModalities(w.Modalities)
 	tags, err := parseTags(strings.Join(w.Tags, "\n"))
 	if err != nil {
 		return err
@@ -72,22 +132,49 @@ func (p *TagProfile) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// matchProfile returns the color of the first enabled profile containing t.
-func matchProfile(t tag.Tag, hasTag bool, profiles []TagProfile) (color.Color, bool) {
+// matches reports whether p colours tag t in a file of the given modality:
+// enabled, applicable to that modality (see TagProfile.Modalities), and
+// listing the tag.
+func (p TagProfile) matches(t tag.Tag, modality string) bool {
+	if !p.Enabled || !p.appliesTo(modality) {
+		return false
+	}
+	for _, pt := range p.Tags {
+		if pt == t {
+			return true
+		}
+	}
+	return false
+}
+
+// matchProfile returns the color of the first profile that matches t in a
+// file of the given modality.
+func matchProfile(t tag.Tag, hasTag bool, modality string, profiles []TagProfile) (color.Color, bool) {
 	if !hasTag {
 		return nil, false
 	}
 	for i := range profiles {
-		if !profiles[i].Enabled {
-			continue
-		}
-		for _, pt := range profiles[i].Tags {
-			if pt == t {
-				return profiles[i].Color, true
-			}
+		if profiles[i].matches(t, modality) {
+			return profiles[i].Color, true
 		}
 	}
 	return nil, false
+}
+
+// matchingProfileNames names every profile that matches t in a file of the
+// given modality, in profile order — so the first is the one whose colour
+// matchProfile gives the row, and the rest are the ones it overrides.
+func matchingProfileNames(t tag.Tag, hasTag bool, modality string, profiles []TagProfile) []string {
+	if !hasTag {
+		return nil
+	}
+	var names []string
+	for i := range profiles {
+		if profiles[i].matches(t, modality) {
+			names = append(names, profiles[i].Name)
+		}
+	}
+	return names
 }
 
 // malformedTagColor returns the configured colour for tags whose VR violates
@@ -164,6 +251,10 @@ func showTagProfileEditor(a fyne.App, parent fyne.Window, p TagProfile, onSave f
 		picker.Show()
 	})
 
+	modalitiesEntry := widget.NewEntry()
+	modalitiesEntry.SetText(strings.Join(p.Modalities, ", "))
+	modalitiesEntry.SetPlaceHolder("Empty = every file; e.g. CT, or NM, PT")
+
 	tagEntry := widget.NewMultiLineEntry()
 	tagEntry.SetMinRowsVisible(6)
 	tagEntry.SetText(formatTags(p.Tags))
@@ -172,11 +263,17 @@ func showTagProfileEditor(a fyne.App, parent fyne.Window, p TagProfile, onSave f
 	form := widget.NewForm(
 		widget.NewFormItem("Name", nameEntry),
 		widget.NewFormItem("Color", container.NewHBox(swatch, changeColorBtn)),
+		widget.NewFormItem("Modalities", modalitiesEntry),
 		widget.NewFormItem("Tags", tagEntry),
 	)
 
 	cancelBtn := widget.NewButton("Cancel", func() { w.Close() })
 	saveBtn := widget.NewButton("Save", func() {
+		modalities, err := parseModalityList(modalitiesEntry.Text)
+		if err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
 		tags, err := parseTags(tagEntry.Text)
 		if err != nil {
 			dialog.ShowError(err, w)
@@ -186,6 +283,7 @@ func showTagProfileEditor(a fyne.App, parent fyne.Window, p TagProfile, onSave f
 		updated := p
 		updated.Name = nameEntry.Text
 		updated.Color = pendingColor
+		updated.Modalities = modalities
 		updated.Tags = tags
 		w.Close()
 		onSave(updated)

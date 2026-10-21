@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image/color"
+	"slices"
 	"testing"
 
 	"github.com/suyashkumar/dicom/pkg/tag"
@@ -12,7 +13,8 @@ import (
 
 // TestDefaultSettingsTagViewer verifies the embedded defaults carry the tag
 // viewer preferences: highlights on, dicomhdr's red, and the stock profiles
-// (PHI, NM, PET), all enabled with non-empty, duplicate-free tag lists.
+// (PHI, then one per modality), all enabled with non-empty, duplicate-free
+// tag lists.
 func TestDefaultSettingsTagViewer(t *testing.T) {
 	var s Settings
 	if err := json.Unmarshal(defaultSettingsJSON, &s); err != nil {
@@ -24,7 +26,7 @@ func TestDefaultSettingsTagViewer(t *testing.T) {
 	if s.MalformedColor != "E54545FF" {
 		t.Errorf("MalformedColor = %q, want E54545FF", s.MalformedColor)
 	}
-	wantNames := []string{"PHI", "NM", "PET"}
+	wantNames := []string{"PHI", "NM", "PET", "CT", "MR", "US"}
 	if len(s.TagProfiles) != len(wantNames) {
 		t.Fatalf("expected %d default profiles %v, got %+v", len(wantNames), wantNames, s.TagProfiles)
 	}
@@ -49,15 +51,36 @@ func TestDefaultSettingsTagViewer(t *testing.T) {
 	}
 	phi := s.TagProfiles[0]
 	// Spot-check PatientName (0010,0010) is covered and drives matchProfile.
-	c, ok := matchProfile(tag.Tag{Group: 0x0010, Element: 0x0010}, true, s.TagProfiles)
+	c, ok := matchProfile(tag.Tag{Group: 0x0010, Element: 0x0010}, true, "CT", s.TagProfiles)
 	if !ok {
 		t.Fatal("PatientName (0010,0010) should match the PHI profile")
 	}
 	if c != phi.Color {
 		t.Errorf("matchProfile colour = %v, want %v", c, phi.Color)
 	}
+	// Each modality profile carries an attribute that defines its modality,
+	// and not one only the other nuclear-medicine modality uses.
+	for name, defining := range map[string]tag.Tag{
+		"NM":  {Group: 0x0054, Element: 0x0012}, // Energy Window Information Sequence
+		"PET": {Group: 0x0054, Element: 0x1001}, // Units
+		"CT":  {Group: 0x0018, Element: 0x0060}, // KVP
+		"MR":  {Group: 0x0018, Element: 0x0081}, // Echo Time
+		"US":  {Group: 0x0018, Element: 0x6011}, // Sequence of Ultrasound Regions
+	} {
+		for _, p := range s.TagProfiles {
+			if p.Name == name && !slices.Contains(p.Tags, defining) {
+				t.Errorf("profile %s lacks %04X,%04X", name, defining.Group, defining.Element)
+			}
+		}
+	}
+	for _, p := range s.TagProfiles {
+		if p.Name == "NM" && slices.Contains(p.Tags, tag.Tag{Group: 0x0054, Element: 0x1001}) {
+			t.Error("NM lists Units (0054,1001), which only the PET Series module defines")
+		}
+	}
+
 	// Structural nodes (hasTag=false) must never match.
-	if _, ok := matchProfile(tag.Tag{Group: 0x0010, Element: 0x0010}, false, s.TagProfiles); ok {
+	if _, ok := matchProfile(tag.Tag{Group: 0x0010, Element: 0x0010}, false, "CT", s.TagProfiles); ok {
 		t.Error("matchProfile must not match when hasTag is false")
 	}
 }

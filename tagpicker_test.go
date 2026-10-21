@@ -2,9 +2,9 @@ package main
 
 // Tests for the tag dictionary enumeration and the picker's selection merge.
 // The merge tests are the important ones: what the picker writes back into a
-// profile's Remove or Keep list is what mergeModProfiles then matches a base
-// profile against, and a Keep entry that stops cancelling its base's Removes
-// deletes a tag the user asked to preserve.
+// Remove or Keep list is what the engine then matches files against — a
+// per-modality Keep entry that stops cancelling the profile's Removes deletes a
+// tag the user asked to preserve.
 
 import (
 	"os"
@@ -238,7 +238,7 @@ func TestMergeTagSelectionRoundTripsThroughValidation(t *testing.T) {
 // and be reachable without opening 76 collapsed groups by hand.
 func TestTagPickerOpensOnCurrentEntries(t *testing.T) {
 	profiles := embeddedModConfigs(t)
-	base, err := resolveModProfile("base-deident", profiles)
+	base, err := lookupModProfile("base-deident", profiles)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -407,7 +407,7 @@ func TestFieldSetRoundTripsDecoratedLists(t *testing.T) {
 	test.NewApp()
 	// The shipped defaults, which are canonical on disk.
 	profiles := embeddedModConfigs(t)
-	base, err := resolveModProfile("base-deident", profiles)
+	base, err := lookupModProfile("base-deident", profiles)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}

@@ -118,6 +118,9 @@ func TestPHITextScreenMatchesRun(t *testing.T) {
 		{"top-level comment removed, nested one kept", ModProfile{Removes: []string{"0020,4000"}},
 			[]string{"nested.dcm"}},
 		{"both removed", ModProfile{Removes: []string{"0020,4000", "0040,1400"}}, nil},
+		// Removing a sequence removes what it holds; the screen used to judge
+		// the nested field by its own tag alone and flag it anyway.
+		{"enclosing sequence removed", ModProfile{Removes: []string{"0020,4000", "0040,0275"}}, nil},
 		{"set values count as handled", ModProfile{Sets: []string{"0020,4000=REDACTED"}, Removes: []string{"0040,1400"}}, nil},
 		{"override keep restores a field", ModProfile{
 			Removes:     []string{"0020,4000", "0040,1400"},

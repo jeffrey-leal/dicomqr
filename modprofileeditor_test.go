@@ -310,13 +310,12 @@ func TestModProfileEditorValidationErrors(t *testing.T) {
 			ed.fields.sets.rows = append(ed.fields.sets.rows, newSetValueRow("0008,0020=ANON"))
 		}, "is a DA value"},
 		{"bad remove tag", func(ed *modProfileEditor) { ed.fields.removes.SetText("notatag") }, "not a GGGG,EEEE tag"},
-		{"base cycle", func(ed *modProfileEditor) { ed.baseSelect.SetSelected("other") }, "circular"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := ModProfileConfig{
 				"a":     {Sets: []string{"0010,0010=X"}},
-				"other": {Base: "a", Removes: []string{"0010,1000"}},
+				"other": {Removes: []string{"0010,1000"}},
 			}
 			ed := newModProfileEditor("a", cfg["a"], cfg)
 			tc.mutate(ed)
@@ -454,16 +453,93 @@ func TestModProfileEditorDOBAdvisory(t *testing.T) {
 	if adv := ed.dobAdvisory(); adv != "" {
 		t.Errorf("advisory shown for a profile with no birth date mask: %s", adv)
 	}
+}
 
-	// A base supplying the removal is enough — the advisory must resolve the
-	// chain, not just read this editor's own list.
-	inherited := ModProfileConfig{
-		"base": {Removes: []string{"0400,0561"}},
-		"p":    {Base: "base", DOB: "YYYY0101"},
+// Copy opens a new profile holding every setting of the source under a name
+// no profile uses; saving it leaves the source as it was.
+func TestModProfileCopyEditor(t *testing.T) {
+	test.NewApp()
+	src := ModProfile{
+		Sets:        []string{"0010,0010=ANON", "0010,0020=[0010,0010]"},
+		Removes:     []string{"0008,0080", "0400,0561"},
+		DOB:         "YYYY0101",
+		ShiftDays:   "-30",
+		FixVR:       "correct",
+		RemapUIDs:   true,
+		Priv:        true,
+		NoOverlays:  true,
+		Annotations: annotationsNoText,
+		AuditTags:   true,
+		Zip:         true,
+		Flat:        true,
+		Dicomdir:    true,
+		Verbose:     true,
+		ExportName:  "[0010,0010]",
+		IgnoreTypes: []string{"LOCALIZER"}, IgnoreModalities: []string{"SR"},
+		IgnoreSOPClasses: []string{"1.2.840.10008.5.1.4.1.1.7"},
+		TransferSyntax:   tsPrefExplicitLE,
+		MaskRegions:      []MaskRegion{{Mode: maskModeOutsideUS}},
+		PerModality: map[string]ModProfile{
+			"CT": {Removes: []string{"0018,1030"}, Keep: []string{"0008,0080"}, KeepPrivate: true},
+		},
 	}
-	ed2 := newModProfileEditor("p", inherited["p"], inherited)
-	if adv := ed2.dobAdvisory(); adv != "" {
-		t.Errorf("advisory shown though the base removes 0400,0561: %s", adv)
+	cfg := ModProfileConfig{"base-deident": src, "base-deident copy": {}}
+	srcBefore := cloneModProfile(src)
+
+	ed := newModProfileCopyEditor("base-deident", src, cfg)
+	if got := ed.nameEntry.Text; got != "base-deident copy 2" {
+		t.Errorf("proposed name = %q, want the first unused one", got)
+	}
+	name, saved, err := ed.validate()
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if name != "base-deident copy 2" {
+		t.Errorf("saved under %q", name)
+	}
+	if !reflect.DeepEqual(saved, src) {
+		t.Errorf("copy differs from its source:\n got  %+v\n want %+v", saved, src)
+	}
+	if !reflect.DeepEqual(cfg["base-deident"], srcBefore) {
+		t.Error("copying changed the source profile")
+	}
+
+	// A copy is a new profile: every existing name is taken, its source's too.
+	ed.nameEntry.SetText("base-deident")
+	if _, _, err := ed.validate(); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("saving a copy over its source: err = %v, want a collision", err)
+	}
+}
+
+// The top-level editor has no Keep list — it only ever cancelled a base's
+// removals — and saving clears a base reference conversion could not resolve,
+// which is the review its warning asks for.
+func TestModProfileEditorSavesSelfContained(t *testing.T) {
+	test.NewApp()
+	p := ModProfile{Base: "gone", Keep: []string{"0010,1000"}, Removes: []string{"0008,0080"}}
+	ed := newModProfileEditor("p", p, ModProfileConfig{"p": p})
+	if ed.fields.keep != nil {
+		t.Error("the top-level editor offers a Keep list")
+	}
+	_, saved, err := ed.validate()
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if saved.Base != "" || saved.Keep != nil {
+		t.Errorf("saved base %q keep %v, want neither", saved.Base, saved.Keep)
+	}
+	if _, err := compileModifyParams(saved); err != nil {
+		t.Errorf("the saved profile does not compile: %v", err)
+	}
+
+	// The per-modality sub-editor keeps its Keep list: there it exempts one
+	// modality from the profile's removals.
+	sub := newPerModalityEditor("CT", ModProfile{Keep: []string{"0008,0080"}}, nil)
+	if sub.fields.keep == nil {
+		t.Fatal("the per-modality editor lost its Keep list")
+	}
+	if _, ov, err := sub.validate(); err != nil || !reflect.DeepEqual(ov.Keep, []string{"0008,0080"}) {
+		t.Errorf("override Keep = %v (err %v), want it kept", ov.Keep, err)
 	}
 }
 

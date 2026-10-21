@@ -45,10 +45,10 @@ func loadMaskFrame(path string) (image.Image, *sdicom.Dataset, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(p.frames) == 0 {
+	if p.frameCount() == 0 {
 		return nil, nil, fmt.Errorf("%s has no image data", filepath.Base(path))
 	}
-	state, err := p.frameStateOpts(len(p.frames)/2, interactiveDecodeOpts()) // the user is waiting on this one frame
+	state, err := p.frameStateOpts(p.frameCount()/2, interactiveDecodeOpts()) // the user is waiting on this one frame
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1069,6 +1069,7 @@ func buildMaskPreview(a fyne.App, parent fyne.Window, profileName string,
 			// below the series.
 			if seriesHasChapters(sr.files) {
 				strip = newChapterStrip(chaps, func(index int) { goTo(index) })
+				strip.start()
 				strip.selectIndex(fileIdx)
 				refreshStripStatuses()
 				stripHolder.Objects = []fyne.CanvasObject{strip.object()}

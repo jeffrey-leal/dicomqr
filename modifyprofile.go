@@ -5,23 +5,32 @@ package main
 // (~/.dicomqr/profiles.json), seeded from embedded defaults on first run and
 // never overwritten, so hand-edits survive upgrades.
 //
-// Every tag reference is stored canonically as zero-padded GGGG,EEEE and
-// canonicalised on load, and profiles are merged by comparing parsed tags
-// rather than the text that spells them. That matters most for the Keep list,
-// which cancels a base profile's Removes: when the comparison was textual, two
-// files disagreeing on "40,275" versus "0040,0275" silently stopped a tag being
-// preserved.
+// Every profile is self-contained: what the editor shows is everything a run
+// does. Profiles used to inherit from a `base` profile, and that was dropped
+// (user decision 2026-10-16) for three reasons. The editor showed only a
+// profile's own additions, so a derived profile opened with Remap UIDs and
+// Remove private tags unticked while its runs did both. Inheritance could only
+// add — checkboxes were OR'd with the base's and an empty scalar meant "the
+// base's" — so a derived profile could not turn off anything its base turned
+// on. And editing a base silently changed every profile built on it. A new
+// profile now starts as a Copy of an existing one (Preferences) and is edited
+// freely from there; a profiles.json still carrying `base` is converted once
+// at startup to the resolved form it always ran with (convertModProfileStore).
 //
-// The JSON format and merge semantics otherwise follow dicomtool, with these
-// deliberate divergences: `zip`, `flat`, `transfersyntax`, `nooverlays` and
+// Every tag reference is stored canonically as zero-padded GGGG,EEEE and
+// canonicalised on load, and tags are compared by identity rather than by the
+// text that spells them (tagMatchKey).
+//
+// The JSON format otherwise follows dicomtool, with these deliberate
+// divergences: `zip`, `flat`, `transfersyntax`, `nooverlays`, `annotations` and
 // `audittags` are dicomqr-only (dicomtool ignores unknown keys); dicomtool's `maskrows` is
 // unsupported here, dropped on load and stripped on save; the `uid` suffix
 // option is removed — the value is preserved through load and save but a
-// profile carrying it is refused at run time in favour of Remap UIDs; and
-// dicomqr no longer resolves dicomtool's tag aliases, so a profile copied from
-// it must use tag numbers.
-// The tag picker names tags from the standard dictionary, which is a better
-// naming authority than a map the user has to maintain.
+// profile carrying it is refused at run time in favour of Remap UIDs; `base`
+// is read only to convert it away and never written; and dicomqr no longer
+// resolves dicomtool's tag aliases, so a profile copied from it must use tag
+// numbers. The tag picker names tags from the standard dictionary, which is a
+// better naming authority than a map the user has to maintain.
 
 import (
 	_ "embed"
@@ -29,6 +38,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -48,11 +58,21 @@ var defaultModProfilesJSON []byte
 // equivalent for either), and dicomtool's maskrows has no field here by
 // design.
 type ModProfile struct {
+	// Base is the retired inheritance reference, read only so a profiles.json
+	// written before profiles became self-contained can be converted
+	// (flattenModProfiles). After conversion it is non-empty only on a profile
+	// whose base could not be resolved — missing, or part of a loop — which
+	// compileModifyParams refuses to run, since the settings it would have
+	// inherited are unknown. Saving such a profile from the editor clears it.
 	Base    string   `json:"base,omitempty"`
 	Sets    []string `json:"set,omitempty"`
 	Removes []string `json:"remove,omitempty"`
-	Keep    []string `json:"keep,omitempty"`
-	DOB     string   `json:"dob,omitempty"`
+	// Keep cancels removals. It means something only inside a per-modality
+	// override, where it exempts that modality from the profile's Removes; at
+	// the top level it was only ever applied while merging a base, so
+	// conversion drops it and the top-level editor has no control for it.
+	Keep []string `json:"keep,omitempty"`
+	DOB  string   `json:"dob,omitempty"`
 	// UIDSuffix is the removed uid-suffix option (Remap UIDs replaced it). The
 	// field survives only so a profile still carrying `uid` — dicomtool-authored
 	// or old — round-trips through load and save instead of being silently
@@ -107,6 +127,15 @@ type ModProfile struct {
 	// `nooverlays` and drops it when it saves); profile-wide, like the other
 	// scalar options.
 	NoOverlays bool `json:"nooverlays,omitempty"`
+
+	// Annotations decides what an export keeps of the graphic annotations a
+	// reviewer drew over an image — arrows, outlines, measurements, text boxes,
+	// stored as vectors in presentation states (annotations.go): empty keeps
+	// them (the profile's tag rules still apply), "notext" keeps the shapes and
+	// removes every piece of text, "remove" removes them all. dicomqr-only
+	// (dicomtool ignores `annotations` and drops it when it saves); profile-wide,
+	// like nooverlays.
+	Annotations string `json:"annotations,omitempty"`
 
 	// AuditTags marks every exported file as de-identified, as PS3.15 expects
 	// of a de-identified object: Patient Identity Removed (0012,0062) = YES, a
@@ -223,6 +252,41 @@ func transferSyntaxPrefFromLabel(label string) string {
 // ModProfileConfig maps profile names to their definitions.
 type ModProfileConfig map[string]ModProfile
 
+// orderedModProfileNames lists cfg's profiles in the user's order
+// (Settings.ModProfileOrder): every name order holds that cfg has, as ordered,
+// then the rest alphabetically — a profile created since, or added to
+// profiles.json by hand. A name cfg lacks, or one listed twice after its first
+// place, is skipped, so the result always names each profile exactly once.
+func orderedModProfileNames(cfg ModProfileConfig, order []string) []string {
+	names := make([]string, 0, len(cfg))
+	seen := make(map[string]bool, len(cfg))
+	for _, n := range order {
+		if _, ok := cfg[n]; ok && !seen[n] {
+			names = append(names, n)
+			seen[n] = true
+		}
+	}
+	rest := make([]string, 0, len(cfg)-len(names))
+	for n := range cfg {
+		if !seen[n] {
+			rest = append(rest, n)
+		}
+	}
+	sort.Strings(rest)
+	return append(names, rest...)
+}
+
+// storedModProfileOrder is what Settings.ModProfileOrder should hold for the
+// order names are now in: nil when that is plain alphabetical, so someone who
+// never reorders keeps the alphabetical list — a profile added later included —
+// rather than having today's list frozen into settings.json.
+func storedModProfileOrder(names []string) []string {
+	if sort.StringsAreSorted(names) {
+		return nil
+	}
+	return append([]string(nil), names...)
+}
+
 // modifyProfilesPath returns ~/.dicomqr/profiles.json.
 func modifyProfilesPath() (string, error) {
 	dir, err := appSettingsDir()
@@ -233,26 +297,38 @@ func modifyProfilesPath() (string, error) {
 }
 
 // loadModProfileConfig reads the profile store at path. A missing file returns
-// an empty config without error.
+// an empty config without error. Profiles still carrying a `base` come back
+// converted (flattenModProfiles), so every consumer sees self-contained
+// profiles whether or not the startup conversion managed to write the file.
 func loadModProfileConfig(path string) (ModProfileConfig, error) {
+	cfg, _, _, err := readModProfileConfig(path)
+	return cfg, err
+}
+
+// readModProfileConfig is loadModProfileConfig plus the conversion report and
+// the bytes it parsed, which convertModProfileStore needs to decide whether to
+// write and what to back up.
+func readModProfileConfig(path string) (ModProfileConfig, modProfileConversion, []byte, error) {
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return ModProfileConfig{}, nil
+		return ModProfileConfig{}, modProfileConversion{}, nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, modProfileConversion{}, nil, err
 	}
 	var cfg ModProfileConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, err
+		return nil, modProfileConversion{}, nil, err
 	}
-	// Canonicalise on the way in, so every consumer — editor, engine, merge —
-	// sees one spelling per tag and the file the editor writes back holds one
-	// too. An entry that does not parse survives untouched for validation.
+	// Canonicalise on the way in, so every consumer — editor, engine,
+	// conversion — sees one spelling per tag and the file the editor writes
+	// back holds one too. An entry that does not parse survives untouched for
+	// validation.
 	for name, p := range cfg {
 		cfg[name] = normalizeModProfile(p)
 	}
-	return cfg, nil
+	flat, conv := flattenModProfiles(cfg)
+	return flat, conv, data, nil
 }
 
 // saveModProfileConfig writes cfg to the profile store at path as indented
@@ -297,10 +373,203 @@ func ensureDefaultModifyConfigs() {
 	f.Write(defaultModProfilesJSON)
 }
 
-// resolveModProfile returns the effective ModProfile for name after fully
-// resolving its base chain. Circular references are detected and returned as
-// an error.
-func resolveModProfile(name string, cfg ModProfileConfig) (ModProfile, error) {
+// lookupModProfile returns the profile a run of name uses. Profiles are
+// self-contained, so this is the stored profile itself — except one whose
+// retired base reference could not be converted, which is refused here rather
+// than run with only its own settings: the ones it inherited may well have
+// been the de-identifying ones.
+func lookupModProfile(name string, cfg ModProfileConfig) (ModProfile, error) {
+	p, ok := cfg[name]
+	if !ok {
+		return ModProfile{}, fmt.Errorf("profile %q not found", name)
+	}
+	if p.Base != "" {
+		return ModProfile{}, fmt.Errorf("profile %q: %w", name, unresolvedBaseError(p.Base))
+	}
+	return p, nil
+}
+
+// unresolvedBaseError is the refusal for a profile still carrying a base
+// reference conversion could not resolve. Shared by lookupModProfile and
+// compileModifyParams, which repeats the check so the engine cannot be handed
+// such a profile by any other route.
+func unresolvedBaseError(base string) error {
+	return fmt.Errorf("it is still based on %q, which could not be resolved, so the settings it used to "+
+		"inherit are missing — open it in Preferences > Modification & Export, review every setting and save it", base)
+}
+
+// cloneModProfile returns a deep copy of p, sharing no slice, map or pointer
+// with it. A JSON round trip is exactly a copy of everything profiles.json
+// stores, which is what Copy promises; it also carries any field added later
+// without this function having to be told.
+func cloneModProfile(p ModProfile) ModProfile {
+	data, err := json.Marshal(p)
+	if err != nil {
+		return p
+	}
+	var out ModProfile
+	if err := json.Unmarshal(data, &out); err != nil {
+		return p
+	}
+	return out
+}
+
+// copyProfileName proposes a name for a copy of src that no profile in cfg
+// already uses: "src copy", then "src copy 2", "src copy 3", ….
+func copyProfileName(src string, cfg ModProfileConfig) string {
+	name := src + " copy"
+	for i := 2; ; i++ {
+		if _, taken := cfg[name]; !taken {
+			return name
+		}
+		name = fmt.Sprintf("%s copy %d", src, i)
+	}
+}
+
+// modProfileConversion reports what flattenModProfiles changed. Names are
+// sorted.
+type modProfileConversion struct {
+	// flattened are profiles that had a base and now hold its settings.
+	flattened []string
+	// keepDropped are base-less profiles whose top-level Keep list was removed:
+	// it was never applied (see ModProfile.Keep), so dropping it changes no run.
+	keepDropped []string
+	// unresolved are profiles whose base chain does not resolve — a missing
+	// profile or a loop — left exactly as they were, and refused at run time.
+	unresolved map[string]error
+}
+
+// changed reports whether the conversion altered any profile.
+func (c modProfileConversion) changed() bool {
+	return len(c.flattened) > 0 || len(c.keepDropped) > 0
+}
+
+// flattenModProfiles converts profiles written for the retired inheritance
+// scheme into self-contained ones. A profile with a base is replaced by the
+// resolved profile it has always run as — the base chain merged exactly as
+// runs merged it — so no run changes; the top-level Keep list, already applied
+// by that merge and inert everywhere else, is dropped. cfg is not modified.
+//
+// A profile whose chain does not resolve is left as it is: guessing at what it
+// inherited would run a weaker profile than the one written, and the error is
+// in conv.unresolved for the caller to report.
+func flattenModProfiles(cfg ModProfileConfig) (ModProfileConfig, modProfileConversion) {
+	var conv modProfileConversion
+	if cfg == nil {
+		return nil, conv
+	}
+	names := make([]string, 0, len(cfg))
+	for name := range cfg {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	out := make(ModProfileConfig, len(cfg))
+	for _, name := range names {
+		p := cfg[name]
+		if p.Base != "" {
+			// Resolved against the unconverted config: every chain is then
+			// merged exactly as a run would have merged it.
+			resolved, err := resolveBaseChain(name, cfg)
+			if err != nil {
+				if conv.unresolved == nil {
+					conv.unresolved = map[string]error{}
+				}
+				conv.unresolved[name] = err
+				out[name] = p
+				continue
+			}
+			resolved.Keep = nil
+			// mergeModProfiles shares unmerged slices with the base; the copy
+			// keeps the two profiles independent from here on.
+			out[name] = cloneModProfile(resolved)
+			conv.flattened = append(conv.flattened, name)
+			continue
+		}
+		if len(p.Keep) > 0 {
+			p.Keep = nil
+			conv.keepDropped = append(conv.keepDropped, name)
+		}
+		out[name] = p
+	}
+	return out, conv
+}
+
+// convertModProfileStore rewrites the profile store at path in self-contained
+// form if any profile needs converting, after saving the file as it was beside
+// it (backupPath). Returns the conversion report either way; backupPath is ""
+// when nothing was written. A store that needs nothing is not touched — the
+// file is the user's, and is never rewritten without cause.
+//
+// A failure here costs nothing at run time: loadModProfileConfig converts in
+// memory on every read, so this only decides whether the file on disk catches
+// up. It never writes the converted file without a backup having succeeded.
+func convertModProfileStore(path string) (conv modProfileConversion, backupPath string, err error) {
+	cfg, conv, data, err := readModProfileConfig(path)
+	if err != nil || !conv.changed() {
+		return conv, "", err
+	}
+	backupPath = strings.TrimSuffix(path, filepath.Ext(path)) + "-with-base-" + time.Now().Format("20060102-150405") + ".json"
+	f, err := os.OpenFile(backupPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return conv, "", fmt.Errorf("backing up %s before converting it: %w", filepath.Base(path), err)
+	}
+	_, werr := f.Write(data)
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		os.Remove(backupPath)
+		return conv, "", fmt.Errorf("backing up %s before converting it: %w", filepath.Base(path), werr)
+	}
+	if err := saveModProfileConfig(path, cfg); err != nil {
+		return conv, backupPath, err
+	}
+	return conv, backupPath, nil
+}
+
+// convertModProfileStoreAtStartup converts ~/.dicomqr/profiles.json once, at
+// startup, and logs what it did. An unresolvable profile is logged on every
+// start until it is fixed, since that is when it is still unusable.
+func convertModProfileStoreAtStartup() {
+	path, err := modifyProfilesPath()
+	if err != nil {
+		return
+	}
+	conv, backup, err := convertModProfileStore(path)
+	unresolved := make([]string, 0, len(conv.unresolved))
+	for name := range conv.unresolved {
+		unresolved = append(unresolved, name)
+	}
+	sort.Strings(unresolved)
+	for _, name := range unresolved {
+		logWarn("modification profile %q could not be converted to a self-contained profile: %v — "+
+			"it will not run until it is reviewed and saved in Preferences > Modification & Export",
+			name, conv.unresolved[name])
+	}
+	if err != nil {
+		logWarn("profiles.json: %v (profiles are still converted in memory whenever they are read)", err)
+		return
+	}
+	if backup == "" {
+		return
+	}
+	if len(conv.flattened) > 0 {
+		logInfo("profiles.json: %s now hold every setting they inherited from a base profile",
+			strings.Join(conv.flattened, ", "))
+	}
+	if len(conv.keepDropped) > 0 {
+		logInfo("profiles.json: dropped the top-level Keep list of %s, which no run ever applied",
+			strings.Join(conv.keepDropped, ", "))
+	}
+	logInfo("profiles.json: converted to self-contained profiles; the original is saved as %s", backup)
+}
+
+// resolveBaseChain returns the profile name ran as under the retired
+// inheritance scheme: its base chain merged by mergeModProfiles. Used only by
+// flattenModProfiles to convert a store written for that scheme. Circular
+// references are detected and returned as an error.
+func resolveBaseChain(name string, cfg ModProfileConfig) (ModProfile, error) {
 	return resolveModProfileChain(name, cfg, make(map[string]bool))
 }
 
@@ -329,6 +598,11 @@ func resolveModProfileChain(name string, cfg ModProfileConfig, visited map[strin
 // applied on top. Override wins for scalars and integers (when non-zero);
 // booleans are OR'd; Sets use per-tag precedence (override wins); Removes are
 // a union; override.Keep is subtracted from the merged removal list.
+//
+// These are the retired inheritance scheme's semantics, kept verbatim because
+// conversion must reproduce exactly what a derived profile ran as. The OR'd
+// booleans and "empty means the base's" scalars are why that scheme went: a
+// derived profile could never turn off what its base turned on.
 func mergeModProfiles(base, override ModProfile) ModProfile {
 	result := base
 
@@ -349,6 +623,12 @@ func mergeModProfiles(base, override ModProfile) ModProfile {
 	}
 	if override.ExportName != "" {
 		result.ExportName = override.ExportName
+	}
+	// No profile written for the retired scheme carries this — the setting is
+	// newer — so the rule only has to be the scalar one above, for a
+	// hand-edited store that mixes the two.
+	if override.Annotations != "" {
+		result.Annotations = override.Annotations
 	}
 	// Mask regions replace rather than accumulate. Geometry describes one
 	// vendor's screen layout, so a derived profile (or a per-modality block)
@@ -551,13 +831,20 @@ func canonicalSetRefs(sets []string) []string {
 
 // normalizeModProfile returns p with every tag reference canonicalised, at any
 // depth. Applied on load so the store holds one spelling per tag, which is what
-// lets a profile and the base it inherits from be compared by eye as well as by
-// code. mergeModProfiles does not depend on this having run — it compares
-// parsed tags — but a canonical file is what the editor writes back.
+// lets two profiles — or a profile and its copy — be compared by eye as well
+// as by code. Nothing that compares tags depends on this having run — they
+// parse first (tagMatchKey) — but a canonical file is what the editor writes
+// back.
 func normalizeModProfile(p ModProfile) ModProfile {
 	p.Sets = canonicalSetRefs(p.Sets)
 	p.Removes = canonicalTagRefs(p.Removes)
 	p.Keep = canonicalTagRefs(p.Keep)
+	// The annotations token likewise ("keep" and "" are one setting, case does
+	// not matter); one that is not a token at all stays as written, for
+	// compileModifyParams to refuse.
+	if mode, ok := annotationMode(p.Annotations); ok {
+		p.Annotations = mode
+	}
 	if len(p.PerModality) > 0 {
 		norm := make(map[string]ModProfile, len(p.PerModality))
 		for k, v := range p.PerModality {
@@ -568,10 +855,11 @@ func normalizeModProfile(p ModProfile) ModProfile {
 	return p
 }
 
-// tagMatchKey is the identity two tag references are compared by when merging a
-// profile with its base. Parsing first means "40,275", "0040,0275" and
-// "0040,275" are one tag rather than three strings, which is what makes a Keep
-// list reliably cancel the Removes list it was written against. A reference
+// tagMatchKey is the identity two tag references are compared by — in
+// conversion's merge, and wherever a profile is checked for a tag. Parsing
+// first means "40,275", "0040,0275" and "0040,275" are one tag rather than
+// three strings, which is what makes a Keep list reliably cancel the Removes
+// list it was written against. A reference
 // that does not parse falls back to its own text, so unparsable entries still
 // deduplicate against themselves instead of collapsing together.
 func tagMatchKey(ref string) string {
@@ -624,8 +912,9 @@ var origAttrsSeqTag = tag.Tag{Group: 0x0400, Element: 0x0561}
 // 0400,0561 takes its nested contents with it, which is why the shipped
 // base-deident profile is not exposed.
 //
-// p must be RESOLVED — base chain merged and Keep applied — because a derived
-// profile inherits the removal from its base, and a Keep list can cancel it.
+// Profiles are self-contained, so p's own Removes list is the whole answer
+// (a profile written for the retired base scheme reaches here already
+// converted — flattenModProfiles).
 //
 // Only the profile-level Removes list is examined. A per-modality override's
 // removals apply to that modality alone, so an override carrying this tag would

@@ -44,7 +44,7 @@ func TestStoreFilesPushesEveryFile(t *testing.T) {
 	var progress []StoreProgress
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := client.StoreFiles(ctx, paths, func(p StoreProgress) { progress = append(progress, p) }); err != nil {
+	if _, err := client.StoreFiles(ctx, paths, 0, func(p StoreProgress) { progress = append(progress, p) }); err != nil {
 		t.Fatalf("StoreFiles: %v", err)
 	}
 

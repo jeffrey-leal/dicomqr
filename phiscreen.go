@@ -1,6 +1,7 @@
 package main
 
 import (
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -161,15 +162,30 @@ var phiTextTagSet = func() map[tag.Tag]bool {
 // elements, sequence items included, in phiTextTags order. An element holding
 // only blanks is empty; a sequence counts once any item holds an element.
 func textFieldsWithValues(elements []*sdicom.Element) []tag.Tag {
-	found := map[tag.Tag]bool{}
-	var walk func([]*sdicom.Element)
-	walk = func(elems []*sdicom.Element) {
+	tags, _ := textFieldOccurrences(elements)
+	return tags
+}
+
+// textFieldOccurrences is textFieldsWithValues plus, for each field found, the
+// sequences enclosing each place it was found, outermost first — empty for a
+// top-level one. A field is gone once every place it sits is removed, and
+// removing a sequence removes what it holds: the run's removals are tags, so
+// the screen needs the enclosing sequences to see that a field nested in a
+// removed one does not ship.
+func textFieldOccurrences(elements []*sdicom.Element) ([]tag.Tag, map[tag.Tag][][]tag.Tag) {
+	found := map[tag.Tag][][]tag.Tag{}
+	record := func(t tag.Tag, path []tag.Tag) {
+		found[t] = append(found[t], append([]tag.Tag(nil), path...))
+	}
+	var walk func([]*sdicom.Element, []tag.Tag)
+	walk = func(elems []*sdicom.Element, path []tag.Tag) {
 		for _, e := range elems {
 			if e == nil || e.Value == nil {
 				continue
 			}
 			if e.Value.ValueType() == sdicom.Sequences {
 				items, _ := e.Value.GetValue().([]*sdicom.SequenceItemValue)
+				inner := append(path[:len(path):len(path)], e.Tag)
 				for _, item := range items {
 					if item == nil {
 						continue
@@ -179,42 +195,43 @@ func textFieldsWithValues(elements []*sdicom.Element) []tag.Tag {
 						continue
 					}
 					if len(sub) > 0 && phiTextTagSet[e.Tag] {
-						found[e.Tag] = true
+						record(e.Tag, path)
 					}
-					walk(sub)
+					walk(sub, inner)
 				}
 				continue
 			}
-			if !phiTextTagSet[e.Tag] || found[e.Tag] {
+			if !phiTextTagSet[e.Tag] {
 				continue
 			}
 			if strs, ok := e.Value.GetValue().([]string); ok {
 				for _, s := range strs {
 					if strings.TrimSpace(strings.Trim(s, "\x00")) != "" {
-						found[e.Tag] = true
+						record(e.Tag, path)
 						break
 					}
 				}
 			} else if b, ok := e.Value.GetValue().([]byte); ok && len(strings.TrimSpace(strings.Trim(string(b), "\x00"))) > 0 {
-				found[e.Tag] = true
+				record(e.Tag, path)
 			}
 		}
 	}
-	walk(elements)
+	walk(elements, nil)
 	var out []tag.Tag
 	for _, t := range phiTextTags {
-		if found[t] {
+		if len(found[t]) > 0 {
 			out = append(out, t)
 		}
 	}
-	return out
+	return out, found
 }
 
 // textRulesFor returns the tags a run removes or replaces in a file of the
 // given modality — the profile's removals and Set values with the matching
 // override layered on exactly as processFile layers them (override edits
-// merged in, override removals added, override keep list cancelling). A
-// field in this set does not ship with its original value.
+// merged in, override removals added, override keep list cancelling), plus the
+// annotation text its Graphic annotations setting removes. A field in this set
+// does not ship with its original value.
 func textRulesFor(p modifyParams, modality string) map[tag.Tag]bool {
 	edits, removals := p.edits, p.removals
 	if ov, ok := p.perMod[strings.ToUpper(strings.TrimSpace(modality))]; ok {
@@ -227,6 +244,13 @@ func textRulesFor(p modifyParams, modality string) map[tag.Tag]bool {
 	}
 	for _, t := range removals {
 		handled[t] = true
+	}
+	// Both annotation modes remove the text of every annotation, at any depth
+	// and whatever an override keeps (applyAnnotationMode).
+	if p.annotations != annotationsKeep {
+		for t := range annotationTextTags {
+			handled[t] = true
+		}
 	}
 	return handled
 }
@@ -286,7 +310,10 @@ type phiHeader struct {
 	overlay     bool // carries overlay-plane elements
 	// text: the phiTextTags carrying a value, in phiTextTags order.
 	text []tag.Tag
-	src  maskSource
+	// textPaths: for each of them, the sequences enclosing each occurrence
+	// (textFieldOccurrences). A field with no entry counts as top-level.
+	textPaths map[tag.Tag][][]tag.Tag
+	src       maskSource
 }
 
 // readPHIHeader reads a file's classification facts from a parsed dataset —
@@ -307,7 +334,7 @@ func readPHIHeader(ds *sdicom.Dataset) phiHeader {
 	}
 	h.document = strings.HasPrefix(sop, encapsulatedDocumentPrefix) || hasEncapsulatedDocument(ds)
 	h.overlay = hasOverlayPlanes(ds)
-	h.text = textFieldsWithValues(ds.Elements)
+	h.text, h.textPaths = textFieldOccurrences(ds.Elements)
 	return h
 }
 
@@ -372,15 +399,32 @@ type phiRules struct {
 	textHandled     map[tag.Tag]bool
 }
 
-// textLeft is the file's text fields the run leaves with their values.
+// textLeft is the file's text fields the run leaves with their values: those
+// neither handled themselves nor nested, everywhere they occur, inside a
+// handled sequence.
 func (h phiHeader) textLeft(handled map[tag.Tag]bool) []tag.Tag {
 	var out []tag.Tag
 	for _, t := range h.text {
-		if !handled[t] {
-			out = append(out, t)
+		if handled[t] || everyPathHandled(h.textPaths[t], handled) {
+			continue
 		}
+		out = append(out, t)
 	}
 	return out
+}
+
+// everyPathHandled reports whether each occurrence path has an enclosing
+// sequence in handled. No paths, or a top-level occurrence, is not.
+func everyPathHandled(paths [][]tag.Tag, handled map[tag.Tag]bool) bool {
+	if len(paths) == 0 {
+		return false
+	}
+	for _, path := range paths {
+		if !slices.ContainsFunc(path, func(t tag.Tag) bool { return handled[t] }) {
+			return false
+		}
+	}
+	return true
 }
 
 // risks classifies the file against what the run does to it.

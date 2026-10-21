@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -681,21 +682,16 @@ func modificationScope(m *resultsModel, ids []string) (label string, studyLevel 
 	return label, false, nil
 }
 
-// modificationProfileItems returns one menu item per modification profile,
-// sorted by name, each calling run with that name. profiles.json is re-read
-// on every call so hand-edits take effect immediately (dicomtool semantics);
-// a missing or unreadable file yields one disabled "(no profiles defined)"
-// entry rather than an empty menu.
-func modificationProfileItems(run func(name string)) []*fyne.MenuItem {
+// modificationProfileItems returns one menu item per modification profile, in
+// the order Preferences sets (order is Settings.ModProfileOrder), each calling
+// run with that name. profiles.json is re-read on every call so hand-edits take
+// effect immediately (dicomtool semantics); a missing or unreadable file yields
+// one disabled "(no profiles defined)" entry rather than an empty menu.
+func modificationProfileItems(order []string, run func(name string)) []*fyne.MenuItem {
 	var items []*fyne.MenuItem
 	if profPath, err := modifyProfilesPath(); err == nil {
 		if profCfg, err := loadModProfileConfig(profPath); err == nil {
-			names := make([]string, 0, len(profCfg))
-			for name := range profCfg {
-				names = append(names, name)
-			}
-			sort.Strings(names)
-			for _, name := range names {
+			for _, name := range orderedModProfileNames(profCfg, order) {
 				items = append(items, fyne.NewMenuItem(name, func() { run(name) }))
 			}
 		}
@@ -898,8 +894,9 @@ func showDeleteDialog(w fyne.Window, cfg *Settings, paths []string, description 
 }
 
 // showPushDialog presents a profile-selection + progress dialog for sending
-// paths to a DICOM destination via C-STORE SCU.
-func showPushDialog(w fyne.Window, cfg *Settings, paths []string, description string) {
+// paths to a DICOM destination via C-STORE SCU. A clean push closes the dialog
+// and hands its summary to report (UI goroutine; nil discards it).
+func showPushDialog(w fyne.Window, cfg *Settings, paths []string, description string, report func(string)) {
 	if len(paths) == 0 {
 		return
 	}
@@ -953,35 +950,69 @@ func showPushDialog(w fyne.Window, cfg *Settings, paths []string, description st
 		}
 
 		pushBtn.Disable()
-		cancelBtn.Disable()
 		destSelect.Disable()
 		progressBar.SetValue(0)
 		statusLbl.SetText(fmt.Sprintf("Connecting to %s…", chosen.Name))
+		// Cancel stays live for the whole push: it aborts every open
+		// association at once, and the dialog then says how far the push got.
+		// It used to be disabled here, so a server that stopped answering held
+		// the dialog — and the main window under it — until the app was quit.
+		cancelBtn.OnTapped = func() {
+			cancel()
+			cancelBtn.Disable()
+			statusLbl.SetText("Cancelling…")
+		}
 
+		// Snapshot on the UI goroutine: Preferences may replace cfg meanwhile.
 		client := NewDicomClient(*chosen, cfg.LocalAETitle)
+		idleTimeout := stallTimeoutFor(cfg.RetrieveStallTimeoutSec)
 		total := len(paths)
+		parallel := min(chosen.parallelTransfers(), len(pushTargets(paths, chosen.parallelTransfers())))
 
 		go func() {
-			var nOK, nFail int
-			_ = client.StoreFiles(ctx, paths, func(p StoreProgress) {
+			// The associations only count; one paced reporter posts progress
+			// (startPacedProgress) — a post per file, or per ten, fires at
+			// whatever rate the server stores files, and the UI goroutine has
+			// to drain every one.
+			var sent, failed, done atomic.Int64
+			shown := int64(-1)
+			stopProgress := startPacedProgress(scanProgressInterval, func() {
+				n := done.Load()
+				if n == shown {
+					return
+				}
+				shown = n
+				fyne.Do(func() {
+					progressBar.SetValue(float64(n) / float64(total))
+					if ctx.Err() == nil {
+						statusLbl.SetText(pushProgressText(n, total, parallel))
+					}
+				})
+			})
+			rep, err := client.StoreFiles(ctx, paths, idleTimeout, func(p StoreProgress) {
 				if p.Err != nil {
-					nFail++
+					failed.Add(1)
 					logError("push: failed %s: %v", filepath.Base(p.Path), p.Err)
 				} else {
-					nOK++
+					sent.Add(1)
 				}
-				if p.Done%10 == 0 || p.Done == total {
-					fyne.Do(func() {
-						progressBar.SetValue(float64(p.Done) / float64(total))
-						statusLbl.SetText(fmt.Sprintf("Sending %d / %d…", p.Done, total))
-					})
-				}
+				done.Store(int64(p.Done))
 			})
+			stopProgress()
+			msg, clean := pushSummary(int(sent.Load()), int(failed.Load()), total, rep.degradedBy, err)
+			logInfo("push: %s → %s: %s", chosen.Name, chosen.RemoteAETitle, msg)
 			fyne.Do(func() {
-				progressBar.SetValue(1)
-				msg := fmt.Sprintf("Done — %d sent", nOK)
-				if nFail > 0 {
-					msg += fmt.Sprintf(", %d failed (see Activity Log)", nFail)
+				progressBar.SetValue(float64(done.Load()) / float64(total))
+				// A push with nothing to report closes itself (user decision
+				// 2026-10-16), leaving its summary on the Local Browse status
+				// line; a failure, a cancel, an empty push or a fallback to one
+				// association keeps the dialog.
+				if clean {
+					dlg.Hide()
+					if report != nil {
+						report(fmt.Sprintf("Push to %s: %s", chosen.Name, msg))
+					}
+					return
 				}
 				statusLbl.SetText(msg)
 				pushBtn.Hide()
@@ -995,6 +1026,43 @@ func showPushDialog(w fyne.Window, cfg *Settings, paths []string, description st
 	dlg.Show()
 }
 
+// pushProgressText is the push dialog's line while files are going out.
+func pushProgressText(done int64, total, parallel int) string {
+	if parallel > 1 {
+		return fmt.Sprintf("Sending %d / %d (up to %d at once)…", done, total, parallel)
+	}
+	return fmt.Sprintf("Sending %d / %d…", done, total)
+}
+
+// pushSummary is a finished push's completion message, and whether it is clean
+// enough for the dialog to close by itself: every file sent, nothing stopped
+// it, and it never had to fall back to one association — that clause tells the
+// user to change the server's Parallel transfers, so it has to be read. A push
+// that sent nothing is never clean: whatever the reason, it did not do what was
+// asked. StoreFiles reports a refused, dropped or silent association as the
+// failure of each file it left unsent, so err is in practice a cancel.
+func pushSummary(sent, failed, total int, degradedBy, err error) (msg string, clean bool) {
+	if errors.Is(err, context.Canceled) {
+		msg = fmt.Sprintf("Cancelled — %d sent", sent)
+		if failed > 0 {
+			msg += fmt.Sprintf(", %d failed (see Activity Log)", failed)
+		}
+		if left := total - sent - failed; left > 0 {
+			msg += fmt.Sprintf(", %d not sent", left)
+		}
+		return msg + describeParallelDegrade(degradedBy), false
+	}
+	msg = fmt.Sprintf("Done — %d sent", sent)
+	if failed > 0 {
+		msg += fmt.Sprintf(", %d failed (see Activity Log)", failed)
+	}
+	if err != nil {
+		msg += fmt.Sprintf("; stopped: %v", err)
+	}
+	msg += describeParallelDegrade(degradedBy)
+	return msg, err == nil && failed == 0 && sent > 0 && degradedBy == nil
+}
+
 // buildLocalBrowseContent constructs the Local Browse tab.
 // Returns the tab content, a refresh func that re-renders the tree (call it
 // after applying theme/selection preferences; it also reopens the catalog when
@@ -1005,6 +1073,9 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 	seriesFiles := make(map[string][]string)
 
 	var doScan func()
+	// reportStatus puts a line on the tab's status label — where a push or a
+	// Modification run that closed its own window leaves its summary.
+	var reportStatus func(msg string)
 	var reloadFromDB func(status string)
 	var pruneMissing func(paths []string)
 	var verifyNode func(id string)
@@ -1095,7 +1166,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 		pushItem := fyne.NewMenuItem("Push to PACS…", func() {
 			showPushDialog(w, cfg, capturedPaths,
 				fmt.Sprintf("Push %d file(s) from %q to a DICOM destination.",
-					len(capturedPaths), model.labelFor(id)))
+					len(capturedPaths), model.labelFor(id)), reportStatus)
 		})
 		deleteItem := fyne.NewMenuItem("Delete…", func() {
 			showDeleteDialog(w, cfg, capturedPaths,
@@ -1110,8 +1181,9 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 		if !modItem.Disabled {
 			capturedRoot := modificationRoot()
 			capturedStudyLevel := studyUID != ""
-			modItem.ChildMenu = fyne.NewMenu("", modificationProfileItems(func(name string) {
-				showModificationDialog(w, cfg, name, capturedLabel, capturedPaths, capturedRoot, capturedStudyLevel)
+			modItem.ChildMenu = fyne.NewMenu("", modificationProfileItems(cfg.ModProfileOrder, func(name string) {
+				showModificationDialog(w, cfg, name, capturedLabel, capturedPaths, capturedRoot, capturedStudyLevel,
+					reportStatus)
 			})...)
 		}
 		copyUID := fyne.NewMenuItem("Copy UID", func() { w.Clipboard().SetContent(uid) })
@@ -1156,6 +1228,11 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 	treeCollapseFix(tree)
 
 	scanStatusLbl := widget.NewLabel("Click Scan to index the download folder.")
+	// Wrapped: a summary left here by a push or an export that closed its own
+	// window names the export folder, and an unwrapped label's minimum width is
+	// its whole text — a long path would widen the main window to fit it.
+	scanStatusLbl.Wrapping = fyne.TextWrapWord
+	reportStatus = func(msg string) { scanStatusLbl.SetText(msg) }
 
 	folderLabel := widget.NewLabel(cfg.DownloadDir)
 	folderLabel.Truncation = fyne.TextTruncateEllipsis
@@ -1423,7 +1500,7 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 			return
 		}
 		showPushDialog(w, cfg, paths,
-			fmt.Sprintf("Push %d selected file(s) to a DICOM destination.", len(paths)))
+			fmt.Sprintf("Push %d selected file(s) to a DICOM destination.", len(paths)), reportStatus)
 	})
 
 	deleteSelectedBtn := widget.NewButton("Delete Selected…", func() {
@@ -1456,8 +1533,8 @@ func buildLocalBrowseContent(a fyne.App, w fyne.Window, cfg *Settings, cat *cata
 		}
 		paths := collectSelected()
 		root := modificationRoot()
-		menu := widget.NewPopUpMenu(fyne.NewMenu("", modificationProfileItems(func(name string) {
-			showModificationDialog(w, cfg, name, label, paths, root, studyLevel)
+		menu := widget.NewPopUpMenu(fyne.NewMenu("", modificationProfileItems(cfg.ModProfileOrder, func(name string) {
+			showModificationDialog(w, cfg, name, label, paths, root, studyLevel, reportStatus)
 		})...), w.Canvas())
 		pos := fyne.CurrentApp().Driver().AbsolutePositionForObject(modifySelectedBtn)
 		menu.ShowAtPosition(fyne.NewPos(pos.X, max(0, pos.Y-menu.MinSize().Height)))

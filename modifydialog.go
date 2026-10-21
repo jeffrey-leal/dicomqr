@@ -1,8 +1,8 @@
 package main
 
 // Modification confirmation dialog — shown when a profile is chosen from the
-// Local Browse "Modification" context submenu. Presents the effective profile
-// (after base-chain resolution) for confirmation: editable set values and
+// Local Browse "Modification" context submenu. Presents the profile for
+// confirmation: editable set values and
 // options, and a read-only list of the tags marked for removal. On confirm the
 // user picks an output folder and the files are processed in the background
 // with progress; the download folder and its catalog are never touched.
@@ -74,7 +74,8 @@ func pathWithinDir(dir, root string) bool {
 // true when every file lies within one study, false when they span a
 // patient's studies — it drives the PHI-safe output layout (see
 // exportLayout).
-func showModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabel string, files []string, rootDir string, studyLevel bool) {
+func showModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabel string, files []string, rootDir string, studyLevel bool,
+	report func(string)) {
 	if len(files) == 0 {
 		dialog.ShowInformation("Modification",
 			"No local files found for this item.", w)
@@ -89,18 +90,20 @@ func showModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabel
 			return
 		}
 	}
-	resolved, err := resolveModProfile(profileName, profCfg)
+	resolved, err := lookupModProfile(profileName, profCfg)
 	if err != nil {
 		dialog.ShowError(err, w)
 		return
 	}
-	buildModificationDialog(w, cfg, profileName, nodeLabel, files, rootDir, studyLevel, resolved)
+	buildModificationDialog(w, cfg, profileName, nodeLabel, files, rootDir, studyLevel, resolved, report)
 }
 
-// buildModificationDialog constructs and shows the confirmation dialog for an
-// already-resolved profile.
+// buildModificationDialog constructs and shows the confirmation dialog for a
+// profile already looked up (lookupModProfile). It is named resolved
+// throughout, from when it was a base chain merged; it is now the stored
+// profile itself.
 func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabel string,
-	files []string, rootDir string, studyLevel bool, resolved ModProfile) {
+	files []string, rootDir string, studyLevel bool, resolved ModProfile, report func(string)) {
 
 	// win is this panel's own window, assigned as it opens at the foot of this
 	// function. Every callback below parents its children to win rather than to
@@ -173,6 +176,8 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	privCheck.SetChecked(resolved.Priv)
 	overlaysCheck := widget.NewCheck("", nil)
 	overlaysCheck.SetChecked(resolved.NoOverlays)
+	annotationsSel := widget.NewSelect(annotationsLabels, nil)
+	annotationsSel.SetSelected(annotationsLabelFor(resolved.Annotations))
 	dobEntry := widget.NewEntry()
 	dobEntry.SetText(resolved.DOB)
 	dobEntry.SetPlaceHolder("YYYYMMDD — empty = no masking")
@@ -201,14 +206,15 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		widget.NewFormItem("Remap UIDs", remapCheck),
 		widget.NewFormItem("Remove private tags", privCheck),
 		widget.NewFormItem("Remove overlay planes", overlaysCheck),
+		widget.NewFormItem(annotationsRowLabel, annotationsSel),
 		widget.NewFormItem("Shift dates (days)", shiftEntry),
 		widget.NewFormItem("Fix VR", fixvrSelect),
 		widget.NewFormItem("Output transfer syntax", tsSelect),
 		widget.NewFormItem(auditRowLabel, auditCheck),
 	)
 
-	// Birth-date advisory, under the row it is about. resolved already carries
-	// the merged base chain, so only the mask itself can change the answer here
+	// Birth-date advisory, under the row it is about. resolved is the whole
+	// profile, so only the mask itself can change the answer here
 	// — the removal list on this panel is read-only — which is why a mask typed
 	// for a single run raises the note too.
 	dobAdvisoryLabel := widget.NewLabel("")
@@ -226,6 +232,26 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	}
 	refreshDOBAdvisory()
 	dobEntry.OnChanged = func(string) { refreshDOBAdvisory() }
+
+	// Graphic annotations advisory, the editor's note for this run: the choice
+	// is editable here, Ignore modalities is not, and Remove tags grows only by
+	// what the PHI check's remedy adds — which is never an annotation tag, since
+	// the remedy switches this choice for annotation text instead. Wired to the
+	// select further down, once the PHI check it also re-evaluates exists.
+	annotationAdvisoryLabel := widget.NewLabel("")
+	annotationAdvisoryLabel.TextStyle = fyne.TextStyle{Italic: true}
+	annotationAdvisoryLabel.Wrapping = fyne.TextWrapWord
+	refreshAnnotationAdvisory := func() {
+		candidate := resolved
+		candidate.Annotations = annotationsFromLabel(annotationsSel.Selected)
+		if text := modProfileAnnotationAdvisory(candidate); text != "" {
+			annotationAdvisoryLabel.SetText(text)
+			annotationAdvisoryLabel.Show()
+			return
+		}
+		annotationAdvisoryLabel.Hide()
+	}
+	refreshAnnotationAdvisory()
 
 	// Tags removed — read-only list (already keep-filtered by base resolution).
 	// The PHI check's text remedy can append to it for this run.
@@ -265,7 +291,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	if len(setRows) > 0 {
 		sections = append(sections, prefSection("Set values", setForm))
 	}
-	sections = append(sections, prefSection("Options", optionsForm, dobAdvisoryLabel))
+	sections = append(sections, prefSection("Options", optionsForm, dobAdvisoryLabel, annotationAdvisoryLabel))
 
 	// Pixel masking. The regions are disclosed because this is the one part of a
 	// profile that alters the image rather than the header and cannot be undone
@@ -317,7 +343,8 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 
 	// PHI check (phiscreen.go): every file's header is read in the background
 	// as the panel opens, and the findings are re-evaluated against this run's
-	// settings whenever masking or Remove overlay planes changes — pure
+	// settings whenever masking, Remove overlay planes or Graphic annotations
+	// changes — pure
 	// arithmetic over the scan, so it never re-reads a file. Advisory: Modify…
 	// never waits for it, and only the two unambiguous findings (a file that
 	// declares burned-in text, an embedded document) ask for a confirmation.
@@ -338,6 +365,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 	compilePHIParams := func() {
 		p := resolved
 		p.Removes = append(append([]string(nil), resolved.Removes...), phiExtraRemoves...)
+		p.Annotations = annotationsFromLabel(annotationsSel.Selected)
 		compiled, err := compileModifyParams(p)
 		if err != nil {
 			// A profile that does not compile fails at Modify… with its own
@@ -430,7 +458,17 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 					for _, r := range phiExtraRemoves {
 						have[r] = true
 					}
+					annotationText := false
 					for _, t := range phiLast.textTags() {
+						// Annotation text goes by switching Graphic annotations to
+						// keep only the shapes, not by a removal: removing the text
+						// alone would leave each text box without the value the
+						// standard requires of it, where the annotation mode drops
+						// the boxes whole.
+						if annotationTextTags[t] {
+							annotationText = true
+							continue
+						}
 						if ref := formatTagRef(t); !have[ref] {
 							phiExtraRemoves = append(phiExtraRemoves, ref)
 							removeLines = append(removeLines, removeLine(ref))
@@ -440,6 +478,9 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 					removeList.Refresh()
 					if title, ok := removeSection.Objects[0].(*widget.Label); ok {
 						title.SetText(fmt.Sprintf("Tags removed (%d)", len(removeLines)))
+					}
+					if annotationText && annotationsFromLabel(annotationsSel.Selected) == annotationsKeep {
+						annotationsSel.SetSelected(annotationsLabelNoText) // OnChanged re-evaluates too
 					}
 					compilePHIParams()
 					refreshPHI()
@@ -457,6 +498,11 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		phiBox.Refresh()
 	}
 	overlaysCheck.OnChanged = func(bool) { refreshPHI() }
+	annotationsSel.OnChanged = func(string) {
+		refreshAnnotationAdvisory()
+		compilePHIParams()
+		refreshPHI()
+	}
 	// The screen applies the profile's own file filters so it never flags a
 	// file the run skips; the remedy only ever adds removals, which change no
 	// filter, so the copy taken here stays right.
@@ -759,6 +805,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 		edited.RemapUIDs = remapCheck.Checked
 		edited.Priv = privCheck.Checked
 		edited.NoOverlays = overlaysCheck.Checked
+		edited.Annotations = annotationsFromLabel(annotationsSel.Selected)
 		if sel := fixvrSelect.Selected; sel == "" || sel == fixvrOffLabel {
 			edited.FixVR = ""
 		} else {
@@ -812,7 +859,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 				zipPath := filepath.Join(outBase, zipName)
 				begin := func() {
 					win.Close()
-					showModificationRunDialog(w, profileName, runFiles, rootDir, zipPath, params, outLayout, true)
+					showModificationRunDialog(w, profileName, runFiles, rootDir, zipPath, params, outLayout, true, report)
 				}
 				if _, serr := os.Stat(zipPath); serr == nil {
 					dialog.ShowConfirm("Zip file exists",
@@ -830,7 +877,7 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 			exportRoot := filepath.Join(outBase, exportName)
 			begin := func() {
 				win.Close()
-				showModificationRunDialog(w, profileName, runFiles, rootDir, exportRoot, params, outLayout, false)
+				showModificationRunDialog(w, profileName, runFiles, rootDir, exportRoot, params, outLayout, false, report)
 			}
 			if entries, rerr := os.ReadDir(exportRoot); rerr == nil && len(entries) > 0 {
 				dialog.ShowConfirm("Export folder exists",
@@ -937,12 +984,13 @@ func buildModificationDialog(w fyne.Window, cfg *Settings, profileName, nodeLabe
 }
 
 // showModificationRunDialog runs the modification in the background with a
-// progress bar and cancel support, then shows the summary. outLayout maps
-// each file to its PHI-safe path under outDir (see exportLayout). With asZip,
-// outDir is the path of the single .zip archive the run writes into instead
-// of a folder tree.
+// progress bar and cancel support, then shows the summary — or, for a run with
+// nothing to review (modificationSummary), closes and hands the summary to
+// report (UI goroutine; nil discards it). outLayout maps each file to its
+// PHI-safe path under outDir (see exportLayout). With asZip, outDir is the path
+// of the single .zip archive the run writes into instead of a folder tree.
 func showModificationRunDialog(w fyne.Window, profileName string, files []string,
-	rootDir, outDir string, params modifyParams, outLayout *exportLayout, asZip bool) {
+	rootDir, outDir string, params modifyParams, outLayout *exportLayout, asZip bool, report func(string)) {
 
 	total := len(files)
 	progressBar := widget.NewProgressBar()
@@ -1044,74 +1092,7 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 			profileName, res.Processed, res.Skipped, res.Failed, res.MaskRecompressed, res.MaskRecodedLossless, res.MaskDecompressed, res.Canceled, outDir)
 		fyne.Do(func() {
 			progressBar.SetValue(1)
-			head := "Done"
-			if res.Canceled {
-				head = "Cancelled"
-			}
-			msg := fmt.Sprintf("%s — %d file(s) written to %s", head, res.Processed, outDir)
-			if res.Skipped > 0 {
-				msg += fmt.Sprintf(", %d skipped", res.Skipped)
-			}
-			if res.Failed > 0 {
-				msg += fmt.Sprintf(", %d failed", res.Failed)
-			}
-			// Masked files whose source compression is lossless are re-encoded,
-			// verified bit-identical, back into their own syntax — the pixels
-			// changed (that was the point), the encoding did not. Stated so the
-			// rewrite is on record.
-			if res.MaskRecompressed > 0 {
-				msg += fmt.Sprintf("; %d masked file(s) recompressed to their original transfer syntax",
-					res.MaskRecompressed)
-			}
-			// Masked files whose source compression is lossy are re-encoded to
-			// JPEG 2000 Lossless instead — re-entering the lossy syntax would
-			// degrade every pixel a second time, while the lossless encode
-			// adds nothing beyond the decode masking already forced. A syntax
-			// change, so it gets its own clause rather than hiding in the one
-			// above.
-			if res.MaskRecodedLossless > 0 {
-				msg += fmt.Sprintf("; %d masked lossy file(s) re-encoded to %s — no added loss",
-					res.MaskRecodedLossless, transferSyntaxLabel(tsJPEG2000LL))
-			}
-			// Masking cannot be applied to compressed pixels, and a lossy source
-			// cannot be recompressed without degrading every pixel a second
-			// time, so those files left in a different encoding than the profile
-			// asked for. Stating it is the whole reason the run does it rather
-			// than failing the file.
-			if res.MaskDecompressed > 0 {
-				msg += fmt.Sprintf("; %d decompressed to %s so burned-in pixels could be masked",
-					res.MaskDecompressed, transferSyntaxLabel(tsExplicitVRLE))
-			}
-			// A weaker guarantee than the rest of the export: those files were
-			// masked by the profile's rectangles because they stated no region
-			// of their own, so they are worth checking by eye.
-			if res.MaskUSFallback > 0 {
-				msg += fmt.Sprintf("; %d ultrasound file(s) declared no image region and were masked "+
-					"with the profile's rectangles instead — worth reviewing", res.MaskUSFallback)
-			}
-			// The birth date mask rewrites the top-level element only, so a copy
-			// nested in a sequence — Original Attributes Sequence being the one
-			// that really carries one — survives it. Reported from what the run
-			// actually found rather than from the profile's shape, so it is a
-			// fact about this export rather than a warning about a possibility.
-			if res.NestedDOBKept > 0 {
-				msg += fmt.Sprintf("; %d file(s) still carry a birth date inside a sequence — "+
-					"the birth date mask reaches the top-level field only, so removing 0400,0561 "+
-					"(Original Attributes Sequence) is what clears it", res.NestedDOBKept)
-			}
-			// The PHI check's evidence half: what the written files still
-			// carried, counted by the engine per file, so this is a fact about
-			// the export whether or not the pre-run check had finished.
-			msg += phiRiskSummary(res.PHIRisks)
-			// Informational, like the mask-outcome clauses above: the exported
-			// DICOM files are unaffected either way, so a DICOMDIR failure never
-			// routes through the hard-failure dialog below.
-			if res.DicomdirWritten {
-				msg += "; DICOMDIR index written"
-			}
-			if res.DicomdirError != "" {
-				msg += fmt.Sprintf("; DICOMDIR index could not be written (%s)", res.DicomdirError)
-			}
+			msg, review := modificationSummary(res, outDir)
 			running = false
 			// Failures have to be impossible to walk past: an export missing
 			// files still looks finished, and a transfer-syntax conversion that
@@ -1124,12 +1105,120 @@ func showModificationRunDialog(w fyne.Window, profileName string, files []string
 				win.Resize(fyne.NewSize(660, 560))
 				return
 			}
+			// A run with nothing to review closes itself (user decision
+			// 2026-10-16); its summary goes to report instead, so where the
+			// export went is still on screen. Anything that asks to be read —
+			// a cancel, an empty export, a warning clause — keeps the window.
+			if !review {
+				if report != nil {
+					report(fmt.Sprintf("Modification (%s): %s", profileName, msg))
+				}
+				win.Close()
+				return
+			}
 			statusLbl.SetText(msg)
 			cancelBtn.SetText("Close")
 			cancelBtn.OnTapped = win.Close
 			cancelBtn.Enable()
 		})
 	}()
+}
+
+// modificationSummary is a finished run's completion message, and whether it
+// carries anything the user must read before the window may close. review is
+// false only for a run that wrote files and finished with nothing but
+// confirmation to say. Everything else keeps the window open:
+//   - a cancelled run, a failed file (the caller's failure view), or a run that
+//     wrote nothing — an empty export looks finished and is not;
+//   - an encoding the profile did not ask for (lossy re-encoded lossless, or
+//     decompressed for masking): the encoding must never change silently, and
+//     closing on that clause would make it silent;
+//   - a weaker guarantee or a residual risk: the ultrasound fallback, a nested
+//     birth date, the PHI check's findings, a DICOMDIR that could not be
+//     written.
+//
+// Informational clauses do not hold the window: files the profile's own
+// filters skipped, masked files recompressed into their own syntax (the
+// encoding did not change), and a DICOMDIR written.
+func modificationSummary(res modifyResult, outDir string) (msg string, review bool) {
+	head := "Done"
+	if res.Canceled {
+		head = "Cancelled"
+	}
+	review = res.Canceled || res.Failed > 0 || res.Processed == 0
+	msg = fmt.Sprintf("%s — %d file(s) written to %s", head, res.Processed, outDir)
+	if res.Skipped > 0 {
+		msg += fmt.Sprintf(", %d skipped", res.Skipped)
+	}
+	if res.Failed > 0 {
+		msg += fmt.Sprintf(", %d failed", res.Failed)
+	}
+	// Masked files whose source compression is lossless are re-encoded,
+	// verified bit-identical, back into their own syntax — the pixels
+	// changed (that was the point), the encoding did not. Stated so the
+	// rewrite is on record.
+	if res.MaskRecompressed > 0 {
+		msg += fmt.Sprintf("; %d masked file(s) recompressed to their original transfer syntax",
+			res.MaskRecompressed)
+	}
+	// Masked files whose source compression is lossy are re-encoded to
+	// JPEG 2000 Lossless instead — re-entering the lossy syntax would
+	// degrade every pixel a second time, while the lossless encode
+	// adds nothing beyond the decode masking already forced. A syntax
+	// change, so it gets its own clause rather than hiding in the one
+	// above.
+	if res.MaskRecodedLossless > 0 {
+		msg += fmt.Sprintf("; %d masked lossy file(s) re-encoded to %s — no added loss",
+			res.MaskRecodedLossless, transferSyntaxLabel(tsJPEG2000LL))
+		review = true
+	}
+	// Masking cannot be applied to compressed pixels, and a lossy source
+	// cannot be recompressed without degrading every pixel a second
+	// time, so those files left in a different encoding than the profile
+	// asked for. Stating it is the whole reason the run does it rather
+	// than failing the file.
+	if res.MaskDecompressed > 0 {
+		msg += fmt.Sprintf("; %d decompressed to %s so burned-in pixels could be masked",
+			res.MaskDecompressed, transferSyntaxLabel(tsExplicitVRLE))
+		review = true
+	}
+	// A weaker guarantee than the rest of the export: those files were
+	// masked by the profile's rectangles because they stated no region
+	// of their own, so they are worth checking by eye.
+	if res.MaskUSFallback > 0 {
+		msg += fmt.Sprintf("; %d ultrasound file(s) declared no image region and were masked "+
+			"with the profile's rectangles instead — worth reviewing", res.MaskUSFallback)
+		review = true
+	}
+	// The birth date mask rewrites the top-level element only, so a copy
+	// nested in a sequence — Original Attributes Sequence being the one
+	// that really carries one — survives it. Reported from what the run
+	// actually found rather than from the profile's shape, so it is a
+	// fact about this export rather than a warning about a possibility.
+	if res.NestedDOBKept > 0 {
+		msg += fmt.Sprintf("; %d file(s) still carry a birth date inside a sequence — "+
+			"the birth date mask reaches the top-level field only, so removing 0400,0561 "+
+			"(Original Attributes Sequence) is what clears it", res.NestedDOBKept)
+		review = true
+	}
+	// The PHI check's evidence half: what the written files still
+	// carried, counted by the engine per file, so this is a fact about
+	// the export whether or not the pre-run check had finished.
+	if phi := phiRiskSummary(res.PHIRisks); phi != "" {
+		msg += phi
+		review = true
+	}
+	// Informational, like the mask-outcome clauses above: the exported
+	// DICOM files are unaffected either way, so a DICOMDIR failure never
+	// routes through the hard-failure view — but it does hold the window.
+	if res.DicomdirWritten {
+		msg += "; DICOMDIR index written"
+	}
+	if res.DicomdirError != "" {
+		msg += fmt.Sprintf("; DICOMDIR index could not be written (%s)", res.DicomdirError)
+		review = true
+	}
+	return msg, review
 }
 
 // modifyFailureListCap bounds how many failures the warning dialog spells out.

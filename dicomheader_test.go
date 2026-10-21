@@ -1,7 +1,6 @@
 package main
 
 import (
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -66,18 +65,6 @@ func writeHeaderFixture(t *testing.T, path, ts string, pixelBytes int, trailing 
 		sdicom.SkipVRVerification(), sdicom.SkipValueTypeVerification()); err != nil {
 		t.Fatalf("write fixture: %v", err)
 	}
-}
-
-// countingReader counts the bytes actually pulled from the file.
-type countingReader struct {
-	r io.Reader
-	n int64
-}
-
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n += int64(n)
-	return n, err
 }
 
 // The header read must return exactly what the SkipPixelData parse it replaces

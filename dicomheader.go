@@ -69,28 +69,53 @@ const headerReadBufferSize = 32 << 10
 // readDicomHeaderFrom is readDicomHeader over any reader — the seam the tests use
 // to count how many bytes a header read actually pulls. what names the source
 // for the log line, as in safeParse.
-func readDicomHeaderFrom(r io.Reader, size int64, what string) (ds sdicom.Dataset, err error) {
+func readDicomHeaderFrom(r io.Reader, size int64, what string) (sdicom.Dataset, error) {
+	ds, _, err := readDicomHeaderStop(r, size, what, nil)
+	return ds, err
+}
+
+// errHeaderDeclined is readDicomHeaderStop's result when its accept function
+// turned the file down on its File Meta.
+var errHeaderDeclined = errors.New("header read declined on the file meta")
+
+// readDicomHeaderStop is readDicomHeaderFrom that also reports where it stopped:
+// the offset from the start of r of the first element in the pixel data group,
+// which is where its tag begins — or -1 when the read ran to the end instead (no
+// pixel data, or a file whose peek cannot be trusted). nativeframes.go reads the
+// pixel data from there without parsing it. accept, when set, sees the File Meta
+// group first, and a false return ends the read there with errHeaderDeclined —
+// so a caller interested only in some transfer syntaxes reads no further than
+// the meta of every other file.
+func readDicomHeaderStop(r io.Reader, size int64, what string, accept func(meta *sdicom.Dataset) bool) (ds sdicom.Dataset, stopAt int64, err error) {
+	stopAt = -1
 	// NewParser rather than safeParse, so this carries the parse-panic boundary
 	// itself (see dicomsafe.go).
 	defer func() {
 		if rec := recover(); rec != nil {
 			logWarn("dicom: parser panic reading %s: %v", what, rec)
-			ds, err = sdicom.Dataset{}, fmt.Errorf("parser panic: %v", rec)
+			ds, stopAt, err = sdicom.Dataset{}, -1, fmt.Errorf("parser panic: %v", rec)
 		}
 	}()
 
-	br := bufio.NewReaderSize(r, headerReadBufferSize)
+	// Counting beneath the buffer: what the file has given up, less what still
+	// sits unread in the buffer, is where the parser is.
+	cr := &countingReader{r: r}
+	br := bufio.NewReaderSize(cr, headerReadBufferSize)
 	p, err := sdicom.NewParser(br, size, nil, sdicom.SkipPixelData())
 	if err != nil {
-		return sdicom.Dataset{}, err
+		return sdicom.Dataset{}, -1, err
 	}
 	meta := p.GetMetadata()
+	if accept != nil && !accept(&meta) {
+		return sdicom.Dataset{}, -1, errHeaderDeclined
+	}
 	bo, peekable := headerPeekByteOrder(&meta)
 
 	elems := append([]*sdicom.Element(nil), meta.Elements...)
 	for {
 		if peekable {
 			if b, perr := br.Peek(2); perr == nil && bo.Uint16(b) >= tag.PixelData.Group {
+				stopAt = cr.n - int64(br.Buffered())
 				break
 			}
 		}
@@ -99,11 +124,23 @@ func readDicomHeaderFrom(r io.Reader, size int64, what string) (ds sdicom.Datase
 			if errors.Is(nerr, sdicom.ErrorEndOfDICOM) {
 				break
 			}
-			return sdicom.Dataset{}, nerr
+			return sdicom.Dataset{}, -1, nerr
 		}
 		elems = append(elems, elem)
 	}
-	return sdicom.Dataset{Elements: elems}, nil
+	return sdicom.Dataset{Elements: elems}, stopAt, nil
+}
+
+// countingReader counts the bytes read through it.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // headerPeekByteOrder reports the byte order the dataset's tags are written in,

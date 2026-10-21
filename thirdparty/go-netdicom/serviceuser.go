@@ -335,6 +335,31 @@ func (su *ServiceUser) CStore(ds *dicom.DataSet) error {
 // bytes went out on an Explicit VR LE context and the receiver stored them
 // under that label.
 //
+// AcceptedTransferSyntaxes waits until the association is established, then
+// returns the transfer syntaxes the peer accepted for sopClassUID, in
+// context-ID order, and whether the class was proposed at all — what CStoreRaw
+// consults before sending (dicomqr local patch). Exposed so a sender can tell,
+// before a file's turn comes, that it must be converted, and convert it while
+// the previous file is still on the wire. err is the association's failure
+// (refused, closed), as CStoreRaw would report it.
+//
+// REQUIRES: Connect() or SetConn has been called.
+func (su *ServiceUser) AcceptedTransferSyntaxes(sopClassUID string) (accepted []string, proposed bool, err error) {
+	if err := su.waitUntilReady(); err != nil {
+		return nil, false, err
+	}
+	accepted, proposed = su.cm.acceptedSyntaxesFor(sopClassUID)
+	return accepted, proposed, nil
+}
+
+// ConversionTarget is the syntax CStoreRaw names (TransferSyntaxMismatchError.
+// Negotiated) for a data set the peer did not accept in its own syntax, given
+// the syntaxes it did accept for the class (dicomqr local patch): one rule, so
+// a sender converting ahead converts into what a refusal would have named.
+func ConversionTarget(accepted []string) string {
+	return preferredConversionTarget(accepted)
+}
+
 // REQUIRES: Connect() or SetConn has been called.
 func (su *ServiceUser) CStoreRaw(sopClassUID, sopInstanceUID, transferSyntaxUID string, data []byte) error {
 	err := su.waitUntilReady()

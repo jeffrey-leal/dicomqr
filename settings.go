@@ -79,6 +79,8 @@ type Settings struct {
 	// servers whose C-MOVE agent stalls on non-image objects (SR/PR). 0 uses
 	// the default (120 s); negative disables stall detection (e.g. for slow
 	// tape archives).
+	// The same limit stops a push from waiting forever on a server that has
+	// stopped answering (stallTimeoutFor).
 	RetrieveStallTimeoutSec int `json:"retrieveStallTimeoutSec,omitempty"`
 
 	// ModifyOutputDir is the default output folder for modification exports,
@@ -88,6 +90,15 @@ type Settings struct {
 	// outside the download folder — enforced on Apply and again at
 	// modification time.
 	ModifyOutputDir string `json:"modifyOutputDir"`
+
+	// ModProfileOrder is the order the modification profiles are listed in —
+	// Preferences and both Modification menus — by name. It lives here rather
+	// than in profiles.json because that file is a name-keyed map shared with
+	// dicomtool: Go writes a map sorted by key, and any key added to hold an
+	// order would read there as one more profile. Nil means alphabetical; a
+	// profile it does not name follows the ones it does, and a name no longer
+	// in the store is ignored (orderedModProfileNames).
+	ModProfileOrder []string `json:"modProfileOrder,omitempty"`
 
 	// ExportFormat ("csv" or "json") is the file type listed first in the
 	// tag viewer's Export Tags… save dialog, and the format applied when the
@@ -138,6 +149,22 @@ func ensureDefaultSettings() {
 // loadSettings reads ~/.dicomqr/settings.json, overlaying saved values on top
 // of compiled-in defaults so new fields always have a sensible value.
 // If DownloadDir is still empty after loading, it defaults to ~/DICOM Downloads.
+// defaultStallTimeout is the Retrieve stall timeout a setting of 0 means.
+const defaultStallTimeout = 120 * time.Second
+
+// stallTimeoutFor turns RetrieveStallTimeoutSec into a duration: 0 is the
+// default, a positive value that many seconds, and a negative one — stall
+// detection disabled, for a slow tape archive — comes back as 0.
+func stallTimeoutFor(sec int) time.Duration {
+	switch {
+	case sec < 0:
+		return 0
+	case sec == 0:
+		return defaultStallTimeout
+	}
+	return time.Duration(sec) * time.Second
+}
+
 func loadSettings() Settings {
 	var s Settings
 	json.Unmarshal(defaultSettingsJSON, &s)

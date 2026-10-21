@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -239,10 +237,11 @@ func (c *DicomClient) Find(ctx context.Context, level string, params map[string]
 // never cut off; a server that has stopped answering is.
 var queryIdleTimeout = 60 * time.Second
 
-// errQueryNoResponse reports a query abandoned under queryIdleTimeout.
-type errQueryNoResponse struct{ after time.Duration }
+// errNoResponse reports an association abandoned because the server went
+// silent: a query under queryIdleTimeout, a push under the stall timeout.
+type errNoResponse struct{ after time.Duration }
 
-func (e errQueryNoResponse) Error() string {
+func (e errNoResponse) Error() string {
 	return fmt.Sprintf("the server stopped responding (nothing for %.0f s)", e.after.Seconds())
 }
 
@@ -300,7 +299,7 @@ func (c *DicomClient) cFindStream(ctx context.Context, op string, level netdicom
 	why := func(err error) error {
 		switch {
 		case timedOut.Load():
-			return fmt.Errorf("%s: %w", op, errQueryNoResponse{queryIdleTimeout})
+			return fmt.Errorf("%s: %w", op, errNoResponse{queryIdleTimeout})
 		case ctx.Err() != nil:
 			return ctx.Err()
 		}
@@ -586,122 +585,120 @@ func elementsToFindResult(elems []*dicom.Element) FindResult {
 
 // StoreProgress reports per-file progress from StoreFiles.
 type StoreProgress struct {
-	Done  int
+	Done  int // files resolved so far, counting this one
 	Total int
 	Path  string
 	Err   error // nil on success
 }
 
-// StoreFiles sends each file in paths to the remote PACS via C-STORE SCU.
-// onProgress is called after each file attempt. The goroutine checks ctx
-// between files so cancellation stops the loop promptly. Returns nil when all
-// files have been attempted; ctx.Err() when cancelled.
+// pushReport is what a finished push says beyond its per-file reports.
+type pushReport struct {
+	// limit is the number of associations the push was allowed at once — the
+	// server profile's Parallel transfers, capped by the number of targets.
+	limit int
+	// degradedBy is why the push dropped to one association, nil if it never
+	// did (describeParallelDegrade words it).
+	degradedBy error
+}
+
+// StoreFiles sends each file in paths to the remote PACS via C-STORE SCU,
+// over as many associations at once as the server profile's Parallel
+// transfers allows (pushrun.go). onProgress is called once per file as it is
+// resolved — sent, refused, or failed — one call at a time, from whichever
+// association finished it; Done counts up across them. A file whose
+// association is cancelled is not reported.
+//
+// idleTimeout aborts an association that has a send in flight and moves no
+// byte either way for that long — a server that stopped answering, which used
+// to leave the push waiting forever. Zero or negative disables it.
+//
+// The returned error is ctx.Err() when the push was cancelled and nil
+// otherwise: every other failure — a refused association, a dropped one, a
+// silent server, a refused file — is reported per file.
 //
 // Files are sent as stored bytes, verbatim (DICOM library policy, Phase 1):
-// the association proposes exactly the SOP classes and transfer syntaxes the
+// each association proposes exactly the SOP classes and transfer syntaxes its
 // files are stored in (pushPresentationContexts), so a server that accepts a
 // file's syntax receives its bytes unchanged — no re-encode, no data
 // dictionary. A file whose stored syntax the server did not accept is
 // converted locally to an accepted uncompressed syntax (on a temp copy;
 // sources are never touched) and resent; a file that cannot be converted, or
 // whose SOP class the server refused, is reported and skipped.
-func (c *DicomClient) StoreFiles(ctx context.Context, paths []string, onProgress func(StoreProgress)) error {
+func (c *DicomClient) StoreFiles(ctx context.Context, paths []string, idleTimeout time.Duration,
+	onProgress func(StoreProgress)) (pushReport, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return pushReport{}, err
 	}
 
 	// Each file's identity (SOP UIDs, stored syntax, where its data set
 	// starts) is read once, here, on the scan worker pool, and reused both to
-	// build the proposal and by the send loop. The pass used to read every
-	// file's syntax one at a time before connecting — about 9 ms a file on a
-	// cold spinning disk, so a minute and a half of silence for 10,000 files —
-	// and then each file was opened again for its identity and a third time
-	// for its bytes.
+	// build each association's proposal and by the send loop. The pass used to
+	// read every file's syntax one at a time before connecting — about 9 ms a
+	// file on a cold spinning disk, so a minute and a half of silence for
+	// 10,000 files — and then each file was opened again for its identity and
+	// a third time for its bytes.
 	idents := readPushIdentities(paths)
-	contexts := pushPresentationContexts(idents)
-	if len(contexts) == 0 {
-		// Not one file's identity could be read: there is nothing to
-		// negotiate, so report each file without connecting.
-		for i, path := range paths {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if onProgress != nil {
-				onProgress(StoreProgress{Done: i + 1, Total: len(paths), Path: path, Err: unreadablePushFile(idents[i])})
-			}
+	limit := c.profile.parallelTransfers()
+	targets := pushTargets(paths, limit)
+	rep := pushReport{limit: max(1, min(limit, len(targets)))}
+
+	// Reports are serialised and numbered here, so onProgress sees one call
+	// at a time whichever association finished the file.
+	var mu sync.Mutex
+	done := 0
+	report := func(i int, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		done++
+		if onProgress != nil {
+			onProgress(StoreProgress{Done: done, Total: len(paths), Path: paths[i], Err: err})
 		}
-		return nil
 	}
 
-	su, err := netdicom.NewServiceUser(netdicom.ServiceUserParams{
-		CalledAETitle:        c.profile.RemoteAETitle,
-		CallingAETitle:       c.localAETitle,
-		PresentationContexts: contexts,
+	push := &pushRun{
+		client:      c,
+		paths:       paths,
+		idents:      idents,
+		idleTimeout: idleTimeout,
+		report:      report,
+		// Read-ahead is bounded by bytes as well as by count: each association
+		// holds up to three files, and several associations of large
+		// multi-frame files would otherwise hold gigabytes.
+		budget:       newMemBudget(modifyMemoryBudget),
+		convertSlots: make(chan struct{}, pushConversionLimit(rep.limit)),
+	}
+	// pending[t] is target t's files not yet resolved. A target whose
+	// association fails part-way keeps the rest for its re-run, so nothing
+	// already sent goes again. Written by the worker running the target and
+	// read by the next to run it, which the scheduler's lock orders.
+	pending := slices.Clone(targets)
+	sched := newRetrieveRun(len(targets), limit)
+	sched.onDegrade = func(err error) {
+		logWarn("push: dropping to one association at a time: %v", err)
+	}
+	logInfo("push: %d file(s) to %s (%s) in %d part(s), up to %d association(s) at once",
+		len(paths), c.profile.Name, c.profile.RemoteAETitle, len(targets), rep.limit)
+	sched.run(ctx, func(tctx context.Context, t int) error {
+		rest, err := push.sendTarget(tctx, pending[t])
+		pending[t] = rest
+		return err
 	})
-	if err != nil {
-		return fmt.Errorf("c-store: create service user: %w", err)
-	}
-
-	type result struct{ err error }
-	resultCh := make(chan result, 1)
-
-	go func() {
-		defer su.Release()
-		su.Connect(fmt.Sprintf("%s:%d", c.profile.Host, c.profile.Port))
-
-		// The next file is read from disk while the current one is on the
-		// wire — one file ahead, so memory holds at most the file being sent,
-		// the one read ahead and the one being read.
-		type loaded struct {
-			i   int
-			raw []byte
-			err error
+	// A target that failed for good fails its unsent files with the reason —
+	// except one that could never have been sent, which keeps its own.
+	for t, res := range sched.outcome() {
+		if res.state != targetFailed {
+			continue
 		}
-		next := make(chan loaded, 1)
-		stopRead := make(chan struct{})
-		defer close(stopRead)
-		go func() {
-			defer close(next)
-			for i, path := range paths {
-				l := loaded{i: i}
-				if idents[i].err != nil {
-					l.err = unreadablePushFile(idents[i])
-				} else {
-					l.raw, l.err = os.ReadFile(path)
-				}
-				select {
-				case next <- l:
-				case <-stopRead:
-					return
-				}
-			}
-		}()
-
-		total := len(paths)
-		for l := range next {
-			if ctx.Err() != nil {
-				resultCh <- result{ctx.Err()}
-				return
-			}
-			path := paths[l.i]
-			fileErr := l.err
-			if fileErr == nil {
-				fileErr = storeFileRaw(su, path, idents[l.i].dicomFileIdentity, l.raw)
-			}
-			if onProgress != nil {
-				onProgress(StoreProgress{Done: l.i + 1, Total: total, Path: path, Err: fileErr})
+		for _, i := range pending[t] {
+			if idents[i].err != nil {
+				report(i, unreadablePushFile(idents[i]))
+			} else {
+				report(i, res.err)
 			}
 		}
-		resultCh <- result{nil}
-	}()
-
-	select {
-	case r := <-resultCh:
-		return r.err
-	case <-ctx.Done():
-		abortAndReap(su, resultCh)
-		return ctx.Err()
 	}
+	rep.degradedBy = sched.degradedBy()
+	return rep, ctx.Err()
 }
 
 // pushIdentity is one file's File Meta identity, or why it could not be read.
@@ -819,13 +816,22 @@ func buildPushContexts(classes []string, syntaxesByClass map[string][]string,
 	return contexts
 }
 
-// storeFileRaw sends one stored file verbatim over an established push
-// association, given its identity and bytes (both already read by StoreFiles).
-// When the server accepted its SOP class but not its stored syntax, it
-// converts a temp copy to an accepted uncompressed syntax and resends; any
-// other error — a refused SOP class, an unconvertible syntax — is returned
-// for per-file reporting.
-func storeFileRaw(su *netdicom.ServiceUser, path string, ident dicomFileIdentity, raw []byte) error {
+// rawStorer is the one association operation storeFileRaw needs —
+// *netdicom.ServiceUser, or the push's watched wrapper (pushAssociation).
+type rawStorer interface {
+	CStoreRaw(sopClassUID, sopInstanceUID, transferSyntaxUID string, data []byte) error
+}
+
+// storeFileRaw sends one file's bytes verbatim over an established push
+// association, given the identity they carry. A file the server would not take
+// in its stored syntax has normally been converted already, by the push's
+// reader while the previous file was on the wire (pushConversionTarget,
+// convertForPush), so this sends what it is handed. Should the server still
+// refuse the syntax, it converts here — through the same bounded conversion,
+// slots — and resends; any other error, a refused SOP class or an unconvertible
+// syntax, is returned for per-file reporting. path is the source file, read
+// again only for that conversion.
+func storeFileRaw(su rawStorer, path string, ident dicomFileIdentity, raw []byte, slots chan struct{}) error {
 	send := func(raw []byte, offset int64, ts string) error {
 		if int64(len(raw)) <= offset {
 			return errors.New("file holds no dataset after the meta group")
@@ -854,26 +860,14 @@ func storeFileRaw(su *netdicom.ServiceUser, path string, ident dicomFileIdentity
 		return fmt.Errorf("stored as %s, which the server does not accept for %s; it accepts only %s, and a file can only be converted to an uncompressed syntax",
 			transferSyntaxLabel(ident.transferSyntaxUID), describeSOPClass(ident.sopClassUID), strings.Join(accepted, ", "))
 	}
-	tmpPath, changed, terr := transcodeDICOMFileToTemp(path, mismatch.Negotiated, os.TempDir())
-	if terr != nil {
-		return fmt.Errorf("cannot convert %s to negotiated %s: %w",
-			transferSyntaxLabel(ident.transferSyntaxUID), transferSyntaxLabel(mismatch.Negotiated), terr)
+	converted, convIdent, cerr := convertForPush(path, ident, mismatch.Negotiated, slots)
+	if cerr != nil {
+		return cerr
 	}
-	if !changed {
-		return err // defensive: mismatch reported but file already in the negotiated syntax
+	if convIdent.transferSyntaxUID == ident.transferSyntaxUID {
+		return err // defensive: mismatch reported but the file is already in the negotiated syntax
 	}
-	defer os.Remove(tmpPath)
-	tmpIdent, ierr := fileMetaIdentity(tmpPath)
-	if ierr != nil {
-		return fmt.Errorf("read converted file meta: %w", ierr)
-	}
-	logInfo("c-store: %s converted %s → %s for push (server did not accept the stored syntax)",
-		filepath.Base(path), transferSyntaxLabel(ident.transferSyntaxUID), transferSyntaxLabel(mismatch.Negotiated))
-	converted, rerr := os.ReadFile(tmpPath)
-	if rerr != nil {
-		return rerr
-	}
-	return send(converted, tmpIdent.datasetOffset, tmpIdent.transferSyntaxUID)
+	return send(converted, convIdent.datasetOffset, convIdent.transferSyntaxUID)
 }
 
 // WorklistResult holds one Modality Worklist C-FIND response item.

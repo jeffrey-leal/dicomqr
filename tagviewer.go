@@ -46,6 +46,11 @@ type tagNode struct {
 	isInstance  bool // true on instance-level structural nodes (export scope)
 	elmTag      tag.Tag
 	hasTag      bool
+	// modality is the Modality (0008,0060) of the file an element row belongs
+	// to, upper-cased — what a Tag Profile limited to some modalities is
+	// matched against. Kept on every element row because nodes have no parent
+	// link to reach their instance through.
+	modality string
 	// Structured element fields kept alongside the display label so Export…
 	// can emit real columns instead of re-parsing labels. Empty on structural
 	// nodes (patient/study/series/instance/sequence items).
@@ -156,34 +161,45 @@ func (m *tagTreeModel) buildVisible() {
 	m.visible, m.visibleFilter, m.visibleOf, m.visibleValid = visible, m.filterText, m.version, true
 }
 
-// tooltipFor returns a formatted DICOM standard description for the node's tag.
-// Returns "" for structural nodes (patient/study/series/instance) and unknown tags.
-func (m *tagTreeModel) tooltipFor(id string) string {
+// tooltipFor returns a formatted DICOM standard description for the node's
+// tag, followed by the Tag Profiles that match it in this file: the one whose
+// colour the row shows, then any it overrides. Returns "" for structural nodes
+// (patient/study/series/instance), and for a tag with no dictionary entry
+// unless a profile lists it.
+func (m *tagTreeModel) tooltipFor(id string, profiles []TagProfile) string {
 	m.mu.RLock()
 	n, ok := m.nodes[id]
 	m.mu.RUnlock()
 	if !ok || !n.hasTag {
 		return ""
 	}
+	names := matchingProfileNames(n.elmTag, n.hasTag, n.modality, profiles)
 	info, err := tag.Find(n.elmTag)
-	if err != nil {
+	if err != nil && len(names) == 0 {
 		return "" // private or non-standard tag — no dictionary entry
 	}
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "Tag:     (%04X,%04X)\n", n.elmTag.Group, n.elmTag.Element)
-	if info.Name != "" {
-		fmt.Fprintf(&sb, "Name:    %s\n", info.Name)
+	lines := []string{fmt.Sprintf("Tag:     (%04X,%04X)", n.elmTag.Group, n.elmTag.Element)}
+	if err == nil {
+		if info.Name != "" {
+			lines = append(lines, "Name:    "+info.Name)
+		}
+		if info.Keyword != "" {
+			lines = append(lines, "Keyword: "+info.Keyword)
+		}
+		if len(info.VRs) > 0 {
+			lines = append(lines, "VR:      "+strings.Join(info.VRs, ", "))
+		}
+		if info.VM != "" {
+			lines = append(lines, "VM:      "+info.VM)
+		}
 	}
-	if info.Keyword != "" {
-		fmt.Fprintf(&sb, "Keyword: %s\n", info.Keyword)
+	if len(names) > 0 {
+		lines = append(lines, "Profile: "+names[0])
 	}
-	if len(info.VRs) > 0 {
-		fmt.Fprintf(&sb, "VR:      %s\n", strings.Join(info.VRs, ", "))
+	if len(names) > 1 {
+		lines = append(lines, "Also in: "+strings.Join(names[1:], ", "))
 	}
-	if info.VM != "" {
-		fmt.Fprintf(&sb, "VM:      %s", info.VM)
-	}
-	return strings.TrimRight(sb.String(), "\n")
+	return strings.Join(lines, "\n")
 }
 
 func (m *tagTreeModel) isBranch(id string) bool {
@@ -230,6 +246,17 @@ func (m *tagTreeModel) nodeTag(id string) (tag.Tag, bool) {
 		return n.elmTag, n.hasTag
 	}
 	return tag.Tag{}, false
+}
+
+// nodeModality is the Modality of the file an element row came from ("" for
+// structural rows, and for a file that states none).
+func (m *tagTreeModel) nodeModality(id string) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if n, ok := m.nodes[id]; ok {
+		return n.modality
+	}
+	return ""
 }
 
 func (m *tagTreeModel) addDataset(ds sdicom.Dataset) {
@@ -308,8 +335,12 @@ func (m *tagTreeModel) addDataset(ds sdicom.Dataset) {
 	instanceID := m.findOrCreateSorted(seriesID, instanceKey, instanceLabel, sortKey)
 	m.nodes[instanceID].isInstance = true
 
+	modality := ""
+	if v := stringVal(ds, tag.Modality); v != "Unknown" {
+		modality = strings.ToUpper(strings.TrimSpace(v))
+	}
 	for _, el := range ds.Elements {
-		m.addElement(instanceID, el)
+		m.addElement(instanceID, el, modality)
 	}
 }
 
@@ -444,7 +475,7 @@ func vrMatchesStandard(vr string, acceptable []string) bool {
 	return false
 }
 
-func (m *tagTreeModel) addElement(parentID string, el *sdicom.Element) {
+func (m *tagTreeModel) addElement(parentID string, el *sdicom.Element, modality string) {
 	info, err := tag.Find(el.Tag)
 	name := info.Name
 	if name == "" {
@@ -462,7 +493,7 @@ func (m *tagTreeModel) addElement(parentID string, el *sdicom.Element) {
 	if el.RawValueRepresentation == "SQ" {
 		seqID := m.nextID()
 		m.nodes[seqID] = &tagNode{label: prefix, isPrivate: private, isMalformed: malformed, elmTag: el.Tag, hasTag: true,
-			vr: el.RawValueRepresentation, tagName: name}
+			vr: el.RawValueRepresentation, tagName: name, modality: modality}
 		m.nodes[parentID].children = append(m.nodes[parentID].children, seqID)
 
 		if items, ok := el.Value.GetValue().([]*sdicom.SequenceItemValue); ok {
@@ -472,7 +503,7 @@ func (m *tagTreeModel) addElement(parentID string, el *sdicom.Element) {
 				m.nodes[seqID].children = append(m.nodes[seqID].children, itemID)
 				if subEls, ok := item.GetValue().([]*sdicom.Element); ok {
 					for _, subEl := range subEls {
-						m.addElement(itemID, subEl)
+						m.addElement(itemID, subEl, modality)
 					}
 				}
 			}
@@ -481,7 +512,7 @@ func (m *tagTreeModel) addElement(parentID string, el *sdicom.Element) {
 		leafID := m.nextID()
 		val := formatValue(el)
 		m.nodes[leafID] = &tagNode{label: prefix + ": " + val, isPrivate: private, isMalformed: malformed, elmTag: el.Tag, hasTag: true,
-			vr: el.RawValueRepresentation, tagName: name, value: val}
+			vr: el.RawValueRepresentation, tagName: name, value: val, modality: modality}
 		m.nodes[parentID].children = append(m.nodes[parentID].children, leafID)
 	}
 }
@@ -835,14 +866,14 @@ func showTagViewerWindow(a fyne.App, cfg *Settings, title string, paths []string
 			func(id widget.TreeNodeID, _ bool, node fyne.CanvasObject) {
 				row := node.(*tagTreeRow)
 				row.nodeID = id
-				row.tooltipText = model.tooltipFor(id)
+				row.tooltipText = model.tooltipFor(id, cfg.TagProfiles)
 				row.ct.Text = model.labelFor(id)
 				row.ct.TextSize = theme.TextSize()
 				row.ct.TextStyle = fyne.TextStyle{Italic: cfg.ItalicPrivate && model.isPrivateNode(id)}
 				elmTag, hasTag := model.nodeTag(id)
 				if model.isMalformedNode(id) {
 					row.ct.Color = malformedTagColor(cfg)
-				} else if c, ok := matchProfile(elmTag, hasTag, cfg.TagProfiles); ok {
+				} else if c, ok := matchProfile(elmTag, hasTag, model.nodeModality(id), cfg.TagProfiles); ok {
 					row.ct.Color = c
 				} else {
 					row.ct.Color = theme.Color(theme.ColorNameForeground)

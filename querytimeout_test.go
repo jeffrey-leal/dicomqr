@@ -74,7 +74,7 @@ func TestFindTimesOutOnSilentServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, errs := drainFind(t, ch)
-	var nr errQueryNoResponse
+	var nr errNoResponse
 	if len(errs) != 1 || !errors.As(errs[0], &nr) {
 		t.Fatalf("errors %v, want one 'stopped responding' error", errs)
 	}
@@ -102,7 +102,7 @@ func TestFindWorklistTimesOutOnSilentServer(t *testing.T) {
 			t.Fatal("worklist query still open after 10 s — it hung, which left Query disabled for good")
 		}
 	}
-	var nr errQueryNoResponse
+	var nr errNoResponse
 	if len(errs) != 1 || !errors.As(errs[0], &nr) {
 		t.Fatalf("errors %v, want one 'stopped responding' error", errs)
 	}

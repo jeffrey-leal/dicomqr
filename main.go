@@ -31,7 +31,7 @@ import (
 	"github.com/grailbio/go-dicom/dicomlog"
 )
 
-const version = "1.25.0"
+const version = "1.26.0"
 
 // LED colours for connection and SCP state indicators.
 var (
@@ -158,6 +158,9 @@ func main() {
 
 	ensureDefaultSettings()
 	ensureDefaultModifyConfigs()
+	// Profiles written for the retired base-inheritance scheme are rewritten
+	// self-contained, once, with the original kept beside them.
+	convertModProfileStoreAtStartup()
 	cfg := loadSettings()
 	// Record the session's starting configuration so a log file alone can
 	// answer "what was the app actually configured to do" after the fact.
@@ -1238,11 +1241,8 @@ func main() {
 			// resort is sched.onStall: drop to one association and re-run the
 			// silent targets, in case the server accepted associations it never
 			// meant to serve; only a stall after that aborts the retrieve.
-			stallTimeout := 120 * time.Second
-			if stallSetting > 0 {
-				stallTimeout = time.Duration(stallSetting) * time.Second
-			}
-			stallDetection := stallSetting >= 0
+			stallTimeout := stallTimeoutFor(stallSetting)
+			stallDetection := stallTimeout > 0
 			var lastActivity atomic.Int64
 			lastActivity.Store(time.Now().UnixNano())
 			touch := func() { lastActivity.Store(time.Now().UnixNano()) }

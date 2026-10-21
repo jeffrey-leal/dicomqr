@@ -207,7 +207,7 @@ func TestDeidentMethodText(t *testing.T) {
 }
 
 func TestBaseDeidentEnablesAuditTags(t *testing.T) {
-	resolved, err := resolveModProfile("base-deident", embeddedModConfigs(t))
+	resolved, err := lookupModProfile("base-deident", embeddedModConfigs(t))
 	if err != nil {
 		t.Fatal(err)
 	}

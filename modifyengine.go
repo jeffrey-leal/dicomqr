@@ -5,7 +5,7 @@ package main
 // identically. Per-file order of operations (matching dicomtool):
 //
 //	parse → ignoretype → ignoremodality → ignoresopclass → per-modality overrides → fixvr →
-//	remove + noprivate + nooverlays → date shift → dob mask → uid remap → set →
+//	remove + noprivate + nooverlays → annotations → date shift → dob mask → uid remap → set →
 //	audit tags → transfer syntax
 //
 // The audit tags (Patient Identity Removed, De-identification Method) are
@@ -68,7 +68,10 @@ type modifyParams struct {
 	// bitmap channel a vendor can burn annotations into that no per-tag rule
 	// reaches practically (16 repeating groups) and pixel masking cannot touch.
 	// Profile-wide, like noprivate is in the editor.
-	removeOverlays   bool
+	removeOverlays bool
+	// annotations is the normalised graphic-annotation mode (annotations.go):
+	// annotationsKeep, annotationsNoText or annotationsRemove. Profile-wide.
+	annotations      string
 	ignoreTypes      []string
 	ignoreModalities []string
 	ignoreSOPClasses []string
@@ -140,6 +143,12 @@ func compileModifyParams(p ModProfile) (modifyParams, error) {
 	if strings.TrimSpace(p.UIDSuffix) != "" {
 		return mp, errors.New("the uid suffix option has been removed — use Remap UIDs instead")
 	}
+	// A base reference left after conversion means the chain did not resolve:
+	// running only the profile's own settings could drop the de-identifying
+	// ones it inherited. Converted profiles carry none (flattenModProfiles).
+	if p.Base != "" {
+		return mp, unresolvedBaseError(p.Base)
+	}
 
 	mp.dobMask = strings.TrimSpace(p.DOB)
 	if mp.dobMask != "" && len(mp.dobMask) != 8 {
@@ -181,6 +190,14 @@ func compileModifyParams(p ModProfile) (modifyParams, error) {
 
 	mp.removePrivate = p.Priv
 	mp.removeOverlays = p.NoOverlays
+	// Refused rather than guessed at: running an unrecognised value as Keep would
+	// export the text its author may have asked to remove.
+	annotations, annOK := annotationMode(p.Annotations)
+	if !annOK {
+		return mp, fmt.Errorf("annotations %q: must be %s or %s (or empty to keep them)",
+			p.Annotations, annotationsNoText, annotationsRemove)
+	}
+	mp.annotations = annotations
 
 	for _, v := range p.IgnoreTypes {
 		if v = strings.TrimSpace(v); v != "" {
@@ -242,11 +259,12 @@ func compileModifyParams(p ModProfile) (modifyParams, error) {
 	// the only place the application can perform one.
 	hasAction := len(mp.edits) > 0 || len(mp.removals) > 0 ||
 		mp.dobMask != "" || mp.shiftDays != "" ||
-		mp.removePrivate || mp.removeOverlays || mp.fixvrMode != "" || mp.targetTS != "" ||
+		mp.removePrivate || mp.removeOverlays || mp.annotations != annotationsKeep ||
+		mp.fixvrMode != "" || mp.targetTS != "" ||
 		len(mp.ignoreTypes) > 0 || len(mp.ignoreModalities) > 0 || len(mp.ignoreSOPClasses) > 0 ||
 		len(mp.perMod) > 0 || mp.remapUIDs || mp.mayMask || mp.dicomdir
 	if !hasAction {
-		return mp, errors.New("the profile contains no actionable parameter (set, remove, dob, shiftdays, noprivate, nooverlays, fixvr, remapuids, transfersyntax, maskregions, dicomdir)")
+		return mp, errors.New("the profile contains no actionable parameter (set, remove, dob, shiftdays, noprivate, nooverlays, annotations, fixvr, remapuids, transfersyntax, maskregions, dicomdir)")
 	}
 
 	return mp, nil
@@ -1179,7 +1197,8 @@ type modalityOverride struct {
 	// a skip is a skip, so union is the only merge that cannot surprise.
 	ignoreSOPClasses []string
 	// maskRegions replaces the profile's regions outright for this modality
-	// rather than adding to them — see mergeModProfiles.
+	// rather than adding to them: geometry describes one modality's screen
+	// layout, not an addition to another's.
 	maskRegions []MaskRegion
 }
 
@@ -1592,6 +1611,11 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 		}
 		ds.Elements = pruneElements(ds.Elements, removalSet, removePrivate, p.removeOverlays)
 	}
+	// Beside the removals and not folded into them: an override's Keep list
+	// cancels removals, and it must not be able to bring annotation text back.
+	if p.annotations != annotationsKeep {
+		ds.Elements = applyAnnotationMode(ds.Elements, p.annotations)
+	}
 
 	if shiftDaysStr != "" {
 		// Re-validated defensively: compileModifyParams checks the top-level
@@ -1739,7 +1763,7 @@ func processFile(src *os.File, p modifyParams, uidRemap *uidRemapper) (skipped b
 	// Text fields likewise, from the finished dataset — removals have already
 	// taken theirs out — less any the profile's Set values wrote, which now hold
 	// the profile's own literal rather than the original.
-	phiIn.text = textFieldsWithValues(ds.Elements)
+	phiIn.text, phiIn.textPaths = textFieldOccurrences(ds.Elements)
 	setTags := make(map[tag.Tag]bool, len(edits))
 	for _, e := range edits {
 		setTags[e.tag] = true
