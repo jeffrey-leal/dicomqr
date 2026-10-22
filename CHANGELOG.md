@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.26.2] — 2026-10-22
+
+### Changed
+
+- **A single study now uses the parallel connections too.** With a server profile's *Parallel transfers* above 1, a selected study used to be fetched in one request on one connection, so only a retrieve of several studies or series got faster, and a retrieve of one large study ran exactly as it did at 1. dicomqr now first lists the selected study's series and then fetches them separately, each series on a connection of its own and the largest first, so one study is shared across the connections — measured on a multi-series study against DICOMSRV, fetching by series took half the time of fetching the study whole. A study with a single series, or one whose series the server cannot list, is fetched in one request as before, and at Parallel transfers 1 nothing changes. The status bar shows "Listing the series of N studies…" while it asks and then counts series rather than studies, the progress bar weighs each series by the number of images the server lists for it, and a series that fails is retried on its own.
+
 ## [1.26.1] — 2026-10-21
 
 ### Added

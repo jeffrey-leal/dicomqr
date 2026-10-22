@@ -31,7 +31,7 @@ import (
 	"github.com/grailbio/go-dicom/dicomlog"
 )
 
-const version = "1.26.1"
+const version = "1.26.2"
 
 // LED colours for connection and SCP state indicators.
 var (
@@ -1106,16 +1106,10 @@ func main() {
 		go exec.Command("explorer", cfg.DownloadDir).Start()
 	})
 
-	type retrieveTarget struct {
-		level     string // "STUDY" or "SERIES"
-		patientID string
-		studyUID  string
-		seriesUID string
-	}
-
 	// startRetrieveTargets runs the retrieve loop for an already-resolved target
-	// list. Extracted so the retry dialog can re-invoke it with only the failed
-	// targets without duplicating the full retrieve loop (Phase 4-E).
+	// list (retrieveTarget, retrieveexpand.go). Extracted so the retry dialog
+	// can re-invoke it with only the failed targets without duplicating the
+	// full retrieve loop (Phase 4-E).
 	var startRetrieveTargets func(targets []retrieveTarget)
 	startRetrieveTargets = func(targets []retrieveTarget) {
 		if retrieveInFlight {
@@ -1156,9 +1150,15 @@ func main() {
 		localAE := cfg.LocalAETitle
 		downloadDir := cfg.DownloadDir
 		stallSetting := cfg.RetrieveStallTimeoutSec
-		parallel := min(prof.parallelTransfers(), count)
-		logInfo("retrieve: %d targets, destAE=%s port=%d method=%s requiredTS=%q parallel=%d",
-			count, localAE, cfg.LocalSCPPort, method, prof.requiredTransferSyntax(), parallel)
+		limit := prof.parallelTransfers()
+		// Above one association each selected study is split into its series
+		// (expandStudyTargets), one target each, so a single study is shared
+		// across the associations too — not under Patient/Study Only, which
+		// has no SERIES level to ask for.
+		splitStudies := limit > 1 && prof.InfoModel != "patient-study-only"
+		parallel := min(limit, count)
+		logInfo("retrieve: %d targets, destAE=%s port=%d method=%s requiredTS=%q parallel=%d splitStudies=%v",
+			count, localAE, cfg.LocalSCPPort, method, prof.requiredTransferSyntax(), limit, splitStudies)
 		for i, t := range targets {
 			logInfo("  target[%d]: level=%s patientID=%s studyUID=%s seriesUID=%s", i, t.level, t.patientID, t.studyUID, t.seriesUID)
 		}
@@ -1201,13 +1201,36 @@ func main() {
 			// changed its width and repainted the whole window frame — once per
 			// file, at whatever rate the PACS delivered.
 			//
-			// The bar is the mean of every target's own fraction, so several
-			// targets running at once each move it by their share.
+			// The bar is the weighted mean of every target's own fraction
+			// (retrieveWeights: the listed instance counts when every target
+			// has one), so several targets running at once each move it by
+			// their share.
+
+			// Split each selected study into its series first, so the
+			// scheduler has more than one target to spread over the
+			// associations. Listing runs up to `limit` queries at once and
+			// cannot hang (cFindStream); a study that cannot be listed, or
+			// has a single series, stays a whole-study target. A retry of
+			// failed series has no study left to split.
+			if n := countTargets(targets, "STUDY"); splitStudies && n > 0 {
+				noun := "studies"
+				if n == 1 {
+					noun = "study"
+				}
+				fyne.Do(func() { statusLabel.SetText(fmt.Sprintf("Listing the series of %d %s…", n, noun)) })
+				targets = expandStudyTargets(ctx, targets, limit, cl.listSeries)
+				count = len(targets)
+				parallel = min(limit, count)
+				logInfo("retrieve: %d target(s) after splitting studies into series, up to %d at once", count, parallel)
+			}
+			weights := retrieveWeights(targets)
+
 			var lastReceived atomic.Pointer[string]
 			var targetStatus atomic.Pointer[string]    // set as each target starts
 			targetFrac := make([]atomic.Uint64, count) // math.Float64bits, per target
 			var shownPath, shownStatus *string         // reporter-owned
 			shownFrac := -1.0                          // reporter-owned
+			fracs := make([]float64, count)            // reporter-owned
 			setFrac := func(i int, frac float64) { targetFrac[i].Store(math.Float64bits(frac)) }
 			publishRetrieve := func() {
 				if s := targetStatus.Load(); s != nil && s != shownStatus && ctx.Err() == nil {
@@ -1219,11 +1242,10 @@ func main() {
 					path := *p
 					fyne.Do(func() { statusLabel.SetText("Received: " + path) })
 				}
-				var sum float64
 				for i := range targetFrac {
-					sum += math.Float64frombits(targetFrac[i].Load())
+					fracs[i] = math.Float64frombits(targetFrac[i].Load())
 				}
-				if f := sum / float64(count); f != shownFrac {
+				if f := retrieveProgress(fracs, weights); f != shownFrac {
 					shownFrac = f
 					fyne.Do(func() { progressBar.SetValue(f) })
 				}
@@ -1631,18 +1653,18 @@ func main() {
 					cp, cs, _, _ := model.uidsForNode(childID)
 					if cs != "" && !studySeen[cs] {
 						studySeen[cs] = true
-						targets = append(targets, retrieveTarget{"STUDY", cp, cs, ""})
+						targets = append(targets, retrieveTarget{level: "STUDY", patientID: cp, studyUID: cs})
 					}
 				}
 			case seriesUID == "":
 				// Study node.
 				if !studySeen[studyUID] {
 					studySeen[studyUID] = true
-					targets = append(targets, retrieveTarget{"STUDY", patID, studyUID, ""})
+					targets = append(targets, retrieveTarget{level: "STUDY", patientID: patID, studyUID: studyUID})
 				}
 			default:
 				// Series node — defer until we know which studies are in the list.
-				pendingSeries = append(pendingSeries, retrieveTarget{"SERIES", patID, studyUID, seriesUID})
+				pendingSeries = append(pendingSeries, retrieveTarget{level: "SERIES", patientID: patID, studyUID: studyUID, seriesUID: seriesUID})
 			}
 		}
 		// Add series targets only when their parent study was not included directly.

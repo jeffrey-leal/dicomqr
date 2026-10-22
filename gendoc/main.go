@@ -509,7 +509,7 @@ const stylesXML = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 
 func buildContent(d Formatter) {
 
-	d.Cover("dicomqr", "User Manual  v1.26.1",
+	d.Cover("dicomqr", "User Manual  v1.26.2",
 		time.Now().Format("January 2, 2006"),
 		"A Windows desktop application for querying, retrieving, and managing DICOM medical imaging studies.")
 
@@ -586,7 +586,7 @@ func buildContent(d Formatter) {
 		{"Retrieve method", "C-MOVE (default) instructs the PACS to push files to the local C-STORE SCP listener. C-GET requests that the PACS return files over the same association — no inbound port or PACS-side destination registration is required. Auto tries C-GET first and falls back to C-MOVE if the PACS rejects it."},
 		{"Connect timeout", "Seconds to wait for the initial C-ECHO before reporting a failure. Default: 10 s."},
 		{"Transfer syntax", "'As stored (server decides)' accepts whatever the PACS prefers — a JPEG 2000 archive will typically send JPEG 2000. The two uncompressed options guarantee every retrieved file ends up in exactly the selected syntax on disk — Explicit VR Little Endian (`1.2.840.10008.1.2.1`) or Implicit VR Little Endian (`1.2.840.10008.1.2`). Negotiation offers the required syntax first, so a transcoding-capable PACS sends it directly; a PACS that only serves objects in their stored form may instead send any syntax the application can decode (the other uncompressed VR, JPEG Baseline/Extended, JPEG 2000), and each such file is converted to the required syntax on receipt, before it reaches the download folder — in the background, after the server has been told the file arrived, so the transfer is not held up waiting for each conversion. The status bar reports how many files needed local conversion. Objects that cannot be obtained in the required syntax do not stop the retrieve: an object the server cannot deliver in any negotiable syntax (e.g. the archive stores JPEG-LS or RLE and does not transcode), or one that arrives but fails local conversion (e.g. a screenshot with undecodable pixel data), is skipped — reported in the Activity Log and counted in the completion status — while every deliverable object is retrieved and stored in the required syntax. Only when the server can deliver nothing at all in a negotiable syntax does an error dialog appear, naming the required syntax; switch the profile back to 'As stored' to retrieve such data in its stored form."},
-		{"Parallel transfers", "How many studies or series a retrieve fetches at once, each on its own connection (association) to the server: 1 (the default) to 4. A retrieve of several studies or series is then shared across that many connections, which can shorten it considerably when the server answers each request slowly. More than one helps only if the server allows several connections from this application's AE Title at the same time. DICOM gives no way to ask a server its limit, so the setting is yours to raise — use Test (Section 4.4) first. If the server refuses an extra connection, or one of them fails or stops responding, the retrieve carries on one at a time: the affected studies or series are fetched again, nothing is lost, and the completion status says so. Some servers accept several connections but still send C-MOVE deliveries one at a time, in which case a higher setting does no harm but gains nothing. The same setting applies when pushing files to this server (Section 8.5): a push is then sent over that many connections at once, with the same fallback to one."},
+		{"Parallel transfers", "How many studies or series a retrieve fetches at once, each on its own connection (association) to the server: 1 (the default) to 4. A retrieve is then shared across that many connections, which can shorten it considerably when the server answers each request slowly: several selected studies or series run side by side, and a selected study is split into its series, each fetched on a connection of its own and the largest first, so one large study is shared out too (a study with a single series, or one whose series the server cannot list, is fetched in one request as before). More than one helps only if the server allows several connections from this application's AE Title at the same time. DICOM gives no way to ask a server its limit, so the setting is yours to raise — use Test (Section 4.4) first. If the server refuses an extra connection, or one of them fails or stops responding, the retrieve carries on one at a time: the affected studies or series are fetched again, nothing is lost, and the completion status says so. Some servers accept several connections but still send C-MOVE deliveries one at a time, in which case a higher setting does no harm but gains nothing. The same setting applies when pushing files to this server (Section 8.5): a push is then sent over that many connections at once, with the same fallback to one."},
 	})
 	d.P("The first profile in the list is selected by default when the application starts.")
 
@@ -710,11 +710,11 @@ func buildContent(d Formatter) {
 	d.Bullet("C-MOVE — dicomqr sends a C-MOVE request; the PACS pushes files to the local C-STORE SCP listener, which writes them to the download folder.")
 	d.Bullet("C-GET — dicomqr sends a C-GET request; the PACS streams files back over the same association directly.")
 	d.Bullet("Auto — dicomqr attempts C-GET; if the PACS rejects it, the request is retried using C-MOVE.")
-	d.P("Selecting a study retrieves all of its series in one request; selecting individual series retrieves each independently. A progress bar appears and advances as each study or series is transferred.")
+	d.P("Selecting individual series retrieves each independently. Selecting a study retrieves all of its series in one request when the profile's Parallel transfers is 1 (Section 4.1). Above 1, dicomqr first lists the study's series and then fetches them separately, each series on a connection of its own and the largest first, so that one study is shared across the connections; the status bar shows 'Listing the series of N studies…' while it asks. A study with a single series, or one whose series the server does not list, is fetched in one request as before. A progress bar appears and advances as each study or series is transferred.")
 	d.P("One retrieve runs at a time. Starting another while one is in progress — from the button, the menu, or the results tree's right-click — is refused with a message rather than queued: wait for the running retrieve to finish, or cancel it, then try again. Disconnecting cancels a retrieve in progress along with the connection.")
 
 	d.H2("7.3  Progress")
-	d.P("The progress bar tracks completion across all selected studies and series, advancing as each study or series finishes. For both C-MOVE and C-GET the bar also advances within a study as the server reports sub-operation progress. As each file arrives, the status bar briefly shows the path of the received file.")
+	d.P("The progress bar tracks completion across every study and series being fetched, advancing as each finishes. When a study has been split into its series, each series counts in proportion to the number of images the server listed for it, so a two-image series does not move the bar as far as a 500-image one; where the server reports no counts, every series counts equally. For both C-MOVE and C-GET the bar also advances within a study as the server reports sub-operation progress. As each file arrives, the status bar briefly shows the path of the received file.")
 
 	d.H2("7.4  Completion")
 	d.P("When all files have been received successfully, the progress bar disappears and the status bar shows:")
@@ -998,7 +998,7 @@ func buildContent(d Formatter) {
 		{"Retrieve method", "C-MOVE / C-GET / Auto — see Section 4.1."},
 		{"Connect timeout", "Seconds before a connection attempt is considered failed."},
 		{"Transfer syntax", "'As stored' or one of the two guaranteed uncompressed syntaxes (converted locally on receipt when the server does not send it) — see Section 4.1 for full details and caveats."},
-		{"Parallel transfers", "How many connections to open to this server at once, 1–4 (blank = 1) — for a retrieve, how many studies or series it fetches together; for a push, how many connections the files are sent over. Test beside it opens that many connections together and reports which the server accepted — see Sections 4.1 and 4.4."},
+		{"Parallel transfers", "How many connections to open to this server at once, 1–4 (blank = 1) — for a retrieve, how many studies or series it fetches together, a selected study being split into its series for this; for a push, how many connections the files are sent over. Test beside it opens that many connections together and reports which the server accepted — see Sections 4.1 and 4.4."},
 	})
 
 	d.H2("14.2  User Interface Tab")
@@ -1042,7 +1042,7 @@ func buildContent(d Formatter) {
 		{"Shift dates (days)", "Shift every DA (Date) and DT (DateTime) field by this many days — negative, zero, or positive, at any nesting depth. DT time/fraction/timezone suffixes are preserved, and Patient Birth Date is never shifted (the birth date mask is that field's dedicated control)."},
 		{"Fix VR", "Handling of value-representation violations: (off), correct, skip, or passthrough."},
 		{"Output transfer syntax", "The transfer syntax exported files are written in. As stored (the default) copies each file's own encoding through untouched; Explicit VR Little Endian and Implicit VR Little Endian convert it, decompressing compressed pixel data on the way out. Only these two uncompressed targets are offered — the application can decompress but never compress. A file whose compression it cannot decode is reported as a failure rather than exported in the wrong syntax."},
-		{"Mark as de-identified", "Record in every exported file that it has been de-identified, as the DICOM standard (PS3.15) expects: Patient Identity Removed (0012,0062) is set to YES, and De-identification Method (0012,0063) names the application, its version and the profile (for example \"dicomqr 1.26.1 profile base-deident\"). A file already de-identified once before keeps the method recorded then, with this run's added after it. When the run shifts dates by a non-zero number of days, Longitudinal Temporal Information Modified (0028,0303) is also set to MODIFIED, so a downstream system knows the dates are not the originals. If the profile's own Set values write any of these tags, the profile's value is kept. The option only labels the export: it removes nothing by itself, and a profile with nothing else to do is still refused. On in the shipped base-deident profile."},
+		{"Mark as de-identified", "Record in every exported file that it has been de-identified, as the DICOM standard (PS3.15) expects: Patient Identity Removed (0012,0062) is set to YES, and De-identification Method (0012,0063) names the application, its version and the profile (for example \"dicomqr 1.26.2 profile base-deident\"). A file already de-identified once before keeps the method recorded then, with this run's added after it. When the run shifts dates by a non-zero number of days, Longitudinal Temporal Information Modified (0028,0303) is also set to MODIFIED, so a downstream system knows the dates are not the originals. If the profile's own Set values write any of these tags, the profile's value is kept. The option only labels the export: it removes nothing by itself, and a profile with nothing else to do is still refused. On in the shipped base-deident profile."},
 		{"Zip export", "Pre-check the Modification dialog's Zip export option for runs with this profile — the run is written as a single <export folder name>.zip. The dialog checkbox still decides per run."},
 		{"Flat export", "Pre-check the Modification dialog's Flat export option for runs with this profile — every file is written directly into the export root (or the archive root, with Zip export also set), with no patient/study/series folders, and named after its SOP Instance UID rather than kept under its source name. The dialog checkbox still decides per run."},
 		{"Ignore image types", "Comma-separated values; a file whose ImageType (0008,0008) contains any of them is skipped entirely."},
@@ -1117,7 +1117,7 @@ func buildContent(d Formatter) {
 	d.P("The status bar at the bottom of the window provides real-time feedback. A coloured LED indicator (gray / amber / green) precedes the status text.")
 	d.Table([]Row{
 		{"Situation", "Status bar text"},
-		{"Application started, not connected", "`v1.26.1`"},
+		{"Application started, not connected", "`v1.26.2`"},
 		{"Connecting to server", "`Connecting…`"},
 		{"Connected", "`Connected: <AE>@<host>:<port>`"},
 		{"Connection cancelled", "`Connection cancelled`"},
@@ -1129,7 +1129,8 @@ func buildContent(d Formatter) {
 		{"Query cut short (some studies received)", "`Query incomplete — <N> studies, then: <reason>`"},
 		{"Query error", "`Query error: <reason>`"},
 		{"Retrieve starting", "`Starting retrieve of <N> studies…`"},
-		{"Retrieve in progress", "`Retrieving study <N>/<total>…`"},
+		{"Listing a study's series (Parallel transfers above 1)", "`Listing the series of <N> studies…`"},
+		{"Retrieve in progress", "`Retrieving study <N>/<total>…`, or with Parallel transfers above 1 `Retrieving series <N>/<total> (up to <K> at once)…`"},
 		{"File received", "`Received: <file path>`"},
 		{"Retrieve complete", "`Retrieved <N> files successfully`"},
 		{"Retrieve complete, objects skipped (required syntax)", "`Retrieved <N> files successfully — <M> unconvertible object(s) skipped, see Activity Log`"},

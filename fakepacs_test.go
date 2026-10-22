@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,8 +21,9 @@ import (
 )
 
 // fakePACS is a loopback Q/R server for the parallel-retrieve tests: it
-// serves C-MOVE, C-GET and C-ECHO from a fixed set of generated studies, and
-// can be capped at maxAssoc concurrent associations, refusing any beyond that
+// serves C-MOVE, C-GET, C-ECHO and a SERIES-level C-FIND from a fixed set of
+// generated studies, and can be capped at maxAssoc concurrent associations,
+// refusing any beyond that
 // with A-ASSOCIATE-RJ "local limit exceeded" — what a real archive's per-AE
 // limit looks like on the wire. Test-only use of grailbio: the vendored
 // provider's C-MOVE/C-GET results carry its data sets, as srtransfer_repro_test
@@ -38,7 +40,29 @@ type fakePACS struct {
 	// wrong thing to measure parallel transfers by.
 	active, serving, peak atomic.Int32
 	refused               atomic.Int32
-	studies               map[string][]string // StudyInstanceUID -> file paths
+	finds                 atomic.Int32            // SERIES-level C-FINDs answered
+	studies               map[string][]string     // StudyInstanceUID -> file paths
+	series                map[string][]fakeSeries // StudyInstanceUID -> its series, in order
+}
+
+// fakeSeries is one series of a generated study.
+type fakeSeries struct {
+	uid   string
+	paths []string
+}
+
+// filterString is the string value of tag t in a C-FIND/C-MOVE identifier, or
+// "" when absent or empty.
+func filterString(filter []*dicom.Element, t dicomtag.Tag) string {
+	e, err := dicom.FindElementByTag(filter, t)
+	if err != nil {
+		return ""
+	}
+	s, err := e.GetString()
+	if err != nil {
+		return ""
+	}
+	return s
 }
 
 func (f *fakePACS) addr() (string, int) {
@@ -46,18 +70,34 @@ func (f *fakePACS) addr() (string, int) {
 	return "127.0.0.1", a.Port
 }
 
-// newFakePACS generates nStudies studies of perStudy files each and starts
-// serving them. destAEs maps C-MOVE destination AE titles to host:port.
+// newFakePACS generates nStudies studies of perStudy files each, one series
+// per study, and starts serving them. destAEs maps C-MOVE destination AE
+// titles to host:port.
 func newFakePACS(t *testing.T, nStudies, perStudy int, maxAssoc int32, destAEs map[string]string) *fakePACS {
 	t.Helper()
+	return newFakePACSSeries(t, nStudies, 1, perStudy, maxAssoc, destAEs)
+}
+
+// newFakePACSSeries generates nStudies studies of seriesPerStudy series of
+// perSeries files each and starts serving them: a study-level C-MOVE/C-GET
+// delivers the whole study, a series-level one just that series, and a
+// SERIES-level C-FIND lists a study's series with their instance counts.
+func newFakePACSSeries(t *testing.T, nStudies, seriesPerStudy, perSeries int, maxAssoc int32, destAEs map[string]string) *fakePACS {
+	t.Helper()
 	srcDir := t.TempDir()
-	f := &fakePACS{maxAssoc: maxAssoc, delay: 150 * time.Millisecond, studies: map[string][]string{}}
+	f := &fakePACS{maxAssoc: maxAssoc, delay: 150 * time.Millisecond,
+		studies: map[string][]string{}, series: map[string][]fakeSeries{}}
 	for s := range nStudies {
 		uid := fmt.Sprintf("1.2.826.0.1.3680043.99.%d", s+1)
-		for i := range perStudy {
-			p := filepath.Join(srcDir, fmt.Sprintf("%d%03d.dcm", s+1, i+1))
-			writeSizedTestDICOM(t, p, "CT", 8, 8, uid+".1", 1, i+1)
-			f.studies[uid] = append(f.studies[uid], p)
+		for k := range seriesPerStudy {
+			ser := fakeSeries{uid: fmt.Sprintf("%s.%d", uid, k+1)}
+			for i := range perSeries {
+				p := filepath.Join(srcDir, fmt.Sprintf("%d%02d%03d.dcm", s+1, k+1, i+1))
+				writeSizedTestDICOM(t, p, "CT", 8, 8, ser.uid, k+1, i+1)
+				ser.paths = append(ser.paths, p)
+			}
+			f.series[uid] = append(f.series[uid], ser)
+			f.studies[uid] = append(f.studies[uid], ser.paths...)
 		}
 	}
 
@@ -73,9 +113,15 @@ func newFakePACS(t *testing.T, nStudies, perStudy int, maxAssoc int32, destAEs m
 		}
 		time.Sleep(f.delay) // hold the association long enough to overlap
 		var paths []string
-		if e, err := dicom.FindElementByTag(filter, dicomtag.StudyInstanceUID); err == nil {
-			if uid, err := e.GetString(); err == nil {
-				paths = f.studies[uid]
+		if uid := filterString(filter, dicomtag.StudyInstanceUID); uid != "" {
+			paths = f.studies[uid]
+			if suid := filterString(filter, dicomtag.SeriesInstanceUID); suid != "" {
+				paths = nil // a series-level request: just that series
+				for _, ser := range f.series[uid] {
+					if ser.uid == suid {
+						paths = ser.paths
+					}
+				}
 			}
 		}
 		for i, p := range paths {
@@ -87,6 +133,18 @@ func newFakePACS(t *testing.T, nStudies, perStudy int, maxAssoc int32, destAEs m
 		AETitle:   "FAKEPACS",
 		RemoteAEs: destAEs,
 		CEcho:     func(netdicom.ConnectionState) dimse.Status { return dimse.Success },
+		CFind: func(_ netdicom.ConnectionState, _, _ string, filter []*dicom.Element, ch chan netdicom.CFindResult) {
+			defer close(ch)
+			f.finds.Add(1)
+			uid := filterString(filter, dicomtag.StudyInstanceUID)
+			for _, ser := range f.series[uid] {
+				ch <- netdicom.CFindResult{Elements: []*dicom.Element{
+					dicom.MustNewElement(dicomtag.StudyInstanceUID, uid),
+					dicom.MustNewElement(dicomtag.SeriesInstanceUID, ser.uid),
+					dicom.MustNewElement(dicomtag.NumberOfSeriesRelatedInstances, strconv.Itoa(len(ser.paths))),
+				}}
+			}
+		},
 		CMove: func(_ netdicom.ConnectionState, _, _ string, filter []*dicom.Element, ch chan netdicom.CMoveResult) {
 			serve(filter, ch)
 		},
